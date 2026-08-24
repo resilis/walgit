@@ -12,7 +12,9 @@ and `just ci`. Run `just test-s3` against the local disposable store. Run
 the required `WALGIT_TEST_S3_*` environment variables for an approved
 disposable bucket and unique prefix. Run
 `just test-gcs <bucket>` only against an approved disposable bucket and unique
-prefix. Production provider conformance remains a later gate.
+prefix. Exact-provider primitive conformance is a PR2 merge gate. Full-scale
+recovery and production-candidate evidence remain later PR3 gates. PR1 does
+not implement the V5.3 control, event, recovery, or cutover contracts.
 
 | Surface | Owner | Entrypoint | PR1 preservation decision | Test or evidence |
 |---|---|---|---|---|
@@ -46,6 +48,7 @@ prefix. Production provider conformance remains a later gate.
 | WAL operator CLI | `walgit-cli` / WAL | `walgit wal ls/show/materialize` | Preserve provenance and `--at-seq` | CLI unit tests; CLI help inspection |
 | Import CLI | `walgit-cli` | `walgit import` | Preserve direct/staged import behavior | `cargo test -p walgit-cli`; `docs/INTEGRITY.md` review |
 | Repair and fsck | CLI / Git / maintainer | `fsck`, `repair` units | Preserve connectivity audit and upstream repair | `cargo test -p walgit-server --test maintain`; `docs/INTEGRITY.md` review |
+| Versioned recovery | future control / store | exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 production approval | Future exact-provider version tests and recovery vertical acceptance in `docs/PRODUCTION_ARCHITECTURE.md` |
 | Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Preserve current routes in PR1; identity/lifecycle/reclamation move to PR2 | `just e2e`; future control gate |
 | Placement | config / server | serve/maintain include/exclude | Preserve prefix routing and explicit placement | `cargo test -p walgit-server --test routing_prefix --test maintain` |
 | Push broker | server | forwarding and trusted principal | Preserve broker fallback and opaque client credential lane | `just e2e`; config/code review |
@@ -60,11 +63,11 @@ prefix. Production provider conformance remains a later gate.
 | Standalone | CLI / server | `walgit-server --config`, one binary | Preserve no-edge operation and self-signed default shape | `walgit config check --config walgit.standalone.toml`; `just e2e` |
 | Memory store | `walgit-store` | `MemoryStore` | Preserve full object-store contract | `cargo test -p walgit-store --test contract -- memory_contract` |
 | GCS store | `walgit-store` | `GcsStore` | Preserve GCS behavior and native conditional compose | memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized |
-| S3 store | `walgit-store` | `S3Store` | Harden default credentials, exact lengths, retry mapping, atomic final conditions, bounds and cleanup | unit tests; protected CI against disposable local RustFS via `just test-s3`; later exact-provider conformance |
+| S3 store | `walgit-store` | `S3Store` | Harden default credentials, exact lengths, retry mapping, atomic final conditions, bounds and cleanup | unit tests; protected CI against disposable local RustFS via `just test-s3`; PR2 exact-provider primitive gate |
 | S3 credentials | `walgit-store` | SDK chain or configured env names | Empty override names preserve the refreshable default chain and temporary credentials; complete custom access/secret and optional session token override it; incoherent partial overrides fail without printing values | `cargo test -p walgit-store --lib` |
 | S3 endpoint/region/addressing | config / store | endpoint, region, path/virtual style | Preserve exact configured values; make contract test parameters explicit | required `WALGIT_TEST_S3_*` environment plus `just test-s3-provider` |
 | S3 multipart cleanup | store | create/upload/complete/abort | Abort on read, upload, condition, and completion failures; max 10,000 parts; require provider `AbortIncompleteMultipartUpload` lifecycle cleanup | unit/contract tests; exact-provider cleanup gate |
-| CI and supply chain | repository | `.github/workflows` | PR1 delivers pinned PR/main quality and audit jobs, a protected disposable RustFS contract, and signed development/main images built only from the exact successful main CI SHA; PR forks never publish, and no PR1 image is production-deployable | actionlint and workflow review; exact-provider conformance and GitHub branch protection remain external evidence |
+| CI and supply chain | repository | `.github/workflows` | PR1 delivers pinned PR/main quality and audit jobs, a protected disposable RustFS contract, and signed development/main images built only from the exact successful main CI SHA; PR forks never publish, and no PR1 image is production-deployable. Future gates require critical PR jobs at 15-minute P95, parallel provider jobs capped at 15 minutes, a fail-closed provider workflow capped at 30 minutes, and promotion of the one tested digest without rebuild or mutable tags | actionlint and workflow review; branch protection, timing, exact-provider, recovery, signature, attestation, and exact-digest promotion remain later evidence |
 
 ## Bounded dependency advisory exception
 
@@ -75,11 +78,22 @@ whose `Drop` implementation does not panic, so the advisory preconditions do
 not occur in this use. Remove the exception as soon as the AWS SDK permits
 `lru` 0.18.2 or newer. All other advisories remain denied as warnings.
 
-## Production-only evidence still required
+## Future provider, recovery, and production evidence
 
-Before a later durable-format gate merges, run the S3 contract against the
-selected provider with its real endpoint, region, addressing mode, temporary
-bucket, and unique prefix. Add proof for credential rotation, a payload larger
-than 5 GiB, the calculated 10,000-part boundary, concurrent create/update and
-conditional multipart completion, aborted-upload cleanup, Range/HEAD/ETag, and
-recovery throughput. Never run these checks against a production data prefix.
+Before PR2 merges, run the S3 contract against the selected provider with its
+real endpoint, region, addressing mode, credential mode, temporary bucket, and
+unique prefix. Prove credential rotation, a payload larger than 5 GiB, the
+calculated 10,000-part boundary, concurrent conditional Create and Update,
+conditional multipart completion, failed and abandoned multipart cleanup,
+Range/HEAD/ETag behavior, mandatory versioning, stable `ObjectVersionID`
+results, paginated version enumeration, exact-version HEAD/GET/delete, and
+delete-marker behavior. Never run these checks against a production data
+prefix.
+
+PR3 must separately prove production-scale object counts, throughput,
+retention, event replay and fanout, exact build pins, recovery, and the stated
+fault model on the exact selected provider. Every result must bind the one
+production candidate image digest. Promotion must attest that same digest
+without a rebuild or mutable-tag substitution. These future jobs follow the
+15-minute per-job and 30-minute provider-workflow budgets in the production
+charter and fail closed when cleanup or evidence is incomplete.
