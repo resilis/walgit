@@ -8,14 +8,16 @@ with a dedicated test. This matrix does not make untested provider claims.
 
 Run the repository-wide checks with `just warnings`, `just test`, `just e2e`,
 and `just ci`. Run `just test-s3` against the local disposable store. Run
-`just test-s3-provider` against the exact selected provider only after setting
+`just test-s3-provider` against the exact selected S3-compatible provider only
+after setting
 the required `WALGIT_TEST_S3_*` environment variables for an approved
 disposable bucket and unique prefix. Run
 `just test-gcs <bucket>` only against an approved disposable bucket and unique
-prefix. Exact-provider primitive conformance is a PR2 merge gate. Full-scale
-recovery and production-candidate evidence remain later PR3 gates. PR1 does
-not implement the V5.4 control, identity, signing, event, recovery, or cutover
-contracts.
+prefix for development or non-production evidence. Production exact-provider
+primitive conformance runs only against the selected S3-compatible provider and
+is a PR2 merge gate. Full-scale recovery and production-candidate evidence
+remain later PR3 gates. PR1 does not implement the V5.8 control, identity,
+signing, event, recovery, or cutover contracts.
 
 | Surface | Owner | Entrypoint | PR1 preservation decision | Test or evidence |
 |---|---|---|---|---|
@@ -49,13 +51,19 @@ contracts.
 | WAL operator CLI | `walgit-cli` / WAL | `walgit wal ls/show/materialize` | Preserve provenance and `--at-seq` | CLI unit tests; CLI help inspection |
 | Import CLI | `walgit-cli` | `walgit import` | Preserve direct/staged import behavior | `cargo test -p walgit-cli`; `docs/INTEGRITY.md` review |
 | Repair and fsck | CLI / Git / maintainer | `fsck`, `repair` units | Preserve connectivity audit and upstream repair | `cargo test -p walgit-server --test maintain`; `docs/INTEGRITY.md` review |
-| Versioned recovery | future control / store | exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 production approval | Future exact-provider version tests and recovery vertical acceptance in `docs/PRODUCTION_ARCHITECTURE.md` |
+| Versioned recovery | future global recovery authority / repository control / store | `recovery_control`, exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; V5.8 adds the exact global CAS fence, credential drain, crash recovery, and terminal release; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 | Future recovery-state, missing-control, credential-drain, exact-provider version, and terminal-release tests |
 | Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Preserve current routes in PR1; identity/lifecycle/reclamation move to PR2 | `just e2e`; future control gate |
 | V2 direct repository identity | future control / Cloud Core | canonical transport path to routing-digest-derived `repo_control`; UUID/generation payload namespace | Not implemented by PR1; V2 keeps `SHA-256(C)` as the canonical identity digest, uses a separate domain-separated routing digest for keys, and enforces binary global uniqueness plus a non-reusable tombstone while preserving current PR1 routes until the hard cut | Future shared transport corpus, both-digest derivation and binding, independent identity/routing collision errors, namespace, and tombstone gate |
-| V2 bounded control schema | future protobuf / control | `repo_control`, typed inline state, immutable catalog roots | Not implemented by PR1; every variable field, message, repeated field, and catalog uses the exact V5.4 numeric bound and compact-or-reject behavior | Future descriptor-linter, decoder-allocation, boundary, inline/catalog `oneof`, and backpressure gate |
+| V2 bounded control schema | future protobuf / control | `repo_control`, typed inline state, immutable catalog roots | Not implemented by PR1; every variable field, message, repeated field, and catalog uses the exact V5.8 numeric bound, exhaustive physical leaf grammar, exact digest preimage, and compact-or-reject behavior; immutable bodies never require their own store identity, parent references carry exact target roots, and standard raw Git/LFS/bundle payloads stay unmodified | Future descriptor-linter, decoder-allocation, key-grammar, parent/child root, byte-digest, raw-payload, watermark/proof boundary, inline/catalog `oneof`, and backpressure gate |
 | V2 normal-read authority | future control / store | one routing-digest-derived control GET, then exact rooted catalog versions only when required | Not implemented by PR1; only the control CAS publishes semantics and mutable auxiliary state stays non-authoritative | Future request-count, exact-version root, cold-ref, stale-host-index, and side-state non-publication gate |
-| Signed create and capabilities | future Cloud Core / control | deterministic CBOR, untagged COSE Sign1, Ed25519 verification ring | Not implemented by PR1; V5.4 freezes payload identity, UUIDv7, time, replay, audience, key-state, and rotation rules | Future cross-language vectors, malformed-CBOR, replay, skew/lifetime, stale-ring, rotation, and revocation gate |
-| No-production-data V2 hard cut | future cutover / selected provider | signed empty-prefix proof, exclusive IAM, conditional `cutover_control` Create | Not implemented by PR1; V2 accepts only a fresh empty prefix and never adopts V1 data or identity | Future all-version/delete-marker/multipart scan, IAM race, crash recovery, V1 rejection, and no-fallback gate |
+| Mutation receipt settlement | future repository control / immutable results | closed `NONE` / `CAPACITY` / `EVENT` obligations | Not implemented by PR1; settlement roots the result through one control CAS, the result identifies the landed `repo_control` version rather than itself, and settlement waits only for exact obligations whose tags are present | Future lost-CAS, later-CAS, all tagged-union cells, absent-obligation, max-key/max-`ObjectVersionID` 64-subscriber archive-watermark, reclamation, and no-recursive-receipt gate |
+| Finite capacity allocation | future global capacity authority / shards | `capacity_control`, tenant catalog, exactly 256 capacity shards | Not implemented by PR1; V5.8 gives every shard an epoch-bound immutable budget, enforces tenant slices and the global sum, and fences redistribution until all shards have zero nonterminal reservations | Future cross-shard exhaustion, tenant/global oversubscription, redistribution, mixed-epoch, and crash-resume gate |
+| Typed reclamation | future repository control / store | current and transitive roots plus retained obligations | Not implemented by PR1; protection does not retain every historical catalog forever, but exact-version deletion remains fenced, bounded, and impossible while any current or retained obligation reaches the target | Future superseded-catalog eligibility, live-root closure, receipt/event/capacity/pin/recovery retention, pagination, and refund gate |
+| Signed create and capabilities | future Cloud Core / control | deterministic CBOR, untagged COSE Sign1, Ed25519 verification ring | Not implemented by PR1; V5.8 freezes exact data/root `kid` headers, the PENDING/ACTIVE/RETIRING/REVOKED slot matrix, payload identity, UUIDv7, time, replay, immutable current/next/previous binding, rotation, and revocation | Future cross-language vectors, every slot/state cell, malformed-CBOR, replay, skew/lifetime, binding-CAS, stale-ring, rotation, and 30-second revocation gate |
+| Bucket administrative safety | future global control / selected S3 provider | `bucket_admin_control`, safety digest, credential epoch, global writer fence | Not implemented by PR1; production requires `PREPARING`, runtime write denial and old-credential revocation, acknowledged drain, exact revalidation, and a new loaded epoch before publication resumes | Future versioning/lifecycle/KMS/encryption/IAM/provider-policy drift, paused-writer, credential-epoch, and drain gate |
+| Durable webhook delivery | future event / Cloud Core | bounded inline event, HTTPS POST, canonical HMAC tuple, replay cache, archive watermark | Not implemented by PR1; V5.8 caps an atomic transaction at 256 changes, active subscribers at 64, every precomputed deterministic body at 1 MiB, and the watermark at 524,288 bytes with at most 64 exact archive refs of at most 4,096 bytes each; it preserves HMAC rotation, causal retention, and exact parent-rooted archives | Future size/subscriber/max-reference boundaries, pre-publication rejection, HMAC vectors, replay, key rotation, fanout crash, retention, settlement, reclamation, and watermark gate |
+| Exact build pins | future Cloud Core build intent / repository control | durable `PREPARING -> READY` intent, standing named exact-SHA pins, primary and named build pins, exact outbox | Not implemented by PR1; the event CAS preserves the primary 120-day floor, but every exact pin and the one READY/outbox transaction must land by `ready_deadline` or terminal no-build permanently rejects late pin, READY, outbox, and enqueue; named exact-SHA configuration is event-eligible only while its standing fenced Git/LFS pin covers the last event horizon | Future deadline-stall, late-action denial, partial-pin compensation, standing-pin activation/removal/renewal, exact-SHA/current-ref resolution, ref-move/reclamation, and maximum-horizon gate |
+| No-production-data V2 hard cut | future cutover / selected S3-compatible provider | conditional `OPEN`, `PREPARING`, bounded creation plan, exclusive fence, two scans with two shared S3 traversals each, and one inline signed proof | Not implemented by PR1; every initial control object is planned before Create and batch-resolved into the cutover graph; after revocation and the bounded admission wait, each scan uses one version traversal for three sets and one multipart traversal, with canonical presence-aware cursors and exact entry, cursor-chain, set, scan, deterministic-CBOR, and Ed25519 proof encodings | Future ordering, plan boundaries, lost-Create resolution, policy convergence, high-watermark, cursor presence/continuity/repetition, page-split/same-key version/delete-marker, byte-vector, corruption/replay, double-scan, graph/history, IAM-race, V1-rejection, and no-fallback gate |
 | Placement | config / server | serve/maintain include/exclude | Preserve prefix routing and explicit placement | `cargo test -p walgit-server --test routing_prefix --test maintain` |
 | Push broker | server | forwarding and trusted principal | Preserve broker fallback and opaque client credential lane | `just e2e`; config/code review |
 | Drain | server / maintainer | SIGTERM phases, `/readyz` | Preserve serving during phase 1 and refusal in phase 2 | `cargo test -p walgit-server --test drain` |
@@ -68,12 +76,12 @@ contracts.
 | HTTP/2 | server | h2c or TLS ALPN | Preserve direct standalone support | server/config code review; later runtime probe |
 | Standalone | CLI / server | `walgit-server --config`, one binary | Preserve no-edge operation and self-signed default shape | `walgit config check --config walgit.standalone.toml`; `just e2e` |
 | Memory store | `walgit-store` | `MemoryStore` | Preserve full object-store contract | `cargo test -p walgit-store --test contract -- memory_contract` |
-| GCS store | `walgit-store` | `GcsStore` | Preserve GCS behavior and native conditional compose; future selected-provider use requires bucket Object Versioning enabled, soft-delete retention zero, and fail-closed startup | memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized; future exact-provider permanent-delete gate |
+| GCS store | `walgit-store` | `GcsStore` | Preserve GCS behavior and native conditional compose for development and non-production only; exact-delete tests require Object Versioning enabled and soft-delete retention zero, but GCS is production-ineligible because it cannot prove all resumable sessions and delete markers | memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized; future production-ineligibility gate |
 | S3 store | `walgit-store` | `S3Store` | Harden default credentials, exact lengths, retry mapping, atomic final conditions, bounds and cleanup | unit tests; protected CI against disposable local RustFS via `just test-s3`; PR2 exact-provider primitive gate |
 | S3 credentials | `walgit-store` | SDK chain or configured env names | Empty override names preserve the refreshable default chain and temporary credentials; complete custom access/secret and optional session token override it; incoherent partial overrides fail without printing values | `cargo test -p walgit-store --lib` |
 | S3 endpoint/region/addressing | config / store | endpoint, region, path/virtual style | Preserve exact configured values; make contract test parameters explicit | required `WALGIT_TEST_S3_*` environment plus `just test-s3-provider` |
 | S3 multipart cleanup | store | create/upload/complete/abort | Abort on read, upload, condition, and completion failures; max 10,000 parts; require provider `AbortIncompleteMultipartUpload` lifecycle cleanup | unit/contract tests; exact-provider cleanup gate |
-| CI and supply chain | repository | `.github/workflows` | PR1 delivers pinned PR/main quality and audit jobs, a protected disposable RustFS contract, and signed development/main images built only from the exact successful main CI SHA; PR forks never publish, and no PR1 image is production-deployable. Future gates require critical PR jobs at 15-minute P95, parallel provider jobs capped at 15 minutes, a fail-closed provider workflow capped at 30 minutes, and promotion of the one tested digest without rebuild or mutable tags | actionlint and workflow review; branch protection, timing, exact-provider, recovery, signature, attestation, and exact-digest promotion remain later evidence |
+| CI and supply chain | repository | `.github/workflows` | PR1 delivers pinned PR/main quality and audit jobs, a protected disposable RustFS contract, and signed development/main images built only from the exact successful main CI SHA; PR forks never publish, and no PR1 image is production-deployable. Future gates require `timeout-minutes <= 15` on every required PR/provider/evidence/recovery/cutover/promotion job, provider test work `<= 12` minutes, cleanup reserve `>= 3` minutes, workflow cap `<= 30` minutes, and promotion of one tested digest | actionlint and timeout-budget linter; branch protection, timing, cleanup, exact-provider, recovery, signature, attestation, and exact-digest promotion remain later evidence |
 
 ## Bounded dependency advisory exception
 
@@ -86,37 +94,64 @@ not occur in this use. Remove the exception as soon as the AWS SDK permits
 
 ## Future provider, recovery, and production evidence
 
-Before PR2 merges, run the S3 contract against the selected provider with its
-real endpoint, region, addressing mode, credential mode, temporary bucket, and
-unique prefix. Prove credential rotation, a payload larger than 5 GiB, the
-calculated 10,000-part boundary, concurrent conditional Create and Update,
-conditional multipart completion, failed and abandoned multipart cleanup,
-Range/HEAD/ETag behavior, mandatory versioning, stable `ObjectVersionID`
-results, paginated version enumeration, exact-version HEAD/GET/delete, and
-delete-marker behavior. Also prove a fully paginated zero count for current
-objects, noncurrent versions, delete markers, and incomplete multipart uploads,
-plus exclusive-IAM denial of a concurrent writer during conditional control
-Create. Run the primitive simulation only in an approved disposable prefix,
-never against a production data prefix.
+Before PR2 merges, run the S3 contract against the selected S3-compatible
+provider with its real endpoint, region, addressing mode, credential mode,
+temporary bucket, and unique prefix. Prove credential rotation, a payload
+larger than 5 GiB, the calculated 10,000-part boundary, concurrent conditional
+Create and Update, conditional multipart completion, failed and abandoned
+multipart cleanup, Range/HEAD/ETag behavior, mandatory versioning, stable
+`ObjectVersionID` results, paginated version enumeration, exact-version
+HEAD/GET/delete, and delete-marker behavior. Prove that conditional `OPEN` and
+its CAS to `PREPARING` occur before the IAM or administrative fence and every
+other external cutover effect. After runtime credential revocation, prove
+provider-policy convergence, the at-most-300-second admission horizon, writer
+drain, and the stable last-admitted-mutating-request watermark; LIST, HEAD, and
+GET proof reads must not advance it. Each scan must use exactly one shared
+`ListObjectVersions` traversal for current objects, noncurrent versions, and
+delete markers, and one `ListMultipartUploads` traversal for active uploads.
+Prove exact presence-aware cursor bytes, truncated/terminal rules, response-next
+to next-request continuity, repetition rejection, page counts, cursor-chain and
+set/scan digests, matching counts, zero repository data, and only the exact
+allowlisted control-plane graph. Prove every initial control Create has a prior exact plan
+row and that a lost Create is resolved into the graph rather than orphaned.
+Prove exclusive-IAM denial of a concurrent writer and rejection of unplanned
+control history without cleanup. Prove bucket-safety drift
+detection and denial of a writer resumed after validation. Run the primitive
+simulation only in an approved disposable prefix, never against a production
+data prefix.
 
-If GCS is selected, the exact-provider gate must read the bucket configuration
-and prove that Object Versioning is enabled and soft-delete retention is zero.
-Startup fails closed otherwise. An exact-version delete and capacity refund do
-not complete until exact-version HEAD and GET return typed not-found and a
-complete version enumeration omits that generation.
+GCS contract tests remain development and non-production evidence. When they
+exercise exact deletion, they require Object Versioning enabled and soft-delete
+retention zero. They also prove that GCS fails production eligibility because
+it cannot enumerate every resumable upload session and delete marker required
+by the bootstrap proof. GCS evidence cannot satisfy the production provider
+gate.
 
-The later V2 bootstrap gate runs only for the authorized fresh deployment
-prefix after Cloud Core has proved that no production repository data exists
-there. It binds the selected provider configuration, versioning, soft-delete,
-retention, four zero counts, exclusive IAM, job image, and signed proof. Any
-object, noncurrent version, delete marker, incomplete multipart upload, V1
-state, or unresolved IAM writer fails the hard cut. V2 has no legacy adoption
-migration.
+The later V2 bootstrap gate runs only against the authorized fresh production
+prefix on the selected S3-compatible provider. It proves conditional `OPEN`,
+then the CAS to `PREPARING`, before every external cutover effect. It then
+installs the exclusive IAM and administrative fence, revokes and drains writers,
+waits the bounded provider admission horizon, and binds two matching complete
+scans, versioning, lifecycle, encryption, KMS, provider policy, all four
+repository-data zero counts, the complete resolved 262-row creation plan and
+allowlisted control-plane graph, job image, and the deterministic-CBOR inline
+proof signed by the dedicated pinned Ed25519 bootstrap key before `PREPARED`.
+Shared byte vectors cover the 4,404-byte computed scan maximum under its 8,192-
+byte cap and the 23,650-byte computed proof maximum under its 65,536-byte cap.
+They also cover corruption, page splits, many versions and delete markers for
+one key, cursor presence/continuity/repetition, classification, ordering,
+duplicate, signature, prior-control, and session/generation replay failures.
+Any unexpected object, version, delete
+marker, multipart upload, V1 state, or unresolved writer fails the hard cut
+without cleanup. V2 has no legacy adoption migration.
 
 PR3 must separately prove production-scale object counts, throughput,
 retention, event replay and fanout, exact build pins, recovery, and the stated
-fault model on the exact selected provider. Every result must bind the one
-production candidate image digest. Promotion must attest that same digest
-without a rebuild or mutable-tag substitution. These future jobs follow the
-15-minute per-job and 30-minute provider-workflow budgets in the production
-charter and fail closed when cleanup or evidence is incomplete.
+fault model on the exact selected S3-compatible provider. Every result must
+bind the one production candidate image digest. Promotion must attest that same
+digest without a rebuild or mutable-tag substitution. These future jobs follow
+the 15-minute required-job limit and 30-minute provider-workflow cap. Each
+provider job reserves at least 3 of its 15 minutes for fail-closed cleanup and
+gives test work at most 12 minutes. The horizon job uses at most 5 test minutes
+for `H` and leaves at least 7 for convergence and two scans. Missing or
+incomplete cleanup and evidence fail closed.
