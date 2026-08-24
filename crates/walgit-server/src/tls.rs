@@ -22,7 +22,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{Accept, TlsAcceptor, server::TlsStream};
@@ -53,16 +53,15 @@ pub fn load(cfg: &Config) -> anyhow::Result<Option<Arc<Tls>>> {
         }
         TlsMode::SelfSigned => self_signed(&cfg.tls_dir(), &cfg.tls_hostnames())?,
     };
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .context("parsing TLS certificate PEM")?;
     anyhow::ensure!(
         !certs.is_empty(),
         "TLS certificate PEM holds no certificate"
     );
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
-        .context("parsing TLS private key PEM")?
-        .ok_or_else(|| anyhow::anyhow!("TLS key PEM holds no private key"))?;
+    let key =
+        PrivateKeyDer::from_pem_slice(key_pem.as_bytes()).context("parsing TLS private key PEM")?;
     let fingerprint = {
         use sha2::Digest;
         format!(

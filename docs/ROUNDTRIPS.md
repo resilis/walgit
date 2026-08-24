@@ -51,12 +51,22 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Maintainer bundle pass, refs level (retention + settle closed slots) | 1 list GET → at most 1 CAS (retention) → at most **1 CAS for every verdict of the pass** (`record_skipped_many`; was one CAS per settled slot until 2026-08-22: a rig repo with 9,654 closed slots paid 9,654 CAS per pass and, past the 4,096-verdict cap, forever) | ≤ 3 | `walgit-bundle/src/lib.rs::settle_closed_slots`, `ops.rs::record_skipped_many` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
+| S3 small conditional PUT | 1 conditional PUT; after a 412 only, 1 HEAD to report the current ETag | 1 happy path | `s3.rs::put` |
+| S3 multipart PUT | 1 create → upload parts → 1 conditional complete | N + 2; no destination probe | `s3.rs::multipart_put` |
+| S3 compose | source HEADs for layout → upload/copy parts → 1 conditional complete | sources + about one copy call per contiguous GiB (up to the calculated 5 GiB cap); fragmented sources coalesce to the bounded multipart target; +2 create/complete calls and **one fewer destination HEAD for Create** | `s3.rs::compose` |
+| S3 conditional delete | 1 conditional DELETE; after a 412 only, 1 HEAD distinguishes absent from moved | 1 happy path; **one fewer HEAD** | `s3.rs::delete` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
 counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an
 extra unconditional manifest GET (3 requests, 3 sequential rounds); it now applies the manifest it already
 fetched directly (2 requests, 2 rounds). `claim_log_slot`, `cas_landed`, and `put_immutable_create` add probes
 only after Create/CAS failure, so the measured happy-path counts remain unchanged.
+
+The 2026-08-24 S3 storage gate moved destination conditions to the atomic
+single PUT, CompleteMultipartUpload, and DeleteObject requests. It removed the
+old destination HEAD from compose Create and conditional delete. Source HEADs
+remain necessary for compose layout; every copied or ranged source is pinned
+to the version that HEAD returned. No CAS object's write rate changed.
 
 Keep this table current; when you change a protocol, update the row and put the before/after depth in the
 commit message. The sim harness can enforce it: `FaultStore::stats().ops` counts exact store requests per

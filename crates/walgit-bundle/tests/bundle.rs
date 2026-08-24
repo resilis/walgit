@@ -952,8 +952,8 @@ async fn too_small_closed_slots_are_recorded_and_skipped_not_remeasured() {
     cfg.bundles.min_commits = 1000; // everything is too small
     let cfg = Arc::new(cfg);
     let bundler = Bundler::new_with_source(Arc::new(source), cfg.clone());
-    // A closed daily slot (yesterday 23:00) on a weekly cut at the Sunday before it.
-    let now = std::time::SystemTime::now();
+    // Friday 2026-08-21 keeps the closed daily slot after its Sunday weekly base.
+    let now = UNIX_EPOCH + Duration::from_secs(1_787_313_600);
     let daily_strat = cfg
         .bundles
         .strategy

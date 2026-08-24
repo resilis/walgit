@@ -61,10 +61,11 @@ base64.workspace = true
 
 bytesize.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
 [dev-dependencies]
+aws-lc-rs.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }

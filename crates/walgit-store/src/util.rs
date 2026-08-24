@@ -28,9 +28,92 @@ pub async fn collect(mut body: ByteStream, size_hint: usize) -> Result<Bytes> {
     })
 }
 
+/// Collect a request body whose declared length is part of the storage
+/// contract. Reject both early EOF and extra bytes.
+pub async fn collect_exact(body: ByteStream, expected: u64) -> Result<Bytes> {
+    let limit = expected.checked_add(1).ok_or_else(|| {
+        StoreError::InvalidArgument(format!(
+            "declared body length {expected} cannot be bounded in memory"
+        ))
+    })?;
+    let capacity = usize::try_from(expected).map_err(|_| {
+        StoreError::InvalidArgument(format!(
+            "declared body length {expected} does not fit in memory"
+        ))
+    })?;
+    let mut body = body;
+    let mut bytes = BytesMut::with_capacity(capacity);
+    let mut supplied = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        let remaining = limit - supplied;
+        let copied = usize::try_from(remaining.min(chunk.len() as u64))
+            .expect("copied byte count is bounded by a chunk length");
+        bytes.extend_from_slice(&chunk[..copied]);
+        supplied += copied as u64;
+        if copied < chunk.len() || supplied == limit {
+            return Err(StoreError::InvalidArgument(format!(
+                "declared body length is {expected} bytes but the body supplied more data"
+            )));
+        }
+    }
+    if supplied != expected {
+        return Err(StoreError::InvalidArgument(format!(
+            "declared body length is {expected} bytes but the body supplied {} bytes",
+            supplied
+        )));
+    }
+    Ok(bytes.freeze())
+}
+
 /// Wrap a single `Bytes` as a stream.
 pub fn once(b: Bytes) -> ByteStream {
     Box::pin(futures::stream::once(async move { Ok(b) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn collect_exact_stops_after_expected_plus_one_across_chunks() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let body: ByteStream =
+            Box::pin(futures::stream::unfold(polls.clone(), |polls| async move {
+                polls.fetch_add(1, Ordering::SeqCst);
+                Some((Ok(Bytes::from_static(b"abcd")), polls))
+            }));
+
+        let error = collect_exact(body, 5)
+            .await
+            .expect_err("an unbounded overlong body must fail");
+        assert!(matches!(error, StoreError::InvalidArgument(_)));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_exact_accepts_multichunk_and_reports_early_eof() {
+        let exact: ByteStream = Box::pin(futures::stream::iter([
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"cde")),
+        ]));
+        assert_eq!(
+            collect_exact(exact, 5).await.expect("exact body"),
+            Bytes::from_static(b"abcde")
+        );
+
+        let short: ByteStream = Box::pin(futures::stream::iter([
+            Ok(Bytes::from_static(b"ab")),
+            Ok(Bytes::from_static(b"c")),
+        ]));
+        let error = collect_exact(short, 5)
+            .await
+            .expect_err("early EOF must fail");
+        assert!(error.to_string().contains("supplied 3 bytes"));
+    }
 }
 
 /// Stream a local file in `chunk` sized pieces, optionally a byte range.

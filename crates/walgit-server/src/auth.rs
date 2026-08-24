@@ -942,9 +942,16 @@ fn resolve_tokens(tokens: &[StaticToken]) -> Vec<StaticToken> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_lc_rs::{
+        rand::SystemRandom,
+        rsa::{KeySize, PublicKeyComponents},
+        signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaKeyPair},
+    };
     use axum::http::header::AUTHORIZATION;
+    use base64::Engine as _;
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
+    use std::sync::LazyLock;
     use std::sync::atomic::AtomicUsize;
 
     const ISSUER: &str = "https://accounts.google.com";
@@ -999,38 +1006,12 @@ mod tests {
         email_verified: bool,
     }
 
-    // gitleaks:allow — fixed test fixture; never loaded outside this module's OIDC verifier tests.
-    const PRIVATE_KEY: &[u8] = br#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDJETqse41HRBsc
-7cfcq3ak4oZWFCoZlcic525A3FfO4qW9BMtRO/iXiyCCHn8JhiL9y8j5JdVP2Q9Z
-IpfElcFd3/guS9w+5RqQGgCR+H56IVUyHZWtTJbKPcwWXQdNUX0rBFcsBzCRESJL
-eelOEdHIjG7LRkx5l/FUvlqsyHDVJEQsHwegZ8b8C0fz0EgT2MMEdn10t6Ur1rXz
-jMB/wvCg8vG8lvciXmedyo9xJ8oMOh0wUEgxziVDMMovmC+aJctcHUAYubwoGN8T
-yzcvnGqL7JSh36Pwy28iPzXZ2RLhAyJFU39vLaHdljwthUaupldlNyCfa6Ofy4qN
-ctlUPlN1AgMBAAECggEAdESTQjQ70O8QIp1ZSkCYXeZjuhj081CK7jhhp/4ChK7J
-GlFQZMwiBze7d6K84TwAtfQGZhQ7km25E1kOm+3hIDCoKdVSKch/oL54f/BK6sKl
-qlIzQEAenho4DuKCm3I4yAw9gEc0DV70DuMTR0LEpYyXcNJY3KNBOTjN5EYQAR9s
-2MeurpgK2MdJlIuZaIbzSGd+diiz2E6vkmcufJLtmYUT/k/ddWvEtz+1DnO6bRHh
-xuuDMeJA/lGB/EYloSLtdyCF6sII6C6slJJtgfb0bPy7l8VtL5iDyz46IKyzdyzW
-tKAn394dm7MYR1RlUBEfqFUyNK7C+pVMVoTwCC2V4QKBgQD64syfiQ2oeUlLYDm4
-CcKSP3RnES02bcTyEDFSuGyyS1jldI4A8GXHJ/lG5EYgiYa1RUivge4lJrlNfjyf
-dV230xgKms7+JiXqag1FI+3mqjAgg4mYiNjaao8N8O3/PD59wMPeWYImsWXNyeHS
-55rUKiHERtCcvdzKl4u35ZtTqQKBgQDNKnX2bVqOJ4WSqCgHRhOm386ugPHfy+8j
-m6cicmUR46ND6ggBB03bCnEG9OtGisxTo/TuYVRu3WP4KjoJs2LD5fwdwJqpgtHl
-yVsk45Y1Hfo+7M6lAuR8rzCi6kHHNb0HyBmZjysHWZsn79ZM+sQnLpgaYgQGRbKV
-DZWlbw7g7QKBgQCl1u+98UGXAP1jFutwbPsx40IVszP4y5ypCe0gqgon3UiY/G+1
-zTLp79GGe/SjI2VpQ7AlW7TI2A0bXXvDSDi3/5Dfya9ULnFXv9yfvH1QwWToySpW
-Kvd1gYSoiX84/WCtjZOr0e0HmLIb0vw0hqZA4szJSqoxQgvF22EfIWaIaQKBgQCf
-34+OmMYw8fEvSCPxDxVvOwW2i7pvV14hFEDYIeZKW2W1HWBhVMzBfFB5SE8yaCQy
-pRfOzj9aKOCm2FjjiErVNpkQoi6jGtLvScnhZAt/lr2TXTrl8OwVkPrIaN0bG/AS
-aUYxmBPCpXu3UjhfQiWqFq/mFyzlqlgvuCc9g95HPQKBgAscKP8mLxdKwOgX8yFW
-GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
-2pOhmquJQVDPDLuZHdrIiKiDM20dy9sMfHygWcZjQ4WSxf/J7T9canLZIXFhHAZT
-3wc9h4G8BBCtWN2TN/LsGZdB
------END PRIVATE KEY-----
-"#;
-    const MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
-    const EXPONENT: &str = "AQAB";
+    static RSA_KEY: LazyLock<RsaKeyPair> =
+        LazyLock::new(|| RsaKeyPair::generate(KeySize::Rsa2048).unwrap());
+
+    fn encode_segment(value: &impl Serialize) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap())
+    }
 
     fn config() -> walgit_config::Config {
         let mut cfg = walgit_config::Config::default();
@@ -1065,22 +1046,31 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
         };
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test".into());
-        encode(
-            &header,
-            &claims,
-            &EncodingKey::from_rsa_pem(PRIVATE_KEY).unwrap(),
+        let signing_input = format!("{}.{}", encode_segment(&header), encode_segment(&claims));
+        let mut signature = vec![0; RSA_KEY.public_modulus_len()];
+        RSA_KEY
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+        format!(
+            "{signing_input}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature)
         )
-        .unwrap()
     }
 
     fn source() -> Arc<MockSource> {
+        let public = PublicKeyComponents::<Vec<u8>>::from(RSA_KEY.public_key());
         Arc::new(MockSource {
             calls: AtomicUsize::new(0),
             response: Mutex::new(Ok(JwksResponse {
                 keys: vec![JwksKey::Rsa {
                     kid: "test".into(),
-                    n: MODULUS.into(),
-                    e: EXPONENT.into(),
+                    n: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.n),
+                    e: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.e),
                 }],
                 max_age: Duration::from_secs(3600),
             })),
@@ -1183,6 +1173,49 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             true,
         ));
         assert!(auth.authenticate(&bare).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn id_token_accepts_es256_jwk_with_aws_lc_provider() {
+        use base64::Engine as _;
+
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let public = key.public_key_raw();
+        assert_eq!(public.len(), 65);
+        assert_eq!(public[0], 0x04);
+        let encode_component =
+            |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let source = Arc::new(MockSource {
+            calls: AtomicUsize::new(0),
+            response: Mutex::new(Ok(JwksResponse {
+                keys: vec![JwksKey::Ec {
+                    kid: "ec-test".into(),
+                    crv: "P-256".into(),
+                    x: encode_component(&public[1..33]),
+                    y: encode_component(&public[33..65]),
+                }],
+                max_age: Duration::from_secs(3600),
+            })),
+        });
+        let claims = TestClaims {
+            iss: ISSUER,
+            aud: AUD,
+            exp: 4_000_000_000,
+            email: "dev@example.com",
+            email_verified: true,
+        };
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("ec-test".into());
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ec_der(&key.serialize_der()),
+        )
+        .unwrap();
+
+        let auth = Authenticator::with_key_source(&config(), source);
+        let principal = auth.authenticate(&bearer(&token)).await.unwrap();
+        assert_eq!(principal.name, "dev@example.com");
     }
 
     #[tokio::test]

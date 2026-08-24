@@ -163,8 +163,19 @@ pub struct GcsStore; impl GcsStore { pub async fn new(cfg: &walgit_config::Store
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>; // by cfg.store.backend, applies Prefixed(cfg.store_prefix())
 ```
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
-memory always, for s3 when `WALGIT_TEST_S3_ENDPOINT` set (bucket `WALGIT_TEST_BUCKET`, default "walgit-test"),
+memory always, for S3 when `WALGIT_TEST_S3_ENDPOINT` is set (endpoint, region, bucket, prefix, addressing mode,
+and default-chain/explicit credentials are parameterized with `WALGIT_TEST_S3_*`; every run adds a unique suffix),
 for gcs when `WALGIT_TEST_GCS_BUCKET` set.
+
+S3 large writes and compose use multipart completion as the destination's
+atomic Create/Update point. Every part is length checked, operations stay
+within the 5 TiB/10,000-part service bounds, and every post-create failure
+attempts AbortMultipartUpload. Providers that do not implement conditional
+multipart completion fail their contract run; no HEAD-then-write emulation is
+allowed. Small writes remain one conditional PutObject. Every S3 deployment
+must also configure an `AbortIncompleteMultipartUpload` bucket lifecycle rule
+with a short retention window. Runtime abort is best effort and cannot clean
+uploads left by process death or a provider outage.
 
 ## walgit-wal (owner: Wal)
 
