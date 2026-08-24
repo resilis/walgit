@@ -2973,6 +2973,7 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
         assert!(!base.is_empty());
         // 6 contenders from the same base, each with its own commit.
         let mut handles = Vec::new();
+        let push_barrier = std::sync::Arc::new(std::sync::Barrier::new(7));
         for i in 0..6 {
             let d = tempfile::tempdir()?;
             git(
@@ -2988,10 +2989,12 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             let sha = git_in(d.path(), &["rev-parse", "HEAD"])?.trim().to_string();
             let url2 = url.clone();
             let cwd = d.path().to_path_buf();
+            let push_barrier = push_barrier.clone();
             handles.push((
                 d,
                 sha,
                 std::thread::spawn(move || {
+                    push_barrier.wait();
                     // true when this push won
                     let o = std::process::Command::new("git")
                         .current_dir(&cwd)
@@ -3026,13 +3029,21 @@ async fn reads_after_an_acknowledged_push_never_show_the_previous_tip() -> TestR
             }
             seen
         });
-        let mut winner = None;
+        // Every clone now descends from `base`; release all six pushes only
+        // after the reader is running so exactly one can win this round.
+        push_barrier.wait();
+        let mut winners = Vec::new();
         for (_d, sha, h) in handles {
             if h.join().unwrap() {
-                winner = Some(sha);
+                winners.push(sha);
             }
         }
-        let winner = winner.expect("exactly one push wins each round");
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one push must win round {round}; winners: {winners:?}"
+        );
+        let winner = winners.pop().unwrap();
         // Read-your-writes: the first read after the last push returned must be the winner, and so
         // must every read after it.
         let mut after: Vec<String> = Vec::new();
