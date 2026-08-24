@@ -79,9 +79,11 @@ access_key_env = ""              # empty names use the refreshable AWS SDK defau
 secret_key_env = ""              # web-identity, shared config, ECS, and EC2 credentials. For a deliberate custom static
 session_token_env = ""           # override, name both access/secret vars and optionally a temporary session-token var.
 force_path_style = false          # true for most self-hosted S3 implementations
+# Bucket versioning is mandatory. WalGit verifies it during startup.
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
+# Bucket versioning is mandatory and GCS soft-delete retention must be disabled. WalGit verifies both at startup.
 direct_connectivity = true
 # signing_service_account = "sa@project.iam.gserviceaccount.com"   # for bundles/lfs serve_via = "signed_url"
 bulk_clients = 4                  # separate data channels for pack/idx/side-file/bundle/LFS bytes + ranged reads

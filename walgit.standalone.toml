@@ -62,9 +62,11 @@ region = "us-east-1"
 access_key_env = "AWS_ACCESS_KEY_ID"       # compose.yaml fixes walgit-dev / walgit-dev-secret for rustfs
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = true
+# Bucket versioning is mandatory. WalGit verifies it during startup.
 # A GCS bucket instead (Application Default Credentials):
 # backend = "gcs"
 # bucket = "my-walgit-bucket"
+# GCS requires bucket versioning enabled and soft-delete retention disabled; WalGit verifies both at startup.
 # prefix = ""
 
 # Bundles (docs/BUNDLE_URI_DESIGN.md): one weekly full, then **chained** incrementals — each daily on the

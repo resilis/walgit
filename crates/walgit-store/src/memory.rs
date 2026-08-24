@@ -14,13 +14,21 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 
 use crate::{
-    BoxStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
-    Result, StoreError, Version, util,
+    BoxStream, CasToken, ComposeSource, GetOptions, GetResult, MAX_VERSION_PAGE_SIZE, ObjectMeta,
+    ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode, PutOptions,
+    Result, StoreError, VersionCursor, VersionPage, util,
 };
+
+#[derive(Clone)]
+struct MemoryVersion {
+    cas_token: CasToken,
+    object_version_id: ObjectVersionId,
+    body: Option<Bytes>,
+}
 
 #[derive(Default)]
 pub struct MemoryStore {
-    objects: Mutex<BTreeMap<String, (Version, Bytes)>>,
+    objects: Mutex<BTreeMap<String, Vec<MemoryVersion>>>,
     counter: AtomicU64,
     /// Optional artificial latency per op (tests of races/batching).
     pub latency: Option<std::time::Duration>,
@@ -39,12 +47,11 @@ impl MemoryStore {
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
     }
-    fn next_version(&self) -> Version {
-        Version::new(
-            self.counter
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1)
-                .to_string(),
+    fn next_version(&self) -> (CasToken, ObjectVersionId) {
+        let value = self.counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        (
+            CasToken::new(format!("cas-{value}")),
+            ObjectVersionId::new(format!("version-{value}")),
         )
     }
     async fn delay(&self) {
@@ -53,7 +60,15 @@ impl MemoryStore {
         }
     }
     pub fn len(&self) -> usize {
-        self.objects.lock().len()
+        self.objects
+            .lock()
+            .values()
+            .filter(|versions| {
+                versions
+                    .last()
+                    .is_some_and(|version| version.body.is_some())
+            })
+            .count()
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -94,13 +109,24 @@ impl ObjectStore for MemoryStore {
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         self.delay().await;
-        let (version, data) = {
+        let selected = {
             let g = self.objects.lock();
-            match g.get(key) {
-                Some((v, d)) => (v.clone(), d.clone()),
-                None => return Err(StoreError::NotFound { key: key.into() }),
+            let versions = g
+                .get(key)
+                .ok_or_else(|| StoreError::NotFound { key: key.into() })?;
+            match &opts.object_version_id {
+                Some(version_id) => versions
+                    .iter()
+                    .find(|version| &version.object_version_id == version_id),
+                None => versions.last(),
             }
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound { key: key.into() })?
         };
+        let data = selected
+            .body
+            .ok_or_else(|| StoreError::NotFound { key: key.into() })?;
+        let version = selected.cas_token;
         if let Some(m) = &opts.if_match
             && *m != version
         {
@@ -131,6 +157,7 @@ impl ObjectStore for MemoryStore {
                 key: key.into(),
                 size,
                 version,
+                object_version_id: Some(selected.object_version_id),
             },
             body: util::once(slice),
         })
@@ -138,18 +165,30 @@ impl ObjectStore for MemoryStore {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         self.delay().await;
-        Ok(self.objects.lock().get(key).map(|(v, d)| ObjectMeta {
-            key: key.into(),
-            size: d.len() as u64,
-            version: v.clone(),
-        }))
+        Ok(self
+            .objects
+            .lock()
+            .get(key)
+            .and_then(|versions| versions.last())
+            .and_then(|version| {
+                version.body.as_ref().map(|body| ObjectMeta {
+                    key: key.into(),
+                    size: body.len() as u64,
+                    version: version.cas_token.clone(),
+                    object_version_id: Some(version.object_version_id.clone()),
+                })
+            }))
     }
 
     async fn put(&self, key: &str, body: PutBody, opts: PutOptions) -> Result<ObjectMeta> {
         let data = body_bytes(body).await?;
         self.delay().await;
         let mut g = self.objects.lock();
-        let current = g.get(key).map(|(v, _)| v.clone());
+        let current = g.get(key).and_then(|versions| {
+            versions
+                .last()
+                .and_then(|version| version.body.as_ref().map(|_| version.cas_token.clone()))
+        });
         match (&opts.mode, &current) {
             (PutMode::Overwrite, _) => {}
             (PutMode::Create, None) => {}
@@ -167,13 +206,18 @@ impl ObjectStore for MemoryStore {
                 });
             }
         }
-        let version = self.next_version();
+        let (version, object_version_id) = self.next_version();
         let size = data.len() as u64;
-        g.insert(key.to_owned(), (version.clone(), data));
+        g.entry(key.to_owned()).or_default().push(MemoryVersion {
+            cas_token: version.clone(),
+            object_version_id: object_version_id.clone(),
+            body: Some(data),
+        });
         Ok(ObjectMeta {
             key: key.into(),
             size,
             version,
+            object_version_id: Some(object_version_id),
         })
     }
 
@@ -187,37 +231,182 @@ impl ObjectStore for MemoryStore {
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
+        if sources.is_empty() {
+            return Err(StoreError::InvalidArgument(
+                "compose needs at least one source".into(),
+            ));
+        }
         let mut buf = bytes::BytesMut::new();
         {
             let g = self.objects.lock();
-            for src in sources {
-                let (_, data) = g
-                    .get(src)
-                    .ok_or_else(|| StoreError::NotFound { key: src.clone() })?;
+            for source in sources {
+                let version = g
+                    .get(&source.key)
+                    .and_then(|versions| {
+                        versions
+                            .iter()
+                            .find(|version| version.object_version_id == source.object_version_id)
+                    })
+                    .ok_or_else(|| StoreError::NotFound {
+                        key: source.key.clone(),
+                    })?;
+                let data = version.body.as_ref().ok_or_else(|| StoreError::NotFound {
+                    key: source.key.clone(),
+                })?;
+                if version.cas_token != source.cas_token {
+                    return Err(StoreError::PreconditionFailed {
+                        key: source.key.clone(),
+                        current: Some(version.cas_token.clone()),
+                    });
+                }
+                if data.len() as u64 != source.size {
+                    return Err(StoreError::InvalidArgument(format!(
+                        "compose source {} size is {}, expected {}",
+                        source.key,
+                        data.len(),
+                        source.size
+                    )));
+                }
                 buf.extend_from_slice(data);
             }
         }
         self.put(dest, PutBody::Bytes(buf.freeze()), opts).await
     }
 
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
         self.delay().await;
         let mut g = self.objects.lock();
-        match (g.get(key), if_version) {
+        let current = g.get(key).and_then(|versions| versions.last());
+        match (current, if_version) {
             (None, None) => Ok(()),
             (None, Some(_)) => Err(StoreError::NotFound { key: key.into() }),
-            (Some((v, _)), Some(want)) if *v != want => Err(StoreError::PreconditionFailed {
-                key: key.into(),
-                current: Some(v.clone()),
-            }),
+            (Some(version), None) if version.body.is_none() => Ok(()),
+            (Some(version), Some(_)) if version.body.is_none() => {
+                Err(StoreError::NotFound { key: key.into() })
+            }
+            (Some(version), Some(want)) if version.cas_token != want => {
+                Err(StoreError::PreconditionFailed {
+                    key: key.into(),
+                    current: Some(version.cas_token.clone()),
+                })
+            }
             _ => {
-                g.remove(key);
+                let (cas_token, object_version_id) = self.next_version();
+                g.entry(key.to_owned()).or_default().push(MemoryVersion {
+                    cas_token,
+                    object_version_id,
+                    body: None,
+                });
                 Ok(())
             }
         }
+    }
+
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        self.delay().await;
+        Ok(self.objects.lock().get(key).and_then(|versions| {
+            versions
+                .iter()
+                .find(|version| &version.object_version_id == version_id)
+                .and_then(|version| {
+                    version.body.as_ref().map(|body| ObjectMeta {
+                        key: key.to_owned(),
+                        size: body.len() as u64,
+                        version: version.cas_token.clone(),
+                        object_version_id: Some(version.object_version_id.clone()),
+                    })
+                })
+        }))
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        self.delay().await;
+        let mut objects = self.objects.lock();
+        let versions = objects.get_mut(key).ok_or_else(|| StoreError::NotFound {
+            key: key.to_owned(),
+        })?;
+        let index = versions
+            .iter()
+            .position(|version| &version.object_version_id == version_id)
+            .ok_or_else(|| StoreError::NotFound {
+                key: key.to_owned(),
+            })?;
+        versions.remove(index);
+        if versions.is_empty() {
+            objects.remove(key);
+        }
+        Ok(())
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        if !(1..=MAX_VERSION_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidArgument(format!(
+                "version page size must be in 1..={MAX_VERSION_PAGE_SIZE}"
+            )));
+        }
+        self.delay().await;
+        let start = match cursor.and_then(|cursor| cursor.page_token.as_deref()) {
+            Some(token) => token
+                .strip_prefix("memory:")
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    StoreError::InvalidArgument("invalid memory version cursor".into())
+                })?,
+            None => 0,
+        };
+        let objects = self.objects.lock();
+        let mut all = Vec::new();
+        for (key, versions) in objects
+            .range(prefix.to_owned()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            for (index, version) in versions.iter().enumerate().rev() {
+                all.push(ObjectVersion {
+                    key: key.clone(),
+                    object_version_id: version.object_version_id.clone(),
+                    cas_token: version.body.as_ref().map(|_| version.cas_token.clone()),
+                    size: version.body.as_ref().map_or(0, |body| body.len() as u64),
+                    kind: if version.body.is_some() {
+                        ObjectVersionKind::Object
+                    } else {
+                        ObjectVersionKind::DeleteMarker
+                    },
+                    is_latest: index + 1 == versions.len(),
+                });
+            }
+        }
+        if start > all.len() {
+            return Err(StoreError::InvalidArgument(
+                "memory version cursor is past the result set".into(),
+            ));
+        }
+        let end = start.saturating_add(limit).min(all.len());
+        let page = all[start..end].to_vec();
+        let next = (end < all.len()).then(|| VersionCursor {
+            key_marker: None,
+            version_id_marker: None,
+            page_token: Some(format!("memory:{end}")),
+        });
+        Ok(VersionPage {
+            versions: page,
+            next,
+        })
+    }
+
+    async fn verify_versioning(&self) -> Result<()> {
+        Ok(())
     }
 
     fn list(
@@ -230,10 +419,15 @@ impl ObjectStore for MemoryStore {
             .range(prefix.to_owned()..)
             .take_while(|(k, _)| k.starts_with(prefix))
             .filter(|(k, _)| start_after.is_none_or(|s| k.as_str() > s))
-            .map(|(k, (v, d))| ObjectMeta {
-                key: k.clone(),
-                size: d.len() as u64,
-                version: v.clone(),
+            .filter_map(|(key, versions)| {
+                let version = versions.last()?;
+                let body = version.body.as_ref()?;
+                Some(ObjectMeta {
+                    key: key.clone(),
+                    size: body.len() as u64,
+                    version: version.cas_token.clone(),
+                    object_version_id: Some(version.object_version_id.clone()),
+                })
             })
             .collect();
         futures::stream::iter(items.into_iter().map(Ok)).boxed()
@@ -244,7 +438,8 @@ impl ObjectStore for MemoryStore {
         let mut out: Vec<String> = g
             .range(prefix.to_owned()..)
             .take_while(|(k, _)| k.starts_with(prefix))
-            .filter_map(|(k, _)| {
+            .filter_map(|(k, versions)| {
+                versions.last()?.body.as_ref()?;
                 let rest = &k[prefix.len()..];
                 rest.find('/').map(|i| format!("{prefix}{}/", &rest[..i]))
             })
@@ -257,7 +452,7 @@ impl ObjectStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ObjectStoreExt;
+    use crate::{ObjectStoreExt, ObjectVersionKind};
 
     #[tokio::test]
     async fn cas_semantics() {
@@ -291,6 +486,109 @@ mod tests {
         );
         s.delete("k", Some(m2.version)).await.unwrap();
         assert!(s.get_bytes("k").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn historical_versions_are_exact_and_delete_markers_restore_history() {
+        let s = MemoryStore::new();
+        s.verify_versioning().await.unwrap();
+
+        let first = s
+            .put_bytes("history", "first", PutMode::Create)
+            .await
+            .unwrap();
+        let second = s
+            .put_bytes("history", "second", PutMode::Overwrite)
+            .await
+            .unwrap();
+        let first_id = first.object_version_id.clone().unwrap();
+        let second_id = second.object_version_id.clone().unwrap();
+        assert_ne!(first_id, second_id);
+
+        let (_, old) = s
+            .get_version("history", &first_id, None)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&old[..], b"first");
+
+        s.delete_version("history", &first_id).await.unwrap();
+        assert_eq!(
+            s.head("history").await.unwrap().unwrap().object_version_id,
+            Some(second_id.clone())
+        );
+
+        s.delete("history", None).await.unwrap();
+        assert!(s.head("history").await.unwrap().is_none());
+        let page = s.list_versions("history", None, 1).await.unwrap();
+        assert_eq!(page.versions.len(), 1);
+        assert!(page.next.is_some());
+        let next = s
+            .list_versions("history", page.next.as_ref(), 1)
+            .await
+            .unwrap();
+        let marker = page
+            .versions
+            .iter()
+            .chain(&next.versions)
+            .find(|version| version.kind == ObjectVersionKind::DeleteMarker)
+            .expect("delete marker");
+        s.delete_version("history", &marker.object_version_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.head("history").await.unwrap().unwrap().object_version_id,
+            Some(second_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_payloads_have_distinct_historical_ids() {
+        let s = MemoryStore::new();
+        let first = s
+            .put_bytes("same", "payload", PutMode::Create)
+            .await
+            .unwrap();
+        let second = s
+            .put_bytes("same", "payload", PutMode::Overwrite)
+            .await
+            .unwrap();
+        assert_ne!(first.object_version_id, second.object_version_id);
+    }
+
+    #[tokio::test]
+    async fn compose_pins_an_exact_source_version() {
+        let s = MemoryStore::new();
+        let old = s.put_bytes("source", "old", PutMode::Create).await.unwrap();
+        let source = ComposeSource::try_from(old).unwrap();
+        s.put_bytes("source", "new", PutMode::Overwrite)
+            .await
+            .unwrap();
+
+        s.compose("dest", &[source], PutOptions::from(PutMode::Create))
+            .await
+            .unwrap();
+        let (_, body) = s.get_bytes("dest").await.unwrap().unwrap();
+        assert_eq!(&body[..], b"old");
+    }
+
+    #[tokio::test]
+    async fn list_prefixes_ignores_deleted_latest_versions() {
+        let s = MemoryStore::new();
+        s.put_bytes("root/deleted/item", "old", PutMode::Create)
+            .await
+            .unwrap();
+        s.delete("root/deleted/item", None).await.unwrap();
+        s.put_bytes("root/live/item", "live", PutMode::Create)
+            .await
+            .unwrap();
+
+        assert_eq!(s.list_prefixes("root/").await.unwrap(), ["root/live/"]);
+        s.delete("root/live/item", None).await.unwrap();
+        assert!(s.list_prefixes("root/").await.unwrap().is_empty());
     }
 
     #[tokio::test]

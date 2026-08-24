@@ -19,11 +19,12 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
 - `walgit-proto`: prost types from `proto/walgit/v1/wal.proto` (Manifest, LogSegmentRef, LogEntry, PackRef,
   RefTransaction/RefUpdate, Checkpoint(+Ref), RefSnapshot/Ref, Lease, BundleList/BundleEntry); `keys::*`;
   `frame::{encode_entries,decode_entries}` (uvarint-framed log encoding); `time::*`; `keys::POLICY` / `policy_key` (`policy.json` rule language, `docs/POLICY.md`).
-- `walgit-store`: `ObjectStore` trait (`Version` opaque CAS token, `GetOptions{if_none_match,if_match,range}`,
-  `GetResult::{NotModified,Object}`, `PutMode::{Overwrite,Create,Update(Version)}`, `PutBody::{Bytes,Stream,File}`,
-  `PutOptions`, `StoreError::{NotFound,PreconditionFailed{current},Retryable,InvalidArgument,Other}`,
-  `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, `util::{collect,once,file_stream,backoff,retry}`),
-  placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`.
+- `walgit-store`: `CasToken` is the opaque conditional-write identity. `ObjectVersionId` is the distinct
+  immutable history identity carried by `ObjectMeta::object_version_id`
+  and `GetOptions::object_version_id`. `ObjectStore` provides exact-version GET/HEAD/delete and bounded opaque
+  `list_versions` pagination over objects and provider delete markers. `ComposeSource` pins each input by key,
+  size, CAS token, and object-version ID. `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, and
+  `util::{collect,once,file_stream,backoff,retry}` preserve the shared implementation surface.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
   only `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]` in repo-scoped settings.
 
@@ -135,10 +136,10 @@ pub async fn cas_update<T: prost::Message + Default, F>(store: &dyn ObjectStore,
 /// Read a protobuf object with its version. Ok(None) if absent.
 pub async fn get_message<T: prost::Message + Default>(store: &dyn ObjectStore, key: &str)
     -> Result<Option<(ObjectMeta, T)>, CoordError>;
-pub async fn get_message_if_changed<T>(store, key, known: &Version) -> Result<Option<(ObjectMeta, T)>, CoordError>;
+pub async fn get_message_if_changed<T>(store, key, known: &CasToken) -> Result<Option<(ObjectMeta, T)>, CoordError>;
 
 /// Lease = walgit_proto::v1::Lease at `key`, acquired by Create or by Update over an expired lease.
-pub struct LeaseGuard; // holds store handle, key, holder id, current Version; Drop => best-effort release
+pub struct LeaseGuard; // holds store handle, key, holder id, current CasToken; Drop => best-effort release
 impl LeaseGuard {
   pub async fn heartbeat(&mut self, ttl: Duration) -> Result<(), CoordError>;      // CAS-extend expires_at
   pub async fn release(self) -> Result<(), CoordError>;                            // CAS delete
@@ -162,6 +163,11 @@ pub struct GcsStore; impl GcsStore { pub async fn new(cfg: &walgit_config::Store
 // lib.rs
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>; // by cfg.store.backend, applies Prefixed(cfg.store_prefix())
 ```
+S3 and GCS constructors fail closed unless bucket versioning is enabled. GCS
+also requires soft-delete retention to be absent or exactly zero so an exact
+generation delete is permanent. WalGit verifies these prerequisites but never
+changes bucket policy.
+
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for S3 when `WALGIT_TEST_S3_ENDPOINT` is set (endpoint, region, bucket, prefix, addressing mode,
 and default-chain/explicit credentials are parameterized with `WALGIT_TEST_S3_*`; every run adds a unique suffix),
@@ -199,7 +205,7 @@ impl RepoHandle {
   pub fn local(&self) -> &LocalRepo;
   pub fn store(&self) -> &Prefixed;                       // repo-scoped
   pub fn manifest(&self) -> Arc<walgit_proto::v1::Manifest>;   // last known
-  pub fn manifest_version(&self) -> Option<Version>;
+  pub fn manifest_version(&self) -> Option<CasToken>;
   /// Freshness check (conditional GET on manifest.pb; honors wal.freshness_ttl) + catch-up (download new
   /// packs, apply log entries after our seq, apply COMPACT: install new pack, remove superseded). Returns a
   /// read guard; while any guard is alive no pack is removed locally. Every request calls this first.

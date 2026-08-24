@@ -13,7 +13,7 @@
 
 use moka::sync::Cache;
 use walgit_git::LsRefsLine;
-use walgit_store::Version;
+use walgit_store::CasToken;
 
 // ---------------------------------------------------------------------------
 // Ref advertisement cache
@@ -33,7 +33,7 @@ struct RefAdvertKey {
     unborn: bool,
 }
 
-fn v0_key(repo: &str, version: Option<&Version>, service: walgit_git::Service) -> RefAdvertKey {
+fn v0_key(repo: &str, version: Option<&CasToken>, service: walgit_git::Service) -> RefAdvertKey {
     RefAdvertKey {
         repo: repo.to_string(),
         version: version.map(|v| v.as_str().to_string()).unwrap_or_default(),
@@ -48,7 +48,7 @@ fn v0_key(repo: &str, version: Option<&Version>, service: walgit_git::Service) -
     }
 }
 
-fn v2_key(repo: &str, version: Option<&Version>, args: &walgit_git::LsRefsArgs) -> RefAdvertKey {
+fn v2_key(repo: &str, version: Option<&CasToken>, args: &walgit_git::LsRefsArgs) -> RefAdvertKey {
     RefAdvertKey {
         repo: repo.to_string(),
         version: version.map(|v| v.as_str().to_string()).unwrap_or_default(),
@@ -79,7 +79,7 @@ impl RefAdvertCache {
     pub fn get_v0(
         &self,
         repo: &str,
-        version: Option<&Version>,
+        version: Option<&CasToken>,
         service: walgit_git::Service,
     ) -> Option<Vec<u8>> {
         let key = v0_key(repo, version, service);
@@ -99,7 +99,7 @@ impl RefAdvertCache {
     pub fn insert_v0(
         &self,
         repo: &str,
-        version: Option<&Version>,
+        version: Option<&CasToken>,
         service: walgit_git::Service,
         buf: Vec<u8>,
     ) {
@@ -110,7 +110,7 @@ impl RefAdvertCache {
     pub fn get_v2_ls_refs(
         &self,
         repo: &str,
-        version: Option<&Version>,
+        version: Option<&CasToken>,
         args: &walgit_git::LsRefsArgs,
     ) -> Option<Vec<LsRefsLine>> {
         let key = v2_key(repo, version, args);
@@ -130,7 +130,7 @@ impl RefAdvertCache {
     pub fn insert_v2_ls_refs(
         &self,
         repo: &str,
-        version: Option<&Version>,
+        version: Option<&CasToken>,
         args: &walgit_git::LsRefsArgs,
         lines: Vec<LsRefsLine>,
     ) {
@@ -147,7 +147,7 @@ impl RefAdvertCache {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct BundleListKey {
     repo: String,
-    /// Version (generation) of `bundles/list.pb` the text was rendered from.
+    /// CasToken (generation) of `bundles/list.pb` the text was rendered from.
     list_version: String,
 }
 
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn ref_advert_cache_hit_miss() {
         let cache = RefAdvertCache::new(16);
-        let version = Version::new("v1");
+        let version = CasToken::new("v1");
 
         assert!(
             cache
@@ -425,8 +425,8 @@ mod tests {
     #[test]
     fn ref_advert_cache_invalidated_by_version() {
         let cache = RefAdvertCache::new(16);
-        let v1 = Version::new("v1");
-        let v2 = Version::new("v2");
+        let v1 = CasToken::new("v1");
+        let v2 = CasToken::new("v2");
 
         cache.insert_v0(
             "acme/monorepo",
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn ls_refs_cache_different_prefixes() {
         let cache = RefAdvertCache::new(16);
-        let version = Version::new("v1");
+        let version = CasToken::new("v1");
         let args1 = make_args(&["refs/heads/"]);
         let args2 = make_args(&["refs/tags/"]);
 
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn cache_eviction_by_size() {
         let cache = RefAdvertCache::new(2);
-        let v = Version::new("v1");
+        let v = CasToken::new("v1");
 
         // Insert 3 entries with capacity 2 — the oldest should be evicted.
         cache.insert_v0(
@@ -621,7 +621,7 @@ mod tests {
         repo.refresh().unwrap();
 
         let cache = RefAdvertCache::new(16);
-        let version = Version::new("v1");
+        let version = CasToken::new("v1");
 
         // Measure: cache miss (first render).
         let start = Instant::now();

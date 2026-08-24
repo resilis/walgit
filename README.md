@@ -25,6 +25,9 @@ endpoint = "https://s3.us-east-1.amazonaws.com"
 region = "us-east-1"
 EOF
 
+# WalGit startup fails closed for S3 and GCS unless bucket versioning is enabled.
+# GCS soft-delete retention must also be disabled so exact deletion is permanent.
+
 # 2. run it
 WALGIT_TOKEN_ME=$(openssl rand -hex 24) walgit serve --config walgit.toml
 
@@ -165,7 +168,7 @@ Code map:
 ```
 crates/
   walgit-proto    protobuf schema (wal.proto), log framing, store keys
-  walgit-store    ObjectStore trait (CAS versions, conditional GET, range, compose); backends s3, gcs, memory; leases
+  walgit-store    ObjectStore (CAS tokens, exact version history, range, pinned compose); backends s3, gcs, memory; leases
   walgit-git      bare repos on disk, receive-pack, pack ingest, refs ↔ packed-refs, advertisements, upload-pack drivers
   walgit-wal      RepoHandle: sync levels, publish (group commit + CAS), checkpoints, log reader, remote reader, tasks
   walgit-bundle   bundle-uri: slots and chains, building, header ∘ pack composition, lists, retention

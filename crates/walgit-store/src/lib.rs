@@ -7,8 +7,9 @@
 //! * conditional writes (`Create` = if-absent, `Update(v)` = CAS on version),
 //! * conditional deletes, range reads, streaming bodies, prefix listing.
 //!
-//! [`Version`] is opaque to callers: GCS generation, S3/rustfs ETag, or a
-//! counter in [`memory::MemoryStore`]. Callers must never parse it.
+//! [`CasToken`] is opaque to callers: GCS generation, S3/rustfs ETag, or a
+//! counter in [`memory::MemoryStore`]. [`ObjectVersionId`] is a separate opaque
+//! historical identity. Callers must never parse or interchange them.
 
 use std::{fmt, ops::Range, pin::Pin, sync::Arc};
 
@@ -29,28 +30,54 @@ pub mod util;
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 pub type ByteStream = BoxStream<'static, Result<Bytes, StoreError>>;
 
-/// Opaque object version (GCS generation / ETag / counter). Compare only for equality.
+/// Opaque token for a conditional update. Compare only for equality.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct Version(Arc<str>);
+pub struct CasToken(Arc<str>);
 
-impl Version {
+impl CasToken {
     pub fn new(s: impl Into<Arc<str>>) -> Self {
-        Version(s.into())
+        CasToken(s.into())
     }
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
-impl fmt::Debug for Version {
+impl fmt::Debug for CasToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "v{:?}", &*self.0)
     }
 }
-impl fmt::Display for Version {
+impl fmt::Display for CasToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
+
+/// Opaque identity of one immutable historical object version.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ObjectVersionId(Arc<str>);
+
+impl ObjectVersionId {
+    pub fn new(s: impl Into<Arc<str>>) -> Self {
+        ObjectVersionId(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Debug for ObjectVersionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "vid{:?}", &*self.0)
+    }
+}
+impl fmt::Display for ObjectVersionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Charter spelling for [`ObjectVersionId`].
+pub type ObjectVersionID = ObjectVersionId;
 
 /// What an edge needs to fetch one object itself (see [`ObjectStore::accel_target`]).
 #[derive(Debug, Clone)]
@@ -67,21 +94,95 @@ pub struct ObjectMeta {
     /// Size of the whole object in bytes — also for range reads (HTTP
     /// `Content-Range: bytes a-b/total` needs it).
     pub size: u64,
-    pub version: Version,
+    pub version: CasToken,
+    /// Historical identity returned by a version-aware provider. `None` means
+    /// the provider did not return one; callers must not substitute `version`.
+    pub object_version_id: Option<ObjectVersionId>,
+}
+
+/// One immutable input to a server-side compose operation.
+///
+/// Compose callers must capture this reference from the write or exact HEAD
+/// that admitted the source. Backends must read precisely this historical
+/// version and must also enforce the expected CAS token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposeSource {
+    pub key: String,
+    pub size: u64,
+    pub cas_token: CasToken,
+    pub object_version_id: ObjectVersionId,
+}
+
+impl TryFrom<ObjectMeta> for ComposeSource {
+    type Error = StoreError;
+
+    fn try_from(meta: ObjectMeta) -> Result<Self> {
+        let object_version_id = meta.object_version_id.ok_or_else(|| {
+            StoreError::InvalidArgument(format!(
+                "compose source {} has no ObjectVersionId",
+                meta.key
+            ))
+        })?;
+        Ok(Self {
+            key: meta.key,
+            size: meta.size,
+            cas_token: meta.version,
+            object_version_id,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct GetOptions {
     /// Return `GetResult::NotModified` if the current version equals this.
-    pub if_none_match: Option<Version>,
+    pub if_none_match: Option<CasToken>,
     /// Fail with `PreconditionFailed` if the current version differs from this.
-    pub if_match: Option<Version>,
+    pub if_match: Option<CasToken>,
     /// Byte range to read (half-open). `None` = whole object.
     pub range: Option<Range<u64>>,
+    /// Select one exact historical object version instead of the current one.
+    pub object_version_id: Option<ObjectVersionId>,
 }
 
+/// The kind of one item returned by historical version enumeration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectVersionKind {
+    Object,
+    DeleteMarker,
+}
+
+/// One exact historical version or delete marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectVersion {
+    pub key: String,
+    pub object_version_id: ObjectVersionId,
+    /// A conditional-update token when the provider supplies one for this
+    /// object version. Delete markers have no CAS token.
+    pub cas_token: Option<CasToken>,
+    pub size: u64,
+    pub kind: ObjectVersionKind,
+    pub is_latest: bool,
+}
+
+/// Opaque provider pagination state. Callers may clone and return it only to
+/// the same store that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionCursor {
+    key_marker: Option<String>,
+    version_id_marker: Option<ObjectVersionId>,
+    page_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionPage {
+    pub versions: Vec<ObjectVersion>,
+    pub next: Option<VersionCursor>,
+}
+
+pub const MAX_VERSION_PAGE_SIZE: usize = 1_000;
+
 pub enum GetResult {
-    NotModified { version: Version },
+    NotModified { version: CasToken },
     Object { meta: ObjectMeta, body: ByteStream },
 }
 
@@ -96,7 +197,7 @@ impl GetResult {
             }
         }
     }
-    pub fn version(&self) -> &Version {
+    pub fn version(&self) -> &CasToken {
         match self {
             GetResult::NotModified { version } => version,
             GetResult::Object { meta, .. } => &meta.version,
@@ -111,7 +212,7 @@ pub enum PutMode {
     /// Only if the object does not exist (if-generation-match: 0 / If-None-Match: *).
     Create,
     /// Only if the current version equals the given one (CAS).
-    Update(Version),
+    Update(CasToken),
 }
 
 /// Body for `put`. Streams must have a known length (object stores require it
@@ -167,13 +268,28 @@ pub enum StoreError {
     #[error("precondition failed on {key} (current version: {current:?})")]
     PreconditionFailed {
         key: String,
-        current: Option<Version>,
+        current: Option<CasToken>,
     },
     /// Transient: caller may retry with backoff.
     #[error("retryable store error: {0}")]
     Retryable(#[source] anyhow::Error),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("{backend} store does not support required capability {capability}")]
+    UnsupportedCapability {
+        backend: &'static str,
+        capability: &'static str,
+    },
+    /// The provider reported a successful write but did not return enough
+    /// identity to prove which immutable version was created.
+    #[error(
+        "ambiguous successful {operation} for {key} on {backend}: provider omitted a usable ObjectVersionId"
+    )]
+    AmbiguousWrite {
+        backend: &'static str,
+        operation: &'static str,
+        key: String,
+    },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -217,7 +333,51 @@ pub trait ObjectStore: Send + Sync + 'static {
 
     /// Delete. `if_version` = CAS delete. Deleting an absent object is `Ok(())`
     /// when unconditional and `NotFound` when conditional.
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()>;
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()>;
+
+    /// Metadata for one exact historical version. Delete markers and missing
+    /// versions return `Ok(None)`.
+    async fn head_version(
+        &self,
+        _key: &str,
+        _version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        Err(StoreError::UnsupportedCapability {
+            backend: self.backend(),
+            capability: "exact-version-head",
+        })
+    }
+
+    /// Permanently delete exactly one named historical version. This must
+    /// never delete the current or another historical version by fallback.
+    async fn delete_version(&self, _key: &str, _version_id: &ObjectVersionId) -> Result<()> {
+        Err(StoreError::UnsupportedCapability {
+            backend: self.backend(),
+            capability: "exact-version-delete",
+        })
+    }
+
+    /// Return at most `limit` historical versions/delete markers under
+    /// `prefix`, plus provider pagination state.
+    async fn list_versions(
+        &self,
+        _prefix: &str,
+        _cursor: Option<&VersionCursor>,
+        _limit: usize,
+    ) -> Result<VersionPage> {
+        Err(StoreError::UnsupportedCapability {
+            backend: self.backend(),
+            capability: "version-enumeration",
+        })
+    }
+
+    /// Fail closed unless the backing bucket retains historical versions.
+    async fn verify_versioning(&self) -> Result<()> {
+        Err(StoreError::UnsupportedCapability {
+            backend: self.backend(),
+            capability: "bucket-versioning",
+        })
+    }
 
     /// Lexicographically ordered listing of keys with `prefix`, starting after
     /// `start_after` if given. Backends page internally.
@@ -270,7 +430,7 @@ pub trait ObjectStore: Send + Sync + 'static {
     async fn compose(
         &self,
         _dest: &str,
-        _sources: &[String],
+        _sources: &[ComposeSource],
         _opts: PutOptions,
     ) -> Result<ObjectMeta> {
         Err(StoreError::InvalidArgument(
@@ -295,7 +455,7 @@ pub trait ObjectStoreExt: ObjectStore {
     async fn get_if_changed(
         &self,
         key: &str,
-        known: &Version,
+        known: &CasToken,
     ) -> Result<Option<(ObjectMeta, Bytes)>> {
         let r = self
             .get(
@@ -319,6 +479,24 @@ pub trait ObjectStoreExt: ObjectStore {
     }
     async fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.head(key).await?.is_some())
+    }
+
+    /// Read one exact historical version, optionally by byte range.
+    async fn get_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+        range: Option<Range<u64>>,
+    ) -> Result<GetResult> {
+        self.get(
+            key,
+            GetOptions {
+                range,
+                object_version_id: Some(version_id.clone()),
+                ..Default::default()
+            },
+        )
+        .await
     }
 }
 impl<T: ObjectStore + ?Sized> ObjectStoreExt for T {}
@@ -514,7 +692,7 @@ impl ObjectStore for Prefixed {
         }
         result.map(|m| self.strip(m))
     }
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
         let instrument = !self.inner.is_prefixed();
         let full_key = self.full(key);
         // No span at all for nested prefix layers (avoids duplicate lines).
@@ -555,6 +733,40 @@ impl ObjectStore for Prefixed {
             }
         }
         result
+    }
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        Ok(self
+            .inner
+            .head_version(&self.full(key), version_id)
+            .await?
+            .map(|meta| self.strip(meta)))
+    }
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        self.inner.delete_version(&self.full(key), version_id).await
+    }
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        let mut page = self
+            .inner
+            .list_versions(&self.full(prefix), cursor, limit)
+            .await?;
+        for version in &mut page.versions {
+            if let Some(rest) = version.key.strip_prefix(&*self.prefix) {
+                version.key = rest.to_owned();
+            }
+        }
+        Ok(page)
+    }
+    async fn verify_versioning(&self) -> Result<()> {
+        self.inner.verify_versioning().await
     }
     fn list(
         &self,
@@ -617,10 +829,17 @@ impl ObjectStore for Prefixed {
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
-        let full_sources: Vec<String> = sources.iter().map(|s| self.full(s)).collect();
+        let full_sources: Vec<ComposeSource> = sources
+            .iter()
+            .cloned()
+            .map(|mut source| {
+                source.key = self.full(&source.key);
+                source
+            })
+            .collect();
         let meta = self
             .inner
             .compose(&self.full(dest), &full_sources, opts)

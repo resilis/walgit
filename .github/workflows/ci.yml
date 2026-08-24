@@ -209,12 +209,18 @@ jobs:
           rustup default 1.97.1
 
       - name: Create unique disposable bucket
-        run: >-
-          docker run --rm --network host
-          -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION
-          amazon/aws-cli@sha256:6a1305a37e63914356f9d1808f3349c06a650cbd6e7c777f5dc4b44d630d6b39
-          --endpoint-url "${WALGIT_TEST_S3_ENDPOINT}"
-          s3api create-bucket --bucket "${S3_BUCKET}"
+        run: |
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+            amazon/aws-cli@sha256:6a1305a37e63914356f9d1808f3349c06a650cbd6e7c777f5dc4b44d630d6b39 \
+            --endpoint-url "${WALGIT_TEST_S3_ENDPOINT}" \
+            s3api create-bucket --bucket "${S3_BUCKET}"
+          docker run --rm --network host \
+            -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
+            amazon/aws-cli@sha256:6a1305a37e63914356f9d1808f3349c06a650cbd6e7c777f5dc4b44d630d6b39 \
+            --endpoint-url "${WALGIT_TEST_S3_ENDPOINT}" \
+            s3api put-bucket-versioning --bucket "${S3_BUCKET}" \
+            --versioning-configuration Status=Enabled
 
       - name: Run S3 contract
         env:
@@ -229,14 +235,34 @@ jobs:
             -e S3_BUCKET -e WALGIT_TEST_S3_ENDPOINT \
             amazon/aws-cli@sha256:6a1305a37e63914356f9d1808f3349c06a650cbd6e7c777f5dc4b44d630d6b39 \
             -c '
-              aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3 rm "s3://$S3_BUCKET" --recursive || true
+              set -eu
+              for query in "Versions[].[Key,VersionId]" "DeleteMarkers[].[Key,VersionId]"; do
+                aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api list-object-versions \
+                  --bucket "$S3_BUCKET" --query "$query" --output text > /tmp/walgit-versions
+                while IFS="$(printf "\t")" read -r key version_id; do
+                    [ -n "$key" ] && [ "$key" != "None" ] || continue
+                    [ -n "$version_id" ] && [ "$version_id" != "None" ]
+                    aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api delete-object \
+                      --bucket "$S3_BUCKET" --key "$key" --version-id "$version_id"
+                done < /tmp/walgit-versions
+              done
               aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api list-multipart-uploads \
-                --bucket "$S3_BUCKET" --query "Uploads[].[Key,UploadId]" --output text 2>/dev/null |
-                while read -r key upload_id; do
+                --bucket "$S3_BUCKET" --query "Uploads[].[Key,UploadId]" --output text > /tmp/walgit-uploads
+              while IFS="$(printf "\t")" read -r key upload_id; do
                   [ -n "$key" ] && [ "$key" != "None" ] || continue
+                  [ -n "$upload_id" ] && [ "$upload_id" != "None" ]
                   aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api abort-multipart-upload \
-                    --bucket "$S3_BUCKET" --key "$key" --upload-id "$upload_id" || true
-                done
+                    --bucket "$S3_BUCKET" --key "$key" --upload-id "$upload_id"
+              done < /tmp/walgit-uploads
+              versions="$(aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api list-object-versions \
+                --bucket "$S3_BUCKET" --query "Versions[].VersionId" --output text)"
+              markers="$(aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api list-object-versions \
+                --bucket "$S3_BUCKET" --query "DeleteMarkers[].VersionId" --output text)"
+              uploads="$(aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api list-multipart-uploads \
+                --bucket "$S3_BUCKET" --query "Uploads[].UploadId" --output text)"
+              [ -z "$versions" ] || [ "$versions" = "None" ]
+              [ -z "$markers" ] || [ "$markers" = "None" ]
+              [ -z "$uploads" ] || [ "$uploads" = "None" ]
               aws --endpoint-url "$WALGIT_TEST_S3_ENDPOINT" s3api delete-bucket \
-                --bucket "$S3_BUCKET" || true
+                --bucket "$S3_BUCKET"
             '
