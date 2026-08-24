@@ -19,6 +19,18 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
 - `walgit-proto`: prost types from `proto/walgit/v1/wal.proto` (Manifest, LogSegmentRef, LogEntry, PackRef,
   RefTransaction/RefUpdate, Checkpoint(+Ref), RefSnapshot/Ref, Lease, BundleList/BundleEntry); `keys::*`;
   `frame::{encode_entries,decode_entries}` (uvarint-framed log encoding); `time::*`; `keys::POLICY` / `policy_key` (`policy.json` rule language, `docs/POLICY.md`).
+- `walgit-proto::v2`: dormant additive `RepoControl` types from
+  `proto/walgit/v2/control.proto`; descriptor-visible message, byte, and count
+  bounds from `proto/walgit/v2/options.proto`; the strict
+  `v2::{encode_repo_control,decode_repo_control,preflight_repo_control}` codec;
+  distinct canonical-path, routing, protobuf-object, raw-payload,
+  signed-envelope, and verification-ring digest types; and the exhaustive
+  `v2::keys` grammar with a closed key-kind-to-digest mapping from the frozen
+  V5.8 production architecture. The raw
+  preflight runs before generated decode and rejects non-canonical or unbounded
+  protobuf input. V2 is not read or written by the V1 registry, WAL, server,
+  CLI, bundle, policy, or coordination paths. Creating these types does not
+  create a production V2 object or a legacy-adoption migration.
 - `walgit-store`: `CasToken` is the opaque conditional-write identity. `ObjectVersionId` is the distinct
   immutable history identity carried by `ObjectMeta::object_version_id`
   and `GetOptions::object_version_id`. `ObjectStore` provides exact-version GET/HEAD/delete and bounded opaque

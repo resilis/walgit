@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package walgit.v2;
+
+import "google/protobuf/descriptor.proto";
+
+// Persisted V2 protobuf is bounded from its descriptors. These option numbers
+// are part of the stored-format contract and must never be reused.
+extend google.protobuf.MessageOptions {
+  uint64 max_encoded_bytes = 51001;
+}
+
+extend google.protobuf.FieldOptions {
+  uint64 min_bytes = 51002;
+  uint64 max_bytes = 51003;
+  uint64 min_items = 51004;
+  uint64 max_items = 51005;
+}

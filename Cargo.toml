@@ -43,6 +43,7 @@ rust-embed = "8"
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
+prost-reflect = "0.16.5"
 tonic = "0.14"
 axum = { version = "0.8", features = ["http2", "macros"] }
 hyper = { version = "1", features = ["full"] }

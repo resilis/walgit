@@ -1,0 +1,265 @@
+syntax = "proto3";
+
+package walgit.v2;
+
+import "walgit/v2/options.proto";
+
+enum ObjectFormat {
+  OBJECT_FORMAT_UNSPECIFIED = 0;
+  OBJECT_FORMAT_SHA1 = 1;
+  OBJECT_FORMAT_SHA256 = 2;
+}
+
+enum Lifecycle {
+  LIFECYCLE_UNSPECIFIED = 0;
+  LIFECYCLE_ACTIVE = 1;
+  LIFECYCLE_DELETING = 2;
+  LIFECYCLE_TOMBSTONED = 3;
+}
+
+enum Visibility {
+  VISIBILITY_UNSPECIFIED = 0;
+  VISIBILITY_PRIVATE = 1;
+  VISIBILITY_INTERNAL = 2;
+  VISIBILITY_PUBLIC = 3;
+}
+
+enum GrantRole {
+  GRANT_ROLE_UNSPECIFIED = 0;
+  GRANT_ROLE_READER = 1;
+  GRANT_ROLE_WRITER = 2;
+  GRANT_ROLE_ADMINISTRATOR = 3;
+}
+
+enum CatalogKind {
+  CATALOG_KIND_UNSPECIFIED = 0;
+  CATALOG_KIND_PACK = 1;
+  CATALOG_KIND_REF_DELTA = 2;
+  CATALOG_KIND_GRANT = 3;
+  CATALOG_KIND_RECEIPT = 4;
+  CATALOG_KIND_EVENT = 5;
+  CATALOG_KIND_PIN = 6;
+  CATALOG_KIND_GIT_OWNERSHIP = 7;
+  CATALOG_KIND_LFS_OWNERSHIP = 8;
+  CATALOG_KIND_BUNDLE = 9;
+  CATALOG_KIND_RECOVERY = 10;
+  CATALOG_KIND_AUDIT = 11;
+  CATALOG_KIND_RECLAMATION = 12;
+}
+
+enum WalEntryKind {
+  WAL_ENTRY_KIND_UNSPECIFIED = 0;
+  WAL_ENTRY_KIND_PUSH = 1;
+  WAL_ENTRY_KIND_REF_UPDATE = 2;
+  WAL_ENTRY_KIND_COMPACTION = 3;
+  WAL_ENTRY_KIND_CHECKPOINT = 4;
+  WAL_ENTRY_KIND_SETTINGS = 5;
+  WAL_ENTRY_KIND_POLICY = 6;
+  WAL_ENTRY_KIND_GRANTS = 7;
+  WAL_ENTRY_KIND_LIFECYCLE = 8;
+  WAL_ENTRY_KIND_BUNDLE = 9;
+  WAL_ENTRY_KIND_PIN = 10;
+  WAL_ENTRY_KIND_EVENT = 11;
+  WAL_ENTRY_KIND_RECLAMATION = 12;
+}
+
+enum ReclamationPhase {
+  RECLAMATION_PHASE_UNSPECIFIED = 0;
+  RECLAMATION_PHASE_IDLE = 1;
+  RECLAMATION_PHASE_SCANNING = 2;
+  RECLAMATION_PHASE_DELETING = 3;
+  RECLAMATION_PHASE_VERIFYING = 4;
+}
+
+message RepositoryIdentity {
+  option (max_encoded_bytes) = 2048;
+
+  bytes tenant_id = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes project_id = 2 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes repository_uuid = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 generation = 4;
+  bytes canonical_path = 5 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes canonical_path_digest = 6 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes routing_digest = 7 [(min_bytes) = 32, (max_bytes) = 32];
+}
+
+// An authoritative parent reference. The referenced immutable body does not
+// contain its own key, version, digest, or size.
+message TargetObjectRef {
+  option (max_encoded_bytes) = 4096;
+
+  RepositoryIdentity identity = 1;
+  bytes key = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 3 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 4 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 5;
+}
+
+message CatalogRoot {
+  option (max_encoded_bytes) = 4096;
+
+  CatalogKind kind = 1;
+  TargetObjectRef object = 2;
+  uint32 depth = 3;
+  uint64 node_count = 4;
+  uint64 item_count = 5;
+  uint64 total_encoded_bytes = 6;
+}
+
+message WriterFence {
+  option (max_encoded_bytes) = 4096;
+
+  bytes holder = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 epoch = 2;
+}
+
+message QuotaState {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 logical_quota_bytes = 1;
+  uint64 charged_git_bytes = 2;
+  uint64 charged_lfs_bytes = 3;
+}
+
+message CapacityBinding {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 allocation_epoch = 1;
+  uint32 shard = 2;
+  bytes shard_key = 3 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes shard_object_version_id = 4 [(min_bytes) = 1, (max_bytes) = 1024];
+  uint64 shard_budget_bytes = 5;
+  uint64 tenant_slice_bytes = 6;
+  bytes shard_digest = 7 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 shard_size = 8;
+}
+
+message BucketSafetyBinding {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 epoch = 1;
+  bytes safety_digest = 2 [(min_bytes) = 32, (max_bytes) = 32];
+}
+
+message PackRoot {
+  option (max_encoded_bytes) = 4096;
+
+  TargetObjectRef object = 1;
+  bytes git_object_id = 2 [(min_bytes) = 20, (max_bytes) = 32];
+  uint64 introduced_wal_sequence = 3;
+  uint64 object_count = 4;
+}
+
+message InlinePackRoots {
+  option (max_encoded_bytes) = 1048576;
+
+  repeated PackRoot roots = 1 [(min_items) = 0, (max_items) = 4096];
+}
+
+message RepositoryGrant {
+  option (max_encoded_bytes) = 4096;
+
+  bytes issuer = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes subject = 2 [(min_bytes) = 1, (max_bytes) = 256];
+  GrantRole role = 3;
+}
+
+message InlineGrants {
+  option (max_encoded_bytes) = 1048576;
+
+  repeated RepositoryGrant grants = 1 [(min_items) = 0, (max_items) = 256];
+}
+
+message RefChange {
+  option (max_encoded_bytes) = 4096;
+
+  bytes name = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes old_object_id = 2 [(min_bytes) = 0, (max_bytes) = 32];
+  bytes new_object_id = 3 [(min_bytes) = 0, (max_bytes) = 32];
+  bytes new_symbolic_target = 4 [(min_bytes) = 0, (max_bytes) = 1024];
+  bytes new_peeled_object_id = 5 [(min_bytes) = 0, (max_bytes) = 32];
+}
+
+message InlineRefChanges {
+  option (max_encoded_bytes) = 65536;
+
+  repeated RefChange changes = 1 [(min_items) = 0, (max_items) = 256];
+}
+
+message WalTailEntry {
+  option (max_encoded_bytes) = 65536;
+
+  uint64 sequence = 1;
+  WalEntryKind kind = 2;
+  bytes mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  repeated TargetObjectRef superseded_objects = 4 [(min_items) = 0, (max_items) = 256];
+  oneof ref_representation {
+    InlineRefChanges inline_ref_changes = 5;
+    CatalogRoot ref_delta_catalog = 6;
+  }
+}
+
+message WalState {
+  option (max_encoded_bytes) = 1048576;
+
+  uint64 head_sequence = 1;
+  uint64 minimum_sequence = 2;
+  TargetObjectRef checkpoint = 3;
+  repeated WalTailEntry tail = 4 [(min_items) = 0, (max_items) = 256];
+}
+
+message ReclamationState {
+  option (max_encoded_bytes) = 4096;
+
+  ReclamationPhase phase = 1;
+  reserved 2;
+  uint64 pass_objects = 3;
+  uint64 pass_bytes = 4;
+}
+
+// The one future repository semantic authority. No V1 runtime path reads or
+// writes this message until the production hard cut.
+message RepoControl {
+  option (max_encoded_bytes) = 1048576;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  bytes create_intent_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  bytes create_intent_digest = 4 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes create_intent_cose = 5 [(min_bytes) = 1, (max_bytes) = 8192];
+  bytes repo_control_key = 6 [(min_bytes) = 1, (max_bytes) = 1024];
+  ObjectFormat object_format = 7;
+  Lifecycle lifecycle = 8;
+  Visibility visibility = 9;
+  uint64 control_revision = 10;
+  uint64 cutover_generation = 11;
+  WriterFence writer = 12;
+  uint64 authorization_epoch = 13;
+  QuotaState quota = 14;
+  CapacityBinding capacity = 15;
+  BucketSafetyBinding bucket_safety = 16;
+  bytes inline_settings = 17 [(min_bytes) = 0, (max_bytes) = 16384];
+  bytes inline_policy = 18 [(min_bytes) = 0, (max_bytes) = 65536];
+  WalState wal = 19;
+  ReclamationState reclamation = 20;
+  bytes last_internal_mutation_id = 21 [(min_bytes) = 16, (max_bytes) = 16];
+
+  CatalogRoot receipt_catalog = 22;
+  CatalogRoot event_catalog = 23;
+  CatalogRoot pin_catalog = 24;
+  CatalogRoot git_ownership_catalog = 25;
+  CatalogRoot lfs_ownership_catalog = 26;
+  CatalogRoot bundle_catalog = 27;
+  CatalogRoot recovery_catalog = 28;
+  CatalogRoot audit_catalog = 29;
+  CatalogRoot reclamation_catalog = 30;
+
+  oneof pack_representation {
+    InlinePackRoots inline_packs = 31;
+    CatalogRoot pack_catalog = 32;
+  }
+  oneof grant_representation {
+    InlineGrants inline_grants = 33;
+    CatalogRoot grant_catalog = 34;
+  }
+}
