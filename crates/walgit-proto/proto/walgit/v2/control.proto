@@ -209,10 +209,10 @@ message WalState {
 }
 
 message ReclamationState {
-  option (max_encoded_bytes) = 4096;
+  option (max_encoded_bytes) = 65536;
 
   ReclamationPhase phase = 1;
-  reserved 2;
+  bytes cursor = 2 [(min_bytes) = 0, (max_bytes) = 4096];
   uint64 pass_objects = 3;
   uint64 pass_bytes = 4;
 }

@@ -137,6 +137,7 @@ fn sample_control() -> RepoControl {
         wal: Some(WalState::default()),
         reclamation: Some(ReclamationState {
             phase: ReclamationPhase::Idle as i32,
+            cursor: Bytes::new(),
             pass_objects: 0,
             pass_bytes: 0,
         }),

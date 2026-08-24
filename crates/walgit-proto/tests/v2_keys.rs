@@ -173,6 +173,41 @@ fn every_repository_leaf_has_one_closed_kind() {
                 generation: 1,
             })
         );
+        if matches!(
+            parsed.kind,
+            V2KeyKind::Catalog(_)
+                | V2KeyKind::EventArchiveWatermark
+                | V2KeyKind::Checkpoint
+                | V2KeyKind::GitPack
+                | V2KeyKind::LfsObject
+                | V2KeyKind::Bundle
+        ) {
+            assert_eq!(
+                parsed.content_digest.unwrap().lower_hex(),
+                DIGEST,
+                "{suffix}"
+            );
+        } else {
+            assert_eq!(parsed.content_digest, None, "{suffix}");
+        }
+        if matches!(
+            parsed.kind,
+            V2KeyKind::EventArchiveWatermark
+                | V2KeyKind::Checkpoint
+                | V2KeyKind::RecoveryJournal
+                | V2KeyKind::RecoveryMapping
+                | V2KeyKind::RecoveryCatalog
+                | V2KeyKind::RecoveryPayloadReference
+                | V2KeyKind::TemporaryGitPackUpload
+                | V2KeyKind::TemporaryLfsUpload
+                | V2KeyKind::TemporaryBundleUpload
+                | V2KeyKind::TemporaryCatalogCandidate
+                | V2KeyKind::TemporaryRecoveryCopy
+        ) {
+            assert_eq!(parsed.sequence, Some(1), "{suffix}");
+        } else {
+            assert_eq!(parsed.sequence, None, "{suffix}");
+        }
     }
 }
 

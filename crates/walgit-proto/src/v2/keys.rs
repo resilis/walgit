@@ -2,7 +2,10 @@
 
 use sha2::{Digest, Sha256};
 
-use super::{CatalogKind, digests::StoredDigestKind};
+use super::{
+    CatalogKind,
+    digests::{ContentAddressDigest, StoredDigestKind},
+};
 
 const ROUTING_DOMAIN: &[u8] = b"walgit-repo-path-v1";
 
@@ -192,6 +195,8 @@ impl V2KeyKind {
 pub struct ParsedV2Key {
     pub kind: V2KeyKind,
     pub repository: Option<RepositoryKeyIdentity>,
+    pub content_digest: Option<ContentAddressDigest>,
+    pub sequence: Option<u64>,
 }
 
 pub fn parse_key(prefix: &DeploymentPrefix, key: &[u8]) -> Result<ParsedV2Key, KeyError> {
@@ -224,13 +229,13 @@ fn parse_parts(parts: &[&str]) -> Result<ParsedV2Key, KeyError> {
             return ok(V2KeyKind::BucketAdminControl, None);
         }
         ["v2", "control", "key-rings", leaf] if digest_leaf(leaf, ".cose") => {
-            return ok(V2KeyKind::VerificationKeyRing, None);
+            return ok_content(V2KeyKind::VerificationKeyRing, None, leaf, ".cose");
         }
         ["v2", "capacity", "capacity_control.pb"] => {
             return ok(V2KeyKind::CapacityControl, None);
         }
         ["v2", "capacity", "catalogs", "tenant", leaf] if digest_leaf(leaf, ".pb") => {
-            return ok(V2KeyKind::TenantCapacityCatalog, None);
+            return ok_content(V2KeyKind::TenantCapacityCatalog, None, leaf, ".pb");
         }
         ["v2", "capacity", "shards", shard, "capacity_shard.pb"] if is_lower_hex(shard, 2) => {
             return ok(V2KeyKind::CapacityShard, None);
@@ -259,11 +264,22 @@ fn parse_parts(parts: &[&str]) -> Result<ParsedV2Key, KeyError> {
         return Err(KeyError::InvalidKey);
     };
     let repository = parse_repository(uuid, generation)?;
-    let kind = parse_repository_leaf(rest)?;
-    ok(kind, Some(repository))
+    let leaf = parse_repository_leaf(rest)?;
+    Ok(ParsedV2Key {
+        kind: leaf.kind,
+        repository: Some(repository),
+        content_digest: leaf.content_digest,
+        sequence: leaf.sequence,
+    })
 }
 
-fn parse_repository_leaf(parts: &[&str]) -> Result<V2KeyKind, KeyError> {
+struct ParsedRepositoryLeaf {
+    kind: V2KeyKind,
+    content_digest: Option<ContentAddressDigest>,
+    sequence: Option<u64>,
+}
+
+fn parse_repository_leaf(parts: &[&str]) -> Result<ParsedRepositoryLeaf, KeyError> {
     if let ["catalogs", kind, leaf] = parts
         && digest_leaf(leaf, ".pb")
     {
@@ -282,71 +298,81 @@ fn parse_repository_leaf(parts: &[&str]) -> Result<V2KeyKind, KeyError> {
             "reclamation" => CatalogKind::Reclamation,
             _ => return Err(KeyError::InvalidKey),
         };
-        return Ok(V2KeyKind::Catalog(kind));
+        return leaf_content(V2KeyKind::Catalog(kind), leaf, ".pb");
     }
     match parts {
-        ["receipts", "results", leaf] if uuid_v7_leaf(leaf, ".pb") => Ok(V2KeyKind::ReceiptResult),
-        ["events", "results", leaf] if uuid_v7_leaf(leaf, ".pb") => Ok(V2KeyKind::EventResult),
+        ["receipts", "results", leaf] if uuid_v7_leaf(leaf, ".pb") => {
+            leaf_plain(V2KeyKind::ReceiptResult)
+        }
+        ["events", "results", leaf] if uuid_v7_leaf(leaf, ".pb") => {
+            leaf_plain(V2KeyKind::EventResult)
+        }
         ["events", "archive", event, leaf] if is_uuid_v7_hex(event) && digest_leaf(leaf, ".pb") => {
-            Ok(V2KeyKind::EventArchive)
+            leaf_plain(V2KeyKind::EventArchive)
         }
         ["events", "watermarks", sequence, leaf]
             if is_lower_hex(sequence, 16) && digest_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::EventArchiveWatermark)
+            leaf_content_sequence(V2KeyKind::EventArchiveWatermark, leaf, ".pb", sequence)
         }
         ["checkpoints", sequence, leaf]
             if is_lower_hex(sequence, 16) && digest_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::Checkpoint)
+            leaf_content_sequence(V2KeyKind::Checkpoint, leaf, ".pb", sequence)
         }
         ["recovery", recovery, "journal", leaf]
             if is_uuid_v7_hex(recovery) && sequence_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::RecoveryJournal)
+            leaf_sequence(V2KeyKind::RecoveryJournal, leaf, ".pb")
         }
         ["recovery", recovery, "mapping", leaf]
             if is_uuid_v7_hex(recovery) && sequence_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::RecoveryMapping)
+            leaf_sequence(V2KeyKind::RecoveryMapping, leaf, ".pb")
         }
         ["recovery", recovery, "catalog", leaf]
             if is_uuid_v7_hex(recovery) && sequence_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::RecoveryCatalog)
+            leaf_sequence(V2KeyKind::RecoveryCatalog, leaf, ".pb")
         }
         ["recovery", recovery, "payload", leaf]
             if is_uuid_v7_hex(recovery) && sequence_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::RecoveryPayloadReference)
+            leaf_sequence(V2KeyKind::RecoveryPayloadReference, leaf, ".pb")
         }
-        ["git", "packs", leaf] if digest_leaf(leaf, ".pack") => Ok(V2KeyKind::GitPack),
-        ["lfs", leaf] if digest_leaf(leaf, ".bin") => Ok(V2KeyKind::LfsObject),
-        ["bundles", leaf] if digest_leaf(leaf, ".bundle") => Ok(V2KeyKind::Bundle),
+        ["git", "packs", leaf] if digest_leaf(leaf, ".pack") => {
+            leaf_content(V2KeyKind::GitPack, leaf, ".pack")
+        }
+        ["lfs", leaf] if digest_leaf(leaf, ".bin") => {
+            leaf_content(V2KeyKind::LfsObject, leaf, ".bin")
+        }
+        ["bundles", leaf] if digest_leaf(leaf, ".bundle") => {
+            leaf_content(V2KeyKind::Bundle, leaf, ".bundle")
+        }
         ["tmp", "git-pack-upload", operation, leaf]
             if is_uuid_v7_hex(operation) && sequence_leaf(leaf, ".bin") =>
         {
-            Ok(V2KeyKind::TemporaryGitPackUpload)
+            leaf_sequence(V2KeyKind::TemporaryGitPackUpload, leaf, ".bin")
         }
         ["tmp", "lfs-upload", operation, leaf]
             if is_uuid_v7_hex(operation) && sequence_leaf(leaf, ".bin") =>
         {
-            Ok(V2KeyKind::TemporaryLfsUpload)
+            leaf_sequence(V2KeyKind::TemporaryLfsUpload, leaf, ".bin")
         }
         ["tmp", "bundle-upload", operation, leaf]
             if is_uuid_v7_hex(operation) && sequence_leaf(leaf, ".bin") =>
         {
-            Ok(V2KeyKind::TemporaryBundleUpload)
+            leaf_sequence(V2KeyKind::TemporaryBundleUpload, leaf, ".bin")
         }
         ["tmp", "catalog-candidate", operation, leaf]
             if is_uuid_v7_hex(operation) && sequence_leaf(leaf, ".pb") =>
         {
-            Ok(V2KeyKind::TemporaryCatalogCandidate)
+            leaf_sequence(V2KeyKind::TemporaryCatalogCandidate, leaf, ".pb")
         }
         ["tmp", "recovery-copy", operation, leaf]
             if is_uuid_v7_hex(operation) && sequence_leaf(leaf, ".bin") =>
         {
-            Ok(V2KeyKind::TemporaryRecoveryCopy)
+            leaf_sequence(V2KeyKind::TemporaryRecoveryCopy, leaf, ".bin")
         }
         _ => Err(KeyError::InvalidKey),
     }
@@ -401,13 +427,82 @@ fn validate_deployment_prefix(prefix: &str) -> Result<(), KeyError> {
 }
 
 fn ok(kind: V2KeyKind, repository: Option<RepositoryKeyIdentity>) -> Result<ParsedV2Key, KeyError> {
-    Ok(ParsedV2Key { kind, repository })
+    Ok(ParsedV2Key {
+        kind,
+        repository,
+        content_digest: None,
+        sequence: None,
+    })
+}
+
+fn ok_content(
+    kind: V2KeyKind,
+    repository: Option<RepositoryKeyIdentity>,
+    leaf: &str,
+    extension: &str,
+) -> Result<ParsedV2Key, KeyError> {
+    Ok(ParsedV2Key {
+        kind,
+        repository,
+        content_digest: Some(parse_content_digest(leaf, extension)?),
+        sequence: None,
+    })
+}
+
+fn leaf_plain(kind: V2KeyKind) -> Result<ParsedRepositoryLeaf, KeyError> {
+    Ok(ParsedRepositoryLeaf {
+        kind,
+        content_digest: None,
+        sequence: None,
+    })
+}
+
+fn leaf_content(
+    kind: V2KeyKind,
+    leaf: &str,
+    extension: &str,
+) -> Result<ParsedRepositoryLeaf, KeyError> {
+    Ok(ParsedRepositoryLeaf {
+        kind,
+        content_digest: Some(parse_content_digest(leaf, extension)?),
+        sequence: None,
+    })
+}
+
+fn leaf_sequence(
+    kind: V2KeyKind,
+    leaf: &str,
+    extension: &str,
+) -> Result<ParsedRepositoryLeaf, KeyError> {
+    Ok(ParsedRepositoryLeaf {
+        kind,
+        content_digest: None,
+        sequence: Some(parse_sequence_leaf(leaf, extension)?),
+    })
+}
+
+fn leaf_content_sequence(
+    kind: V2KeyKind,
+    leaf: &str,
+    extension: &str,
+    sequence: &str,
+) -> Result<ParsedRepositoryLeaf, KeyError> {
+    let mut parsed = leaf_content(kind, leaf, extension)?;
+    parsed.sequence = Some(parse_sequence(sequence)?);
+    Ok(parsed)
 }
 
 fn digest_leaf(value: &str, extension: &str) -> bool {
     value
         .strip_suffix(extension)
         .is_some_and(|digest| is_lower_hex(digest, 64))
+}
+
+fn parse_content_digest(value: &str, extension: &str) -> Result<ContentAddressDigest, KeyError> {
+    let digest = value.strip_suffix(extension).ok_or(KeyError::InvalidKey)?;
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(digest, &mut bytes).map_err(|_| KeyError::InvalidKey)?;
+    Ok(ContentAddressDigest::from_bytes(bytes))
 }
 
 fn uuid_v7_leaf(value: &str, extension: &str) -> bool {
@@ -424,6 +519,15 @@ fn sequence_leaf(value: &str, extension: &str) -> bool {
     value
         .strip_suffix(extension)
         .is_some_and(|sequence| is_lower_hex(sequence, 16))
+}
+
+fn parse_sequence_leaf(value: &str, extension: &str) -> Result<u64, KeyError> {
+    let sequence = value.strip_suffix(extension).ok_or(KeyError::InvalidKey)?;
+    parse_sequence(sequence)
+}
+
+fn parse_sequence(value: &str) -> Result<u64, KeyError> {
+    u64::from_str_radix(value, 16).map_err(|_| KeyError::InvalidKey)
 }
 
 fn is_lower_hex(value: &str, len: usize) -> bool {

@@ -359,32 +359,79 @@ fn validate_wal(
     prefix: &DeploymentPrefix,
     object_format: i32,
 ) -> Result<(), ControlValidationError> {
-    if wal.minimum_sequence > wal.head_sequence {
-        return Err(invalid(
-            "wal.minimum_sequence",
-            "cannot exceed head_sequence",
-        ));
-    }
-    if let Some(checkpoint) = &wal.checkpoint {
-        validate_target(checkpoint, identity, prefix, V2KeyKind::Checkpoint)?;
-    }
     if wal.tail.len() > 256 {
         return Err(invalid("wal.tail", "exceeds 256 entries"));
     }
-    let mut previous = None;
+
+    let checkpoint_sequence = match &wal.checkpoint {
+        Some(checkpoint) => {
+            let parsed = validate_target(checkpoint, identity, prefix, V2KeyKind::Checkpoint)?;
+            let sequence = parsed
+                .sequence
+                .ok_or_else(|| invalid("wal.checkpoint.key", "does not bind a sequence"))?;
+            if sequence > wal.head_sequence {
+                return Err(invalid(
+                    "wal.checkpoint.key",
+                    "sequence exceeds the WAL head",
+                ));
+            }
+            Some(sequence)
+        }
+        None => None,
+    };
+    let expected_minimum = match checkpoint_sequence {
+        Some(sequence) => sequence.checked_add(1).ok_or_else(|| {
+            invalid(
+                "wal.checkpoint.key",
+                "sequence cannot advance without overflowing u64",
+            )
+        })?,
+        None if wal.head_sequence == 0 => 0,
+        None => 1,
+    };
+    if wal.minimum_sequence != expected_minimum {
+        return Err(invalid(
+            "wal.minimum_sequence",
+            "does not immediately follow the checkpoint or genesis",
+        ));
+    }
+    let expected_tail_count =
+        if checkpoint_sequence.is_none() && wal.head_sequence == 0 && wal.minimum_sequence == 0 {
+            0
+        } else if wal.minimum_sequence <= wal.head_sequence {
+            wal.head_sequence
+                .checked_sub(wal.minimum_sequence)
+                .and_then(|span| span.checked_add(1))
+                .ok_or_else(|| invalid("wal.tail", "retained sequence span overflows u64"))?
+        } else {
+            0
+        };
+    if expected_tail_count > 256 {
+        return Err(invalid(
+            "wal.tail",
+            "retained sequence span exceeds 256 entries",
+        ));
+    }
+    if wal.tail.len() as u64 != expected_tail_count {
+        return Err(invalid(
+            "wal.tail",
+            "does not exactly cover minimum_sequence through head_sequence",
+        ));
+    }
+
     let mut aggregate_changes = 0usize;
-    for entry in &wal.tail {
+    for (offset, entry) in wal.tail.iter().enumerate() {
         nonzero("wal.tail.sequence", entry.sequence)?;
-        if entry.sequence < wal.minimum_sequence || entry.sequence > wal.head_sequence {
+        let expected_sequence = wal
+            .minimum_sequence
+            .checked_add(offset as u64)
+            .ok_or_else(|| invalid("wal.tail.sequence", "overflows u64"))?;
+        if entry.sequence != expected_sequence {
             return Err(invalid(
                 "wal.tail.sequence",
-                "is outside the retained WAL range",
+                "is not the exact contiguous retained sequence",
             ));
         }
-        if previous.is_some_and(|value| entry.sequence <= value) {
-            return Err(invalid("wal.tail.sequence", "must be strictly increasing"));
-        }
-        previous = Some(entry.sequence);
         known_nonzero_enum::<WalEntryKind>("wal.tail.kind", entry.kind)?;
         validate_uuid_v7("wal.tail.mutation_id", &entry.mutation_id)?;
         if entry.superseded_objects.len() > 256 {
@@ -453,6 +500,12 @@ fn validate_wal(
             }
             Some(RefRepresentation::RefDeltaCatalog(root)) => {
                 validate_catalog_root(root, CatalogKind::RefDelta, identity, prefix)?;
+                if root.item_count > 256 {
+                    return Err(invalid(
+                        "wal.tail.ref_delta_catalog.item_count",
+                        "exceeds one atomic transaction's 256-change limit",
+                    ));
+                }
             }
             None => {}
         }
@@ -472,6 +525,7 @@ fn validate_reclamation(control: &RepoControl) -> Result<(), ControlValidationEr
         .as_ref()
         .ok_or_else(|| missing("reclamation"))?;
     known_nonzero_enum::<ReclamationPhase>("reclamation.phase", reclamation.phase)?;
+    bounded_bytes("reclamation.cursor", &reclamation.cursor, 0, 4_096)?;
     if reclamation.pass_objects > MAX_RECLAMATION_OBJECTS {
         return Err(invalid("reclamation.pass_objects", "exceeds 1000 objects"));
     }
@@ -602,12 +656,12 @@ fn validate_target(
     identity: &RepositoryIdentity,
     prefix: &DeploymentPrefix,
     expected_kind: V2KeyKind,
-) -> Result<(), ControlValidationError> {
+) -> Result<ParsedV2Key, ControlValidationError> {
     let parsed = validate_target_any_repository_leaf(target, identity, prefix)?;
     if parsed.kind != expected_kind {
         return Err(invalid("target.key", "does not match its typed slot"));
     }
-    Ok(())
+    Ok(parsed)
 }
 
 fn validate_target_any_repository_leaf(
@@ -647,6 +701,14 @@ fn validate_target_any_repository_leaf(
         return Err(invalid(
             "target.key",
             "does not match the repository UUID and generation",
+        ));
+    }
+    if let Some(key_digest) = parsed.content_digest
+        && target.digest.as_ref() != key_digest.as_bytes()
+    {
+        return Err(invalid(
+            "target.digest",
+            "does not equal the content digest encoded in target.key",
         ));
     }
     Ok(parsed)

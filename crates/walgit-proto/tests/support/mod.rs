@@ -70,6 +70,7 @@ pub fn sample_control() -> RepoControl {
         }),
         reclamation: Some(ReclamationState {
             phase: ReclamationPhase::Idle as i32,
+            cursor: Bytes::new(),
             pass_objects: 0,
             pass_bytes: 0,
         }),

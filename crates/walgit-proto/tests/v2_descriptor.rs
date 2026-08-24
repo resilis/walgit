@@ -41,6 +41,21 @@ fn every_v2_message_and_variable_field_has_machine_readable_bounds() {
         ),
         256
     );
+    let reclamation = pool
+        .get_message_by_name("walgit.v2.ReclamationState")
+        .unwrap();
+    assert_eq!(
+        option(&pool, reclamation.options(), "walgit.v2.max_encoded_bytes"),
+        65_536
+    );
+    assert_eq!(
+        option(
+            &pool,
+            reclamation.get_field_by_name("cursor").unwrap().options(),
+            "walgit.v2.max_bytes"
+        ),
+        4_096
+    );
 }
 
 #[test]
