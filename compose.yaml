@@ -42,6 +42,7 @@ services:
     command: >
       sh -c "
         aws --endpoint-url http://rustfs:9000 s3 mb s3://walgit-test 2>/dev/null || true &&
+        aws --endpoint-url http://rustfs:9000 s3api put-bucket-versioning --bucket walgit-test --versioning-configuration Status=Enabled &&
         aws --endpoint-url http://rustfs:9000 s3 ls
       "
     restart: "no"

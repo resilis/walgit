@@ -39,8 +39,9 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 
 use crate::{
-    BoxStream, ByteStream, DynStore, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody,
-    PutMode, PutOptions, Result, StoreError, Version,
+    BoxStream, ByteStream, CasToken, ComposeSource, DynStore, GetOptions, GetResult, ObjectMeta,
+    ObjectStore, ObjectVersionId, PutBody, PutMode, PutOptions, Result, StoreError, VersionCursor,
+    VersionPage,
 };
 
 /// Probabilities (0..=1) and switches. `Default` = no faults at all.
@@ -445,7 +446,7 @@ impl ObjectStore for FaultStore {
         }
     }
 
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
         let conditional = if_version.is_some();
         match self.decide("delete", key, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
@@ -460,6 +461,51 @@ impl ObjectStore for FaultStore {
             }
             _ => self.inner.delete(key, if_version).await,
         }
+    }
+
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        match self.decide("head_version", key, false, false, false).await {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("head_version", key, "before")),
+            Decision::Denied => Ok(None),
+            _ => self.inner.head_version(key, version_id).await,
+        }
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        match self.decide("delete_version", key, true, false, false).await {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("delete_version", key, "before")),
+            Decision::ErrAfter => {
+                self.inner.delete_version(key, version_id).await?;
+                Err(self.retryable("delete_version", key, "after (applied)"))
+            }
+            _ => self.inner.delete_version(key, version_id).await,
+        }
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        match self
+            .decide("list_versions", prefix, false, false, false)
+            .await
+        {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("list_versions", prefix, "before")),
+            _ => self.inner.list_versions(prefix, cursor, limit).await,
+        }
+    }
+
+    async fn verify_versioning(&self) -> Result<()> {
+        self.inner.verify_versioning().await
     }
 
     fn list(
@@ -502,10 +548,13 @@ impl ObjectStore for FaultStore {
     fn supports_compose(&self) -> bool {
         self.inner.supports_compose()
     }
+    fn compose_is_native(&self) -> bool {
+        self.inner.compose_is_native()
+    }
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
         let conditional = !matches!(opts.mode, PutMode::Overwrite);

@@ -1,8 +1,8 @@
 //! GCS backend over the google-cloud-storage 1.x client.
 //!
-//! Version tokens are GCS object generations rendered as decimal strings.
-//! Conditional reads use `if_generation_not_match`; conditional writes use
-//! `if_generation_match` (0 for create-if-absent). Range reads use
+//! GCS object generations are rendered separately into typed `CasToken` and
+//! `ObjectVersionId` values. Conditional reads use `if_generation_not_match`;
+//! conditional writes use `if_generation_match` (0 for create-if-absent). Range reads use
 //! `read_offset` / `read_limit`. Streaming uploads use `send_buffered` for
 //! non-seekable sources and `send_unbuffered` for seekable ones (Bytes).
 
@@ -19,8 +19,9 @@ use google_cloud_storage::signed_url::UrlStyle;
 use google_cloud_storage::streaming_source::StreamingSource;
 
 use crate::{
-    ByteStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
-    Result, StoreError, Version,
+    ByteStream, CasToken, ComposeSource, GetOptions, GetResult, MAX_VERSION_PAGE_SIZE, ObjectMeta,
+    ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode, PutOptions,
+    Result, StoreError, VersionCursor, VersionPage,
 };
 
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
@@ -216,7 +217,7 @@ impl GcsStore {
         // (via IAM signBlob) and locally (via service account key if present).
         let signing_signer = AuthBuilder::default().build_signer().ok();
 
-        Ok(Self {
+        let store = Self {
             storage,
             bulk,
             bulk_next: std::sync::atomic::AtomicUsize::new(0),
@@ -232,7 +233,9 @@ impl GcsStore {
             bucket_resource,
             signing_signer,
             signing_service_account: cfg.gcs.signing_service_account.clone(),
-        })
+        };
+        store.verify_versioning().await?;
+        Ok(store)
     }
 
     /// Bulk keys: pack data and side-files, bundles, LFS (everything that is
@@ -316,11 +319,12 @@ impl GcsStore {
             key: obj.name.clone(),
             size: obj.size as u64,
             version: gen_version(obj.generation),
+            object_version_id: Some(gen_object_version_id(obj.generation)),
         }
     }
 
     /// Fetch the current generation for an object via a metadata GET.
-    async fn current_generation(&self, key: &str) -> Option<Version> {
+    async fn current_generation(&self, key: &str) -> Option<CasToken> {
         let req = google_cloud_storage::model::GetObjectRequest::new()
             .set_bucket(self.bucket_resource.clone())
             .set_object(key.to_owned());
@@ -348,10 +352,11 @@ impl GcsStore {
         &self,
         key: &str,
         range: Option<std::ops::Range<u64>>,
+        generation: Option<i64>,
         if_generation_match: Option<i64>,
     ) -> Result<(u64, Option<i64>, ByteStream)> {
         self.clone_for_resume()
-            .read(key, range, if_generation_match)
+            .read(key, range, generation, if_generation_match)
             .await
     }
 }
@@ -362,9 +367,12 @@ impl BulkHttp {
         &self,
         key: &str,
         range: Option<std::ops::Range<u64>>,
+        selected_generation: Option<i64>,
         if_generation_match: Option<i64>,
     ) -> Result<(u64, Option<i64>, ByteStream)> {
-        let (size, generation, first) = self.open(key, range.clone(), if_generation_match).await?;
+        let (size, generation, first) = self
+            .open(key, range.clone(), selected_generation, if_generation_match)
+            .await?;
         let end = range.as_ref().map(|r| r.end).unwrap_or(size);
         let start = range.as_ref().map(|r| r.start).unwrap_or(0);
         let this = self.clone();
@@ -409,7 +417,10 @@ impl BulkHttp {
                         200 * (1u64 << st.attempts.min(5)) + rand::random::<u64>() % 250,
                     );
                     tokio::time::sleep(backoff).await;
-                    match this.open(&key, Some(st.pos..end), generation).await {
+                    match this
+                        .open(&key, Some(st.pos..end), generation, generation)
+                        .await
+                    {
                         Ok((_, _, s)) => st.inner = s,
                         Err(e) => {
                             if st.attempts >= BULK_RESUME_ATTEMPTS {
@@ -458,6 +469,7 @@ impl BulkHttp {
         &self,
         key: &str,
         range: Option<std::ops::Range<u64>>,
+        generation: Option<i64>,
         if_generation_match: Option<i64>,
     ) -> Result<(u64, Option<i64>, ByteStream)> {
         let headers = match &self.creds {
@@ -481,10 +493,13 @@ impl BulkHttp {
         let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.clients.len();
         let permit = self.permits.clone().acquire_owned().await.ok();
         let url = format!(
-            "{}/storage/v1/b/{}/o/{}?alt=media{}",
+            "{}/storage/v1/b/{}/o/{}?alt=media{}{}",
             self.endpoint,
             self.bucket,
             urlencode(key),
+            generation
+                .map(|generation| format!("&generation={generation}"))
+                .unwrap_or_default(),
             if_generation_match
                 .map(|g| format!("&ifGenerationMatch={g}"))
                 .unwrap_or_default()
@@ -568,12 +583,16 @@ impl GcsStore {
         &self,
         key: &str,
         range: Option<std::ops::Range<u64>>,
+        generation: Option<i64>,
     ) -> Result<ByteStream> {
         if self.creds.is_some() && (range.is_some() || Self::is_bulk_key(key)) {
-            return Ok(self.bulk_http_read(key, range, None).await?.2);
+            return Ok(self.bulk_http_read(key, range, generation, None).await?.2);
         }
         let (client, permit) = self.data_client(key, range.is_some()).await;
         let mut builder = client.read_object(self.bucket_resource.clone(), key.to_owned());
+        if let Some(generation) = generation {
+            builder = builder.set_generation(generation);
+        }
         if let Some(ref r) = range {
             builder = builder.set_read_range(range_to_read_range(r));
         }
@@ -668,6 +687,12 @@ impl ObjectStore for GcsStore {
     }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
+        let selected_generation = match &opts.object_version_id {
+            Some(version_id) => Some(parse_object_version_id(version_id).ok_or_else(|| {
+                StoreError::InvalidArgument("invalid GCS object version ID".into())
+            })?),
+            None => None,
+        };
         // if_none_match → metadata GET with if_generation_not_match.
         // 304 / FailedPrecondition = NotModified (cheap, no body download).
         if let Some(v) = &opts.if_none_match {
@@ -677,10 +702,13 @@ impl ObjectStore for GcsStore {
             // the object directly.
             match parse_generation(v) {
                 Some(generation) => {
-                    let req = google_cloud_storage::model::GetObjectRequest::new()
+                    let mut req = google_cloud_storage::model::GetObjectRequest::new()
                         .set_bucket(self.bucket_resource.clone())
                         .set_object(key.to_owned())
                         .set_if_generation_not_match(generation);
+                    if let Some(selected_generation) = selected_generation {
+                        req = req.set_generation(selected_generation);
+                    }
 
                     let result = match call("get", key, META_DEADLINE, READ_RETRIES, || {
                         self.control.get_object().with_request(req.clone()).send()
@@ -688,8 +716,18 @@ impl ObjectStore for GcsStore {
                     .await
                     {
                         Ok(obj) => {
+                            if selected_generation
+                                .is_some_and(|selected| obj.generation != selected)
+                            {
+                                return Err(StoreError::UnsupportedCapability {
+                                    backend: "gcs",
+                                    capability: "honored exact-generation metadata read",
+                                });
+                            }
                             let meta = Self::meta_from_object(&obj);
-                            let body = self.read_object_body(key, opts.range.clone()).await?;
+                            let body = self
+                                .read_object_body(key, opts.range.clone(), Some(obj.generation))
+                                .await?;
                             Ok(GetResult::Object { meta, body })
                         }
                         Err(e) => {
@@ -726,19 +764,30 @@ impl ObjectStore for GcsStore {
                 },
                 None => None,
             };
-            let (size, generation, body) =
-                self.bulk_http_read(key, opts.range.clone(), if_gen).await?;
+            let (size, generation, body) = self
+                .bulk_http_read(key, opts.range.clone(), selected_generation, if_gen)
+                .await?;
+            if selected_generation.is_some_and(|selected| generation != Some(selected)) {
+                return Err(StoreError::UnsupportedCapability {
+                    backend: "gcs",
+                    capability: "honored exact-generation data read",
+                });
+            }
             let meta = ObjectMeta {
                 key: key.to_owned(),
                 size,
                 version: generation
                     .map(gen_version)
-                    .unwrap_or_else(|| Version::new("")),
+                    .unwrap_or_else(|| CasToken::new("")),
+                object_version_id: generation.map(gen_object_version_id),
             };
             return Ok(GetResult::Object { meta, body });
         }
         let (client, permit) = self.data_client(key, opts.range.is_some()).await;
         let mut builder = client.read_object(self.bucket_resource.clone(), key.to_owned());
+        if let Some(generation) = selected_generation {
+            builder = builder.set_generation(generation);
+        }
 
         if let Some(v) = &opts.if_match {
             if let Some(generation) = parse_generation(v) {
@@ -761,10 +810,17 @@ impl ObjectStore for GcsStore {
             Err(_) => return Err(deadline_error("read", key, READ_OPEN_DEADLINE)),
         };
         let obj = resp.object();
+        if selected_generation.is_some_and(|selected| obj.generation != selected) {
+            return Err(StoreError::UnsupportedCapability {
+                backend: "gcs",
+                capability: "honored exact-generation data read",
+            });
+        }
         let meta = ObjectMeta {
             key: key.to_owned(),
             size: obj.size as u64,
             version: gen_version(obj.generation),
+            object_version_id: Some(gen_object_version_id(obj.generation)),
         };
 
         Ok(GetResult::Object {
@@ -812,15 +868,34 @@ impl ObjectStore for GcsStore {
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
-        use google_cloud_storage::model::compose_object_request::SourceObject;
         if sources.is_empty() || sources.len() > 32 {
             return Err(StoreError::InvalidArgument(format!(
                 "compose needs 1..=32 sources, got {}",
                 sources.len()
             )));
+        }
+        for source in sources {
+            let meta = self
+                .head_version(&source.key, &source.object_version_id)
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                    key: source.key.clone(),
+                })?;
+            if meta.version != source.cas_token {
+                return Err(StoreError::PreconditionFailed {
+                    key: source.key.clone(),
+                    current: Some(meta.version),
+                });
+            }
+            if meta.size != source.size {
+                return Err(StoreError::InvalidArgument(format!(
+                    "compose source {} size is {}, expected {}",
+                    source.key, meta.size, source.size
+                )));
+            }
         }
         let mut destination = google_cloud_storage::model::Object::new()
             .set_bucket(self.bucket_resource.clone())
@@ -838,8 +913,8 @@ impl ObjectStore for GcsStore {
             .set_source_objects(
                 sources
                     .iter()
-                    .map(|s| SourceObject::new().set_name(s.clone()))
-                    .collect::<Vec<_>>(),
+                    .map(gcs_compose_source)
+                    .collect::<Result<Vec<_>>>()?,
             );
         match &opts.mode {
             PutMode::Overwrite => {}
@@ -861,7 +936,7 @@ impl ObjectStore for GcsStore {
         Ok(Self::meta_from_object(&obj))
     }
 
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
         let mut req = google_cloud_storage::model::DeleteObjectRequest::new()
             .set_bucket(self.bucket_resource.clone())
             .set_object(key.to_owned());
@@ -908,6 +983,141 @@ impl ObjectStore for GcsStore {
             }
             Err(e) => Err(e.into_store("delete", key)),
         }
+    }
+
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        let generation = parse_object_version_id(version_id)
+            .ok_or_else(|| StoreError::InvalidArgument("invalid GCS object version ID".into()))?;
+        let request = google_cloud_storage::model::GetObjectRequest::new()
+            .set_bucket(self.bucket_resource.clone())
+            .set_object(key.to_owned())
+            .set_generation(generation);
+        match call(
+            "head exact version",
+            key,
+            META_DEADLINE,
+            READ_RETRIES,
+            || {
+                self.control
+                    .get_object()
+                    .with_request(request.clone())
+                    .send()
+            },
+        )
+        .await
+        {
+            Ok(object) if object.generation == generation => {
+                Ok(Some(Self::meta_from_object(&object)))
+            }
+            Ok(_) => Err(StoreError::UnsupportedCapability {
+                backend: "gcs",
+                capability: "honored exact-generation HEAD",
+            }),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error.into_store("head exact version", key)),
+        }
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        let generation = parse_object_version_id(version_id)
+            .ok_or_else(|| StoreError::InvalidArgument("invalid GCS object version ID".into()))?;
+        let request = google_cloud_storage::model::DeleteObjectRequest::new()
+            .set_bucket(self.bucket_resource.clone())
+            .set_object(key.to_owned())
+            .set_generation(generation)
+            .set_if_generation_match(generation);
+        call("delete exact version", key, META_DEADLINE, 0, || {
+            self.control
+                .delete_object()
+                .with_request(request.clone())
+                .send()
+        })
+        .await
+        .map_err(|error| error.into_store("delete exact version", key))
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        if !(1..=MAX_VERSION_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidArgument(format!(
+                "version page size must be in 1..={MAX_VERSION_PAGE_SIZE}"
+            )));
+        }
+        if cursor
+            .is_some_and(|cursor| cursor.key_marker.is_some() || cursor.version_id_marker.is_some())
+        {
+            return Err(StoreError::InvalidArgument(
+                "version cursor belongs to another backend".into(),
+            ));
+        }
+        let mut request = google_cloud_storage::model::ListObjectsRequest::new()
+            .set_parent(self.bucket_resource.clone())
+            .set_prefix(prefix.to_owned())
+            .set_versions(true)
+            .set_page_size(limit as i32);
+        if let Some(token) = cursor.and_then(|cursor| cursor.page_token.as_ref()) {
+            request = request.set_page_token(token.clone());
+        }
+        let list_key = format!("{prefix}/list_versions");
+        let response = call(
+            "list versions",
+            &list_key,
+            META_DEADLINE,
+            READ_RETRIES,
+            || {
+                self.control
+                    .list_objects()
+                    .with_request(request.clone())
+                    .send()
+            },
+        )
+        .await
+        .map_err(|error| error.into_store("list versions", &list_key))?;
+        let versions = response.objects.iter().map(listed_object_version).collect();
+        let next = (!response.next_page_token.is_empty()).then(|| VersionCursor {
+            key_marker: None,
+            version_id_marker: None,
+            page_token: Some(response.next_page_token),
+        });
+        Ok(VersionPage { versions, next })
+    }
+
+    async fn verify_versioning(&self) -> Result<()> {
+        let request = google_cloud_storage::model::GetBucketRequest::new()
+            .set_name(self.bucket_resource.clone());
+        let bucket = call(
+            "get bucket versioning",
+            &self.bucket,
+            META_DEADLINE,
+            READ_RETRIES,
+            || {
+                self.control
+                    .get_bucket()
+                    .with_request(request.clone())
+                    .send()
+            },
+        )
+        .await
+        .map_err(|error| error.into_store("get bucket versioning", &self.bucket))?;
+        require_gcs_bucket_capabilities(
+            bucket
+                .versioning
+                .is_some_and(|versioning| versioning.enabled),
+            bucket.soft_delete_policy.as_ref().map(|policy| {
+                policy
+                    .retention_duration
+                    .as_ref()
+                    .map(|duration| (duration.seconds(), duration.nanos()))
+            }),
+        )
     }
 
     fn list(
@@ -1057,14 +1267,79 @@ impl ObjectStore for GcsStore {
 
 // ---- helpers ----
 
-/// Render a GCS generation (i64) as a decimal string Version.
-fn gen_version(generation: i64) -> Version {
-    Version::new(generation.to_string())
+/// Render a GCS generation (i64) as a decimal string CasToken.
+fn gen_version(generation: i64) -> CasToken {
+    CasToken::new(generation.to_string())
 }
 
-/// Parse a Version back into a generation (i64).
-fn parse_generation(v: &Version) -> Option<i64> {
+fn gen_object_version_id(generation: i64) -> ObjectVersionId {
+    ObjectVersionId::new(generation.to_string())
+}
+
+/// Parse a CasToken back into a generation (i64).
+fn parse_generation(v: &CasToken) -> Option<i64> {
     v.as_str().parse::<i64>().ok()
+}
+
+fn parse_object_version_id(version_id: &ObjectVersionId) -> Option<i64> {
+    version_id.as_str().parse::<i64>().ok()
+}
+
+fn require_gcs_bucket_capabilities(
+    versioning_enabled: bool,
+    soft_delete: Option<Option<(i64, i32)>>,
+) -> Result<()> {
+    if !versioning_enabled {
+        Err(StoreError::UnsupportedCapability {
+            backend: "gcs",
+            capability: "enabled bucket versioning",
+        })
+    } else if !matches!(soft_delete, None | Some(Some((0, 0)))) {
+        Err(StoreError::UnsupportedCapability {
+            backend: "gcs",
+            capability: "disabled bucket soft-delete retention",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn gcs_compose_source(
+    source: &ComposeSource,
+) -> Result<google_cloud_storage::model::compose_object_request::SourceObject> {
+    use google_cloud_storage::model::compose_object_request::{
+        SourceObject, source_object::ObjectPreconditions,
+    };
+
+    let generation = parse_object_version_id(&source.object_version_id).ok_or_else(|| {
+        StoreError::InvalidArgument(format!(
+            "compose source {} has an invalid GCS ObjectVersionId",
+            source.key
+        ))
+    })?;
+    if parse_generation(&source.cas_token) != Some(generation) {
+        return Err(StoreError::InvalidArgument(format!(
+            "compose source {} has mismatched GCS CAS and version identities",
+            source.key
+        )));
+    }
+    Ok(SourceObject::new()
+        .set_name(source.key.clone())
+        .set_generation(generation)
+        .set_object_preconditions(ObjectPreconditions::new().set_if_generation_match(generation)))
+}
+
+fn listed_object_version(object: &google_cloud_storage::model::Object) -> ObjectVersion {
+    ObjectVersion {
+        key: object.name.clone(),
+        object_version_id: gen_object_version_id(object.generation),
+        cas_token: Some(gen_version(object.generation)),
+        size: object.size.max(0) as u64,
+        kind: ObjectVersionKind::Object,
+        // GCS sets delete_time when a generation became noncurrent. It does
+        // not model S3-style delete markers.
+        is_latest: object.delete_time.is_none(),
+    }
 }
 
 /// Convert our half-open `Range<u64>` to GCS `ReadRange`.
@@ -1277,6 +1552,18 @@ mod tests {
     }
 
     #[test]
+    fn production_bucket_capability_check_fails_closed() {
+        assert!(require_gcs_bucket_capabilities(false, None).is_err());
+        assert!(require_gcs_bucket_capabilities(true, Some(None)).is_err());
+        assert!(require_gcs_bucket_capabilities(true, Some(Some((1, 0)))).is_err());
+        assert!(require_gcs_bucket_capabilities(true, Some(Some((0, 1)))).is_err());
+        assert!(require_gcs_bucket_capabilities(true, Some(Some((-1, 0)))).is_err());
+        assert!(require_gcs_bucket_capabilities(true, Some(Some((0, -1)))).is_err());
+        require_gcs_bucket_capabilities(true, None).unwrap();
+        require_gcs_bucket_capabilities(true, Some(Some((0, 0)))).unwrap();
+    }
+
+    #[test]
     fn parse_generation_roundtrip() {
         let v = gen_version(42);
         assert_eq!(parse_generation(&v), Some(42));
@@ -1284,8 +1571,52 @@ mod tests {
 
     #[test]
     fn parse_generation_invalid() {
-        let v = Version::new("not-a-number");
+        let v = CasToken::new("not-a-number");
         assert_eq!(parse_generation(&v), None);
+    }
+
+    #[test]
+    fn listed_generations_identify_only_the_live_generation_as_latest() {
+        let current = google_cloud_storage::model::Object::new()
+            .set_name("key")
+            .set_generation(12)
+            .set_size(4);
+        let mut noncurrent = current.clone().set_generation(11);
+        noncurrent.delete_time = Some(Default::default());
+
+        assert!(listed_object_version(&current).is_latest);
+        assert!(!listed_object_version(&noncurrent).is_latest);
+        assert_eq!(
+            listed_object_version(&noncurrent)
+                .object_version_id
+                .as_str(),
+            "11"
+        );
+    }
+
+    #[test]
+    fn compose_source_requires_matching_generation_identities() {
+        let good = ComposeSource {
+            key: "source".into(),
+            size: 4,
+            cas_token: gen_version(42),
+            object_version_id: gen_object_version_id(42),
+        };
+        let built = gcs_compose_source(&good).expect("matching exact source");
+        assert_eq!(built.generation, 42);
+        assert_eq!(
+            built
+                .object_preconditions
+                .expect("source precondition")
+                .if_generation_match,
+            Some(42)
+        );
+
+        let bad = ComposeSource {
+            cas_token: gen_version(41),
+            ..good
+        };
+        assert!(gcs_compose_source(&bad).is_err());
     }
 
     #[test]
@@ -1626,7 +1957,7 @@ mod resume_tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
         let bulk = BulkHttp::for_tests(format!("http://{addr}"), "b".into());
-        let (size, generation, mut body) = bulk.read("k", None, None).await.unwrap();
+        let (size, generation, mut body) = bulk.read("k", None, None, None).await.unwrap();
         assert_eq!((size, generation), (3000, Some(7)));
         let mut got = Vec::new();
         while let Some(chunk) = body.next().await {
