@@ -87,9 +87,16 @@ e2e *ARGS:
 warnings:
     #!/usr/bin/env bash
     set -euo pipefail
-    out="$(timeout 900 cargo build --locked --workspace --all-targets 2>&1)"
-    if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
-        printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
+    warnings_output="$(mktemp)"
+    trap 'rm -f "$warnings_output"' EXIT
+    build_status=0
+    timeout 900 cargo build --locked --workspace --all-targets >"$warnings_output" 2>&1 || build_status=$?
+    if (( build_status != 0 )); then
+        cat "$warnings_output" || true
+        exit "$build_status"
+    fi
+    if grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)' "$warnings_output"; then
+        grep -E '^warning' -A4 "$warnings_output" | grep -vE '^warning: `walgit-[a-z]+`' || true
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
     fi
     echo "no rustc warnings"

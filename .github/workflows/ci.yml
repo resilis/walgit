@@ -37,6 +37,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
@@ -133,6 +139,12 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
 
       - name: Install pinned Rust toolchain
         run: |
