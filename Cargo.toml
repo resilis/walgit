@@ -139,3 +139,18 @@ debug = "line-tables-only"
 [profile.dev.build-override]
 opt-level = 0
 debug = 0
+
+# CI checks correctness, not optimized runtime performance. Keep one small,
+# non-incremental fingerprint for compilation and every test execution.
+[profile.ci]
+inherits = "dev"
+debug = 0
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 2
+debug = 0
+
+[profile.ci.build-override]
+opt-level = 0
+debug = 0

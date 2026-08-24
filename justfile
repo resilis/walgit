@@ -102,7 +102,8 @@ warnings:
     echo "no rustc warnings"
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings test e2e
+ci:
+    bash scripts/ci.sh
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
