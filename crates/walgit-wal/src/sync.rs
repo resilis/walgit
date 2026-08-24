@@ -8,7 +8,7 @@ use tracing::Instrument;
 use walgit_git::LocalRepo;
 use walgit_proto::keys;
 use walgit_proto::v1::{EntryKind, LogEntry, Manifest, PackRef, RefSnapshot};
-use walgit_store::{GetOptions, GetResult, ObjectStore, Prefixed, Version};
+use walgit_store::{CasToken, GetOptions, GetResult, ObjectStore, Prefixed};
 
 /// A read guard held for the lifetime of a request. While any guard is alive
 /// no pack is removed locally (the inner RwLock read guard prevents it).
@@ -81,7 +81,7 @@ impl PackPlan {
 pub(crate) enum SyncOutcome {
     Unchanged,
     Changed {
-        meta_version: Version,
+        meta_version: CasToken,
         manifest: Manifest,
     },
 }
@@ -89,7 +89,7 @@ pub(crate) enum SyncOutcome {
 /// Perform a conditional GET on manifest.pb and return the outcome.
 pub(crate) async fn freshness_check(
     store: &Prefixed,
-    known: &Option<Version>,
+    known: &Option<CasToken>,
 ) -> Result<SyncOutcome, WalError> {
     match known {
         Some(v) => match get_message_if_changed::<Manifest>(store, keys::MANIFEST, v).await? {
@@ -430,7 +430,7 @@ pub(crate) async fn download_object(
 pub(crate) async fn apply_delta(
     handle: &super::handle::RepoHandle,
     new_manifest: &Manifest,
-    new_version: &Version,
+    new_version: &CasToken,
 ) -> Result<(), WalError> {
     let store = &handle.store;
     let local = &handle.local;
@@ -971,7 +971,7 @@ pub(crate) fn apply_entries(
 pub(crate) async fn materialize_from_scratch(
     handle: &super::handle::RepoHandle,
     manifest: &Manifest,
-    version: &Version,
+    version: &CasToken,
 ) -> Result<(), WalError> {
     let span = tracing::info_span!(
         "wal.materialize",

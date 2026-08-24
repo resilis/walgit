@@ -55,6 +55,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | S3 multipart PUT | 1 create → upload parts → 1 conditional complete | N + 2; no destination probe | `s3.rs::multipart_put` |
 | S3 compose | source HEADs for layout → upload/copy parts → 1 conditional complete | sources + about one copy call per contiguous GiB (up to the calculated 5 GiB cap); fragmented sources coalesce to the bounded multipart target; +2 create/complete calls and **one fewer destination HEAD for Create** | `s3.rs::compose` |
 | S3 conditional delete | 1 conditional DELETE; after a 412 only, 1 HEAD distinguishes absent from moved | 1 happy path; **one fewer HEAD** | `s3.rs::delete` |
+| S3 exact-version HEAD | 1 HEAD; an exact delete-marker 405 with complete AWS headers returns directly, while an ambiguous RustFS 405 pages version history until the named key/version is proved | 1 normal path; listing is bounded to 1,000 pages on the delete-marker failure path only | `s3.rs::head_version` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
 counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an

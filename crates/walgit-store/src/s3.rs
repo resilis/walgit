@@ -5,12 +5,12 @@
 //! returns `&ByteStream` with no owned-body extractor. All other operations
 //! (PUT, HEAD, DELETE, LIST) use the SDK directly.
 //!
-//! ## Version tokens
+//! ## Object identity tokens
 //!
-//! S3 ETags are used as opaque `Version` strings. Quotes are stripped
-//! consistently on read and never stored. For non-multipart uploads the
-//! ETag is the MD5 of the content; for multipart uploads it is a compound
-//! hash. Callers never parse the token — equality comparison suffices.
+//! S3 ETags are used only as opaque `CasToken` strings. SDK `VersionId`
+//! values are returned separately as `ObjectVersionId`. Quotes are stripped
+//! from ETags consistently on read and never stored. Callers never parse or
+//! interchange either token.
 //!
 //! ## Conditional PUT
 //!
@@ -51,8 +51,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    BoxStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
-    Result, StoreError, Version,
+    BoxStream, CasToken, ComposeSource, GetOptions, GetResult, MAX_VERSION_PAGE_SIZE, ObjectMeta,
+    ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode, PutOptions,
+    Result, StoreError, VersionCursor, VersionPage,
 };
 
 /// S3-compatible object store.
@@ -107,13 +108,15 @@ impl S3Store {
 
         let multipart_part_size = multipart_part_size(1, cfg.multipart_part_size.as_u64())?;
 
-        Ok(S3Store {
+        let store = S3Store {
             client,
             bucket: cfg.bucket.clone(),
             http,
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size,
-        })
+        };
+        store.verify_versioning().await?;
+        Ok(store)
     }
 
     /// `bytes=start-(end-1)` for a half-open range (S3 Range is inclusive).
@@ -135,6 +138,9 @@ impl S3Store {
         if let Some(v) = &opts.if_match {
             builder = builder.if_match(v.as_str());
         }
+        if let Some(version_id) = &opts.object_version_id {
+            builder = builder.version_id(version_id.as_str());
+        }
         if let Some(r) = &opts.range {
             builder = builder.range(Self::range_header(r));
         }
@@ -154,7 +160,11 @@ impl S3Store {
             .map_err(|e| sanitized_reqwest_error("get request", e))
     }
 
-    fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
+    fn get_result_from_response(
+        key: &str,
+        resp: reqwest::Response,
+        requested_version_id: Option<&ObjectVersionId>,
+    ) -> Result<GetResult> {
         let status = resp.status();
         let etag = resp
             .headers()
@@ -166,6 +176,10 @@ impl S3Store {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        let response_version_id = resp
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|v| v.to_str().ok());
 
         // `ObjectMeta::size` is the size of the whole object (as on GCS/memory),
         // also for range reads: `Content-Range: bytes a-b/total` carries it.
@@ -178,11 +192,22 @@ impl S3Store {
 
         match status.as_u16() {
             200 | 206 => {
-                let version = Version::new(etag.as_deref().unwrap_or(""));
+                let object_version_id = require_current_s3_version_id(
+                    "VersionId on successful current GET",
+                    response_version_id,
+                )?;
+                if requested_version_id.is_some_and(|requested| &object_version_id != requested) {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "honored exact-version GET with VersionId response",
+                    });
+                }
+                let version = CasToken::new(etag.as_deref().unwrap_or(""));
                 let meta = ObjectMeta {
                     key: key.into(),
                     size: total.or(content_length).unwrap_or(0),
                     version,
+                    object_version_id: Some(object_version_id),
                 };
                 let body = resp
                     .bytes_stream()
@@ -191,12 +216,12 @@ impl S3Store {
                 Ok(GetResult::Object { meta, body })
             }
             304 => Ok(GetResult::NotModified {
-                version: Version::new(etag.as_deref().unwrap_or("")),
+                version: CasToken::new(etag.as_deref().unwrap_or("")),
             }),
             404 => Err(StoreError::NotFound { key: key.into() }),
             412 => Err(StoreError::PreconditionFailed {
                 key: key.into(),
-                current: etag.map(Version::new),
+                current: etag.map(CasToken::new),
             }),
             s if retryable_status(s) => {
                 Err(StoreError::Retryable(anyhow::anyhow!("s3 get status {s}")))
@@ -604,6 +629,107 @@ fn classify_list_error(
     classify_sdk_error("list", "<prefix>", err)
 }
 
+fn require_enabled_versioning(
+    status: Option<&aws_sdk_s3::types::BucketVersioningStatus>,
+) -> Result<()> {
+    if matches!(
+        status,
+        Some(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedCapability {
+            backend: "s3",
+            capability: "enabled bucket versioning",
+        })
+    }
+}
+
+fn successful_write_meta(
+    operation: &'static str,
+    key: &str,
+    size: u64,
+    etag: Option<&str>,
+    version_id: Option<&str>,
+) -> Result<ObjectMeta> {
+    let version_id =
+        usable_s3_version_id(version_id).ok_or_else(|| StoreError::AmbiguousWrite {
+            backend: "s3",
+            operation,
+            key: key.to_owned(),
+        })?;
+    Ok(ObjectMeta {
+        key: key.to_owned(),
+        size,
+        version: CasToken::new(etag.unwrap_or("").trim_matches('"').to_owned()),
+        object_version_id: Some(version_id),
+    })
+}
+
+fn usable_s3_version_id(version_id: Option<&str>) -> Option<ObjectVersionId> {
+    version_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != "null")
+        .map(ObjectVersionId::new)
+}
+
+fn require_current_s3_version_id(
+    capability: &'static str,
+    version_id: Option<&str>,
+) -> Result<ObjectVersionId> {
+    usable_s3_version_id(version_id).ok_or(StoreError::UnsupportedCapability {
+        backend: "s3",
+        capability,
+    })
+}
+
+fn compose_copy_source(bucket: &str, source: &ComposeSource) -> String {
+    let encoded_version_id =
+        crate::util::encode_path(source.object_version_id.as_str()).replace('/', "%2F");
+    format!(
+        "{}/{}?versionId={}",
+        bucket,
+        crate::util::encode_path(&source.key),
+        encoded_version_id
+    )
+}
+
+const DELETE_MARKER_PROOF_MAX_PAGES: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactDeleteMarkerHeadEvidence {
+    Confirmed,
+    RequiresListing,
+    Unrelated,
+}
+
+fn exact_delete_marker_head_evidence(
+    status: u16,
+    delete_marker: Option<&str>,
+    response_version_id: Option<&str>,
+    requested_version_id: &ObjectVersionId,
+) -> ExactDeleteMarkerHeadEvidence {
+    if status != 405 {
+        return ExactDeleteMarkerHeadEvidence::Unrelated;
+    }
+    if delete_marker == Some("true") && response_version_id == Some(requested_version_id.as_str()) {
+        ExactDeleteMarkerHeadEvidence::Confirmed
+    } else {
+        ExactDeleteMarkerHeadEvidence::RequiresListing
+    }
+}
+
+fn exact_listed_version_kind(
+    versions: &[ObjectVersion],
+    key: &str,
+    version_id: &ObjectVersionId,
+) -> Option<ObjectVersionKind> {
+    versions
+        .iter()
+        .find(|version| version.key == key && version.object_version_id == *version_id)
+        .map(|version| version.kind)
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for S3Store {
     fn backend(&self) -> &'static str {
@@ -612,7 +738,7 @@ impl ObjectStore for S3Store {
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         let resp = self.presigned_get(key, &opts).await?;
-        Self::get_result_from_response(key, resp)
+        Self::get_result_from_response(key, resp, opts.object_version_id.as_ref())
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
@@ -628,10 +754,15 @@ impl ObjectStore for S3Store {
             Ok(out) => {
                 let etag = out.e_tag().map(|s| s.trim_matches('"').to_owned());
                 let size = out.content_length().unwrap_or(0) as u64;
+                let object_version_id = require_current_s3_version_id(
+                    "VersionId on successful current HEAD",
+                    out.version_id(),
+                )?;
                 Ok(Some(ObjectMeta {
                     key: key.into(),
                     size,
-                    version: Version::new(etag.as_deref().unwrap_or("")),
+                    version: CasToken::new(etag.as_deref().unwrap_or("")),
+                    object_version_id: Some(object_version_id),
                 }))
             }
             Err(err) => {
@@ -688,12 +819,7 @@ impl ObjectStore for S3Store {
         let result = builder.send().await;
         match result {
             Ok(resp) => {
-                let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
-                Ok(ObjectMeta {
-                    key: key.into(),
-                    size: len,
-                    version: Version::new(etag.as_deref().unwrap_or("")),
-                })
+                successful_write_meta("PutObject", key, len, resp.e_tag(), resp.version_id())
             }
             Err(e) => {
                 let mut err = classify_put_error(key, e);
@@ -708,7 +834,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
         let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
             request = request.if_match(want.as_str());
@@ -736,6 +862,180 @@ impl ObjectStore for S3Store {
                 Err(mapped)
             }
         }
+    }
+
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        let result = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .version_id(version_id.as_str())
+            .send()
+            .await;
+        match result {
+            Ok(out) => {
+                if out.version_id() != Some(version_id.as_str()) {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "honored exact-version HEAD with VersionId response",
+                    });
+                }
+                let etag = out.e_tag().map(|value| value.trim_matches('"').to_owned());
+                Ok(Some(ObjectMeta {
+                    key: key.to_owned(),
+                    size: out.content_length().unwrap_or(0).max(0) as u64,
+                    version: CasToken::new(etag.as_deref().unwrap_or("")),
+                    object_version_id: Some(version_id.clone()),
+                }))
+            }
+            Err(error) => {
+                let evidence = error
+                    .raw_response()
+                    .map(|response| {
+                        exact_delete_marker_head_evidence(
+                            response.status().as_u16(),
+                            response.headers().get("x-amz-delete-marker"),
+                            response.headers().get("x-amz-version-id"),
+                            version_id,
+                        )
+                    })
+                    .unwrap_or(ExactDeleteMarkerHeadEvidence::Unrelated);
+                match evidence {
+                    ExactDeleteMarkerHeadEvidence::Confirmed => return Ok(None),
+                    ExactDeleteMarkerHeadEvidence::RequiresListing => {
+                        let mapped = classify_sdk_error("head exact version", key, error);
+                        return if self
+                            .prove_exact_delete_marker_by_listing(key, version_id)
+                            .await?
+                        {
+                            Ok(None)
+                        } else {
+                            Err(mapped)
+                        };
+                    }
+                    ExactDeleteMarkerHeadEvidence::Unrelated => {}
+                }
+                match classify_sdk_error("head exact version", key, error) {
+                    StoreError::NotFound { .. } => Ok(None),
+                    other => Err(other),
+                }
+            }
+        }
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        let response = self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .version_id(version_id.as_str())
+            .send()
+            .await
+            .map_err(|error| classify_sdk_error("delete exact version", key, error))?;
+        if response.version_id() != Some(version_id.as_str()) {
+            return Err(StoreError::UnsupportedCapability {
+                backend: "s3",
+                capability: "honored exact-version delete with VersionId response",
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        if !(1..=MAX_VERSION_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidArgument(format!(
+                "version page size must be in 1..={MAX_VERSION_PAGE_SIZE}"
+            )));
+        }
+        if cursor.is_some_and(|cursor| cursor.page_token.is_some()) {
+            return Err(StoreError::InvalidArgument(
+                "version cursor belongs to another backend".into(),
+            ));
+        }
+        let mut request = self
+            .client
+            .list_object_versions()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(limit as i32);
+        if let Some(cursor) = cursor {
+            request = request.set_key_marker(cursor.key_marker.clone());
+            request = request.set_version_id_marker(
+                cursor
+                    .version_id_marker
+                    .as_ref()
+                    .map(|version| version.as_str().to_owned()),
+            );
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| classify_sdk_error("list versions", prefix, error))?;
+        let mut versions =
+            Vec::with_capacity(response.versions().len() + response.delete_markers().len());
+        for version in response.versions() {
+            let version_id = version.version_id().ok_or_else(|| {
+                StoreError::InvalidArgument(
+                    "s3 version listing returned an object without VersionId".into(),
+                )
+            })?;
+            versions.push(ObjectVersion {
+                key: version.key().unwrap_or_default().to_owned(),
+                object_version_id: ObjectVersionId::new(version_id),
+                cas_token: version
+                    .e_tag()
+                    .map(|etag| CasToken::new(etag.trim_matches('"').to_owned())),
+                size: version.size().unwrap_or(0).max(0) as u64,
+                kind: ObjectVersionKind::Object,
+                is_latest: version.is_latest().unwrap_or(false),
+            });
+        }
+        for marker in response.delete_markers() {
+            let version_id = marker.version_id().ok_or_else(|| {
+                StoreError::InvalidArgument(
+                    "s3 version listing returned a delete marker without VersionId".into(),
+                )
+            })?;
+            versions.push(ObjectVersion {
+                key: marker.key().unwrap_or_default().to_owned(),
+                object_version_id: ObjectVersionId::new(version_id),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: marker.is_latest().unwrap_or(false),
+            });
+        }
+        let next = response
+            .is_truncated()
+            .unwrap_or(false)
+            .then(|| VersionCursor {
+                key_marker: response.next_key_marker().map(str::to_owned),
+                version_id_marker: response.next_version_id_marker().map(ObjectVersionId::new),
+                page_token: None,
+            });
+        Ok(VersionPage { versions, next })
+    }
+
+    async fn verify_versioning(&self) -> Result<()> {
+        let response = self
+            .client
+            .get_bucket_versioning()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|error| classify_sdk_error("get bucket versioning", &self.bucket, error))?;
+        require_enabled_versioning(response.status())
     }
 
     fn list(
@@ -793,7 +1093,8 @@ impl ObjectStore for S3Store {
                                 Ok(ObjectMeta {
                                     key: obj.key().unwrap_or("").to_owned(),
                                     size: obj.size().unwrap_or(0) as u64,
-                                    version: Version::new(etag.as_deref().unwrap_or("")),
+                                    version: CasToken::new(etag.as_deref().unwrap_or("")),
+                                    object_version_id: None,
                                 })
                             })
                             .collect();
@@ -874,7 +1175,7 @@ impl ObjectStore for S3Store {
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
         if sources.is_empty() {
@@ -882,17 +1183,27 @@ impl ObjectStore for S3Store {
                 "compose needs at least one source".into(),
             ));
         }
-        // Sizes first: the layout of parts depends on them.
-        let mut sizes = Vec::with_capacity(sources.len());
-        let mut versions = Vec::with_capacity(sources.len());
-        for src in sources {
-            let m = self
-                .head(src)
+        for source in sources {
+            let meta = self
+                .head_version(&source.key, &source.object_version_id)
                 .await?
-                .ok_or_else(|| StoreError::NotFound { key: src.clone() })?;
-            sizes.push(m.size);
-            versions.push(m.version);
+                .ok_or_else(|| StoreError::NotFound {
+                    key: source.key.clone(),
+                })?;
+            if meta.version != source.cas_token {
+                return Err(StoreError::PreconditionFailed {
+                    key: source.key.clone(),
+                    current: Some(meta.version),
+                });
+            }
+            if meta.size != source.size {
+                return Err(StoreError::InvalidArgument(format!(
+                    "compose source {} size is {}, expected {}",
+                    source.key, meta.size, source.size
+                )));
+            }
         }
+        let sizes: Vec<u64> = sources.iter().map(|source| source.size).collect();
         let total = sizes.iter().try_fold(0u64, |total, size| {
             total.checked_add(*size).ok_or_else(|| {
                 StoreError::InvalidArgument("composed object size overflows u64".into())
@@ -950,16 +1261,12 @@ impl ObjectStore for S3Store {
                             .key(dest)
                             .upload_id(&upload_id)
                             .part_number(part_number)
-                            .copy_source(format!(
-                                "{}/{}",
-                                self.bucket,
-                                crate::util::encode_path(source)
-                            ))
+                            .copy_source(compose_copy_source(&self.bucket, source))
                             .copy_source_range(format!("bytes={}-{}", range.start, range_end))
-                            .copy_source_if_match(versions[range.source].as_str())
+                            .copy_source_if_match(source.cas_token.as_str())
                             .send()
                             .await
-                            .map_err(|e| classify_sdk_error("upload part copy", source, e))?;
+                            .map_err(|e| classify_sdk_error("upload part copy", &source.key, e))?;
                         let etag = part
                             .copy_part_result()
                             .and_then(|r| r.e_tag())
@@ -984,16 +1291,17 @@ impl ObjectStore for S3Store {
                             let source = &sources[range.source];
                             let range_result = self
                                 .get(
-                                    source,
+                                    &source.key,
                                     GetOptions {
-                                        if_match: Some(versions[range.source].clone()),
+                                        if_match: Some(source.cas_token.clone()),
                                         range: Some(range.start..range.start + range.len),
+                                        object_version_id: Some(source.object_version_id.clone()),
                                         ..GetOptions::default()
                                     },
                                 )
                                 .await?;
                             let bytes =
-                                collect_compose_range(range_result, source, range.len).await?;
+                                collect_compose_range(range_result, &source.key, range.len).await?;
                             buf.extend_from_slice(&bytes);
                         }
                         if buf.len() as u64 != len {
@@ -1058,12 +1366,13 @@ impl ObjectStore for S3Store {
                 return Err(error);
             }
         };
-        let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
-        Ok(ObjectMeta {
-            key: dest.into(),
-            size: total,
-            version: Version::new(etag.as_deref().unwrap_or("")),
-        })
+        successful_write_meta(
+            "ComposeObject completion",
+            dest,
+            total,
+            resp.e_tag(),
+            resp.version_id(),
+        )
     }
 
     async fn signed_get_url(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
@@ -1095,6 +1404,36 @@ struct ListState {
 // ---- multipart upload --------------------------------------------------
 
 impl S3Store {
+    async fn prove_exact_delete_marker_by_listing(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<bool> {
+        let mut cursor = None;
+        for _ in 0..DELETE_MARKER_PROOF_MAX_PAGES {
+            let page = self
+                .list_versions(key, cursor.as_ref(), MAX_VERSION_PAGE_SIZE)
+                .await?;
+            if let Some(kind) = exact_listed_version_kind(&page.versions, key, version_id) {
+                return Ok(kind == ObjectVersionKind::DeleteMarker);
+            }
+            match page.next {
+                None => return Ok(false),
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "progressing exact delete-marker version enumeration",
+                    });
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(StoreError::UnsupportedCapability {
+            backend: "s3",
+            capability: "bounded exact delete-marker version enumeration",
+        })
+    }
+
     async fn multipart_put(
         &self,
         key: &str,
@@ -1207,12 +1546,13 @@ impl S3Store {
             }
         };
 
-        let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
-        Ok(ObjectMeta {
-            key: key.into(),
-            size: len,
-            version: Version::new(etag.as_deref().unwrap_or("")),
-        })
+        successful_write_meta(
+            "CompleteMultipartUpload",
+            key,
+            len,
+            resp.e_tag(),
+            resp.version_id(),
+        )
     }
 
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
@@ -1234,6 +1574,8 @@ impl S3Store {
                 StoreError::PreconditionFailed { .. } => "precondition",
                 StoreError::Retryable(_) => "retryable",
                 StoreError::InvalidArgument(_) => "invalid-argument",
+                StoreError::UnsupportedCapability { .. } => "unsupported-capability",
+                StoreError::AmbiguousWrite { .. } => "ambiguous-write",
                 StoreError::Other(_) => "other",
             };
             tracing::warn!(
@@ -1258,8 +1600,11 @@ impl S3Store {
 //    are supported. The exact selected provider must separately prove the
 //    conditional CompleteMultipartUpload headers required by this backend.
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
-//    stripped consistently in our Version.
+//    stripped consistently in our CasToken.
 // 9. force_path_style: required for rustfs local dev.
+// 10. Exact HEAD of a delete marker returns a bare 405 without the AWS
+//     delete-marker/version headers. The failure path proves the exact marker
+//     through bounded ListObjectVersions pagination instead.
 
 #[cfg(test)]
 mod tests {
@@ -1307,6 +1652,169 @@ mod tests {
         assert!(defaults.access_key_env.is_empty());
         assert!(defaults.secret_key_env.is_empty());
         assert!(defaults.session_token_env.is_empty());
+    }
+
+    #[test]
+    fn production_versioning_check_fails_closed() {
+        assert!(require_enabled_versioning(None).is_err());
+        assert!(
+            require_enabled_versioning(Some(&aws_sdk_s3::types::BucketVersioningStatus::Suspended))
+                .is_err()
+        );
+        require_enabled_versioning(Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled))
+            .unwrap();
+    }
+
+    #[test]
+    fn every_successful_write_path_requires_a_usable_version_id() {
+        for operation in [
+            "PutObject",
+            "ComposeObject completion",
+            "CompleteMultipartUpload",
+        ] {
+            for missing in [None, Some(""), Some("   "), Some("null")] {
+                assert!(matches!(
+                    successful_write_meta(operation, "key", 4, Some("\"etag\""), missing),
+                    Err(StoreError::AmbiguousWrite { .. })
+                ));
+            }
+            let meta =
+                successful_write_meta(operation, "key", 4, Some("\"etag\""), Some("version-id"))
+                    .expect("version-addressed successful write");
+            assert_eq!(meta.version.as_str(), "etag");
+            assert_eq!(
+                meta.object_version_id.expect("version ID").as_str(),
+                "version-id"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_current_get_and_head_require_a_usable_version_id() {
+        for capability in [
+            "VersionId on successful current GET",
+            "VersionId on successful current HEAD",
+        ] {
+            for missing in [None, Some(""), Some("   "), Some("null"), Some(" null ")] {
+                assert!(matches!(
+                    require_current_s3_version_id(capability, missing),
+                    Err(StoreError::UnsupportedCapability { .. })
+                ));
+            }
+            assert_eq!(
+                require_current_s3_version_id(capability, Some(" version-id "))
+                    .expect("usable version ID")
+                    .as_str(),
+                "version-id"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_copy_source_pins_the_exact_version_and_cas() {
+        let source = ComposeSource {
+            key: "packs/a pack.pack".into(),
+            size: 42,
+            cas_token: CasToken::new("etag"),
+            object_version_id: ObjectVersionId::new("version/with+reserved"),
+        };
+        assert_eq!(
+            compose_copy_source("bucket", &source),
+            "bucket/packs/a%20pack.pack?versionId=version%2Fwith%2Breserved"
+        );
+    }
+
+    #[test]
+    fn exact_head_uses_only_405_for_delete_marker_evidence() {
+        let requested = ObjectVersionId::new("marker-version");
+        assert_eq!(
+            exact_delete_marker_head_evidence(
+                405,
+                Some("true"),
+                Some("marker-version"),
+                &requested
+            ),
+            ExactDeleteMarkerHeadEvidence::Confirmed
+        );
+        for (marker, version) in [
+            (None, Some("marker-version")),
+            (Some("false"), Some("marker-version")),
+            (Some("true"), Some("other-version")),
+            (Some("true"), None),
+        ] {
+            assert_eq!(
+                exact_delete_marker_head_evidence(405, marker, version, &requested),
+                ExactDeleteMarkerHeadEvidence::RequiresListing
+            );
+        }
+        assert_eq!(
+            exact_delete_marker_head_evidence(
+                404,
+                Some("true"),
+                Some("marker-version"),
+                &requested
+            ),
+            ExactDeleteMarkerHeadEvidence::Unrelated
+        );
+        assert_eq!(
+            exact_delete_marker_head_evidence(500, None, None, &requested),
+            ExactDeleteMarkerHeadEvidence::Unrelated
+        );
+    }
+
+    #[test]
+    fn exact_listing_proof_matches_both_key_and_version_kind() {
+        let requested = ObjectVersionId::new("requested");
+        let versions = vec![
+            ObjectVersion {
+                key: "same-prefix-sibling".into(),
+                object_version_id: requested.clone(),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: false,
+            },
+            ObjectVersion {
+                key: "key".into(),
+                object_version_id: ObjectVersionId::new("other"),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: false,
+            },
+        ];
+        assert_eq!(
+            exact_listed_version_kind(&versions, "key", &requested),
+            None
+        );
+
+        let mut exact_object = versions.clone();
+        exact_object.push(ObjectVersion {
+            key: "key".into(),
+            object_version_id: requested.clone(),
+            cas_token: Some(CasToken::new("etag")),
+            size: 1,
+            kind: ObjectVersionKind::Object,
+            is_latest: false,
+        });
+        assert_eq!(
+            exact_listed_version_kind(&exact_object, "key", &requested),
+            Some(ObjectVersionKind::Object)
+        );
+
+        let mut exact_marker = versions;
+        exact_marker.push(ObjectVersion {
+            key: "key".into(),
+            object_version_id: requested.clone(),
+            cas_token: None,
+            size: 0,
+            kind: ObjectVersionKind::DeleteMarker,
+            is_latest: true,
+        });
+        assert_eq!(
+            exact_listed_version_kind(&exact_marker, "key", &requested),
+            Some(ObjectVersionKind::DeleteMarker)
+        );
     }
 
     #[test]
@@ -1481,7 +1989,8 @@ mod tests {
             meta: ObjectMeta {
                 key: "large-pack".into(),
                 size: 30 * 1024 * 1024 * 1024,
-                version: Version::new("version"),
+                version: CasToken::new("version"),
+                object_version_id: None,
             },
             body: Box::pin(futures::stream::iter([
                 Ok(Bytes::from(vec![b'a'; 2 * 1024 * 1024])),
@@ -1499,7 +2008,8 @@ mod tests {
             meta: ObjectMeta {
                 key: "large-pack".into(),
                 size: 30 * 1024 * 1024 * 1024,
-                version: Version::new("version"),
+                version: CasToken::new("version"),
+                object_version_id: None,
             },
             body: crate::util::once(Bytes::from_static(b"short")),
         };
@@ -1523,7 +2033,7 @@ mod tests {
         assert_eq!(create.get_if_none_match().as_deref(), Some("*"));
         assert!(create.get_if_match().is_none());
 
-        let update_version = Version::new("etag");
+        let update_version = CasToken::new("etag");
         let update = apply_complete_condition(
             client.complete_multipart_upload(),
             &PutMode::Update(update_version),

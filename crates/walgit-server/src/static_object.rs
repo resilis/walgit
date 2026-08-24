@@ -19,7 +19,7 @@ use std::ops::Range;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use walgit_store::{GetOptions, GetResult, ObjectMeta, ObjectStore, StoreError, Version};
+use walgit_store::{CasToken, GetOptions, GetResult, ObjectMeta, ObjectStore, StoreError};
 
 use crate::error::ApiError;
 
@@ -107,7 +107,7 @@ impl RangeSpec {
 }
 
 /// `ETag` header value for a store version.
-pub fn etag_of(version: &Version) -> HeaderValue {
+pub fn etag_of(version: &CasToken) -> HeaderValue {
     let v = version.as_str().trim_matches('"');
     HeaderValue::from_str(&format!("\"{v}\"")).unwrap_or_else(|_| HeaderValue::from_static("\"-\""))
 }
@@ -130,7 +130,7 @@ fn etags(headers: &HeaderMap, name: header::HeaderName) -> Vec<String> {
         .collect()
 }
 
-fn if_none_match_hit(headers: &HeaderMap, version: &Version) -> bool {
+fn if_none_match_hit(headers: &HeaderMap, version: &CasToken) -> bool {
     let tags = etags(headers, header::IF_NONE_MATCH);
     let cur = version.as_str().trim_matches('"');
     tags.iter().any(|t| t == "*" || t == cur)
@@ -139,7 +139,7 @@ fn if_none_match_hit(headers: &HeaderMap, version: &Version) -> bool {
 /// `If-Range`: if it names an ETag that does not match the current version the
 /// range is ignored and the full body is sent (RFC 9110 §13.1.5). Dates are
 /// not supported (we have no `Last-Modified`) and therefore also ignored.
-fn if_range_allows(headers: &HeaderMap, version: &Version) -> bool {
+fn if_range_allows(headers: &HeaderMap, version: &CasToken) -> bool {
     match headers.get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
         None => true,
         Some(v) if v.contains('"') => {
@@ -200,7 +200,7 @@ fn cache_control(opts: &ServeOptions<'_>) -> HeaderValue {
         .unwrap_or(HeaderValue::from_static(IMMUTABLE))
 }
 
-fn not_modified(meta_version: &Version, opts: &ServeOptions<'_>) -> Response {
+fn not_modified(meta_version: &CasToken, opts: &ServeOptions<'_>) -> Response {
     let mut resp = StatusCode::NOT_MODIFIED.into_response();
     let h = resp.headers_mut();
     h.insert(header::ETAG, etag_of(meta_version));
@@ -347,7 +347,7 @@ pub async fn serve(
     let tags = etags(headers, header::IF_NONE_MATCH);
     let get = GetOptions {
         if_none_match: match tags.as_slice() {
-            [one] if one != "*" => Some(Version::new(one.as_str())),
+            [one] if one != "*" => Some(CasToken::new(one.as_str())),
             _ => None,
         },
         ..Default::default()
@@ -448,21 +448,21 @@ mod tests {
             header::IF_NONE_MATCH,
             HeaderValue::from_static("W/\"abc\", \"123\""),
         );
-        assert!(if_none_match_hit(&h, &Version::new("123")));
-        assert!(if_none_match_hit(&h, &Version::new("\"abc\"")));
-        assert!(!if_none_match_hit(&h, &Version::new("999")));
+        assert!(if_none_match_hit(&h, &CasToken::new("123")));
+        assert!(if_none_match_hit(&h, &CasToken::new("\"abc\"")));
+        assert!(!if_none_match_hit(&h, &CasToken::new("999")));
         h.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
-        assert!(if_none_match_hit(&h, &Version::new("999")));
+        assert!(if_none_match_hit(&h, &CasToken::new("999")));
         let mut h = HeaderMap::new();
         h.insert(header::IF_RANGE, HeaderValue::from_static("\"123\""));
-        assert!(if_range_allows(&h, &Version::new("123")));
-        assert!(!if_range_allows(&h, &Version::new("124")));
+        assert!(if_range_allows(&h, &CasToken::new("123")));
+        assert!(!if_range_allows(&h, &CasToken::new("124")));
         h.insert(
             header::IF_RANGE,
             HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
         );
-        assert!(!if_range_allows(&h, &Version::new("123")));
-        assert_eq!(etag_of(&Version::new("12345")), "\"12345\"");
-        assert_eq!(etag_of(&Version::new("\"e\"")), "\"e\"");
+        assert!(!if_range_allows(&h, &CasToken::new("123")));
+        assert_eq!(etag_of(&CasToken::new("12345")), "\"12345\"");
+        assert_eq!(etag_of(&CasToken::new("\"e\"")), "\"e\"");
     }
 }

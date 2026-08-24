@@ -31,7 +31,6 @@ use std::collections::{HashMap, HashSet};
 
 use futures::future::BoxFuture;
 use gix_object::{Find, FindHeader, Kind as ObjKind};
-use gix_pack::data::Version as PackVersion;
 use gix_pack::data::output::bytes::FromEntriesIter;
 use gix_pack::data::output::count;
 use gix_pack::data::output::entry;
@@ -585,7 +584,7 @@ fn generate_pack_streaming(
     )
     .map_err(ge)?;
     if counts.is_empty() {
-        let header = gix_pack::data::header::encode(PackVersion::V2, 0);
+        let header = gix_pack::data::header::encode(gix_pack::data::Version::V2, 0);
         let mut buf = header.to_vec();
         let trailer = crate::compute_pack_trailer(&buf, object_hash);
         buf.extend_from_slice(trailer.as_slice());
@@ -600,7 +599,7 @@ fn generate_pack_streaming(
         find,
         progress,
         entry::iter_from_counts::Options {
-            version: PackVersion::V2,
+            version: gix_pack::data::Version::V2,
             mode: entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
             allow_thin_pack,
             thread_limit,
@@ -613,7 +612,7 @@ fn generate_pack_streaming(
         entries_in_order,
         out,
         num_entries,
-        PackVersion::V2,
+        gix_pack::data::Version::V2,
         object_hash,
     );
     while let Some(result) = pack_iter.next() {

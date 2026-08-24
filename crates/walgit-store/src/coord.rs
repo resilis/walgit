@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use prost::Message;
 use tokio::sync::Mutex;
 
-use crate::{DynStore, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, StoreError, Version};
+use crate::{CasToken, DynStore, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, StoreError};
 use walgit_proto::time;
 use walgit_proto::v1::Lease;
 
@@ -127,7 +127,7 @@ where
 pub async fn get_message_if_changed<T>(
     store: &dyn ObjectStore,
     key: &str,
-    known: &Version,
+    known: &CasToken,
 ) -> Result<Option<(ObjectMeta, T)>, CoordError>
 where
     T: prost::Message + Default,
@@ -164,7 +164,7 @@ pub struct LeaseGuard {
     key: String,
     holder: String,
     purpose: String,
-    version: Version,
+    version: CasToken,
     expires_at: SystemTime,
     epoch: u64,
     /// Set by `release` / `Drop` so the other path is a no-op. Also read by the
@@ -178,7 +178,7 @@ impl LeaseGuard {
         key: &str,
         holder: &str,
         purpose: &str,
-        version: Version,
+        version: CasToken,
         now: SystemTime,
         ttl: Duration,
         epoch: u64,
@@ -637,7 +637,7 @@ mod tests {
         let key = "catalog.pb";
 
         // Absent => None.
-        let res = get_message_if_changed::<RepoCatalog>(store.as_ref(), key, &Version::new("0"))
+        let res = get_message_if_changed::<RepoCatalog>(store.as_ref(), key, &CasToken::new("0"))
             .await
             .unwrap();
         assert!(res.is_none());
@@ -660,7 +660,7 @@ mod tests {
         assert!(res.is_none());
 
         // Different version => Some.
-        let res = get_message_if_changed::<RepoCatalog>(store.as_ref(), key, &Version::new("0"))
+        let res = get_message_if_changed::<RepoCatalog>(store.as_ref(), key, &CasToken::new("0"))
             .await
             .unwrap()
             .unwrap();

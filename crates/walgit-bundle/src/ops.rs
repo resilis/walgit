@@ -19,7 +19,8 @@ use walgit_git::{GitError, LocalRepo, RefSnapshotData};
 use walgit_proto::v1::{BundleEntry, BundleList, Lease, Ref};
 use walgit_proto::{keys, time};
 use walgit_store::{
-    ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions, StoreError, Version,
+    CasToken, ComposeSource, ObjectStore, ObjectStoreExt, Prefixed, PutBody, PutMode, PutOptions,
+    StoreError,
 };
 
 use crate::BundleError;
@@ -435,7 +436,7 @@ pub async fn cas_update_list<F>(
     store: &Prefixed,
     max_retries: u32,
     mut f: F,
-) -> Result<Option<(Version, BundleList)>, BundleError>
+) -> Result<Option<(CasToken, BundleList)>, BundleError>
 where
     F: FnMut(Option<&BundleList>) -> Result<Option<BundleList>, BundleError>,
 {
@@ -499,7 +500,7 @@ where
 pub struct LeaseGuard {
     store: Prefixed,
     key: String,
-    version: Version,
+    version: CasToken,
     released: bool,
 }
 
@@ -661,7 +662,7 @@ pub async fn hold_lease(
     strategy: &str,
     holder: &str,
     ttl: Duration,
-) -> Result<Version, BundleError> {
+) -> Result<CasToken, BundleError> {
     let key = format!("{}bundle-{strategy}.pb", keys::LEASES_DIR);
     let now = SystemTime::now();
     let lease = Lease {
@@ -1129,18 +1130,34 @@ async fn compose_full_inner(
     };
     let meta = if store.supports_compose() {
         let hdr_key = format!("{key}.hdr");
-        store
+        let header_meta = store
             .put(
                 &hdr_key,
                 PutBody::Bytes(header.clone().into()),
                 PutOptions::from(PutMode::Overwrite),
             )
             .await?;
-        let m = store
-            .compose(&key, &[hdr_key.clone(), pack_key], opts)
-            .await?;
-        let _ = store.delete(&hdr_key, None).await;
-        m
+        let header_source = ComposeSource::try_from(header_meta)?;
+        let compose_result: std::result::Result<_, StoreError> = async {
+            let pack_meta = store
+                .head(&pack_key)
+                .await?
+                .ok_or_else(|| StoreError::NotFound {
+                    key: pack_key.clone(),
+                })?;
+            if pack_meta.size != pack_size {
+                return Err(StoreError::InvalidArgument(format!(
+                    "bundle base pack {} size is {}, expected {}",
+                    pack_key, pack_meta.size, pack_size
+                )));
+            }
+            let sources = [header_source.clone(), ComposeSource::try_from(pack_meta)?];
+            store.compose(&key, &sources, opts).await
+        }
+        .await;
+        walgit_store::util::cleanup_temporary_versions(store, std::slice::from_ref(&header_source))
+            .await;
+        compose_result?
     } else {
         let Some(path) = pack_path else {
             return Err(BundleError::Other(

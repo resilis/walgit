@@ -10,13 +10,15 @@
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
 //! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use walgit_store::{
-    DynStore, GetOptions, GetResult, PutBody, PutMode, PutOptions, StoreError, memory::MemoryStore,
+    ComposeSource, DynStore, GetOptions, GetResult, ObjectStoreExt, ObjectVersionKind, PutBody,
+    PutMode, PutOptions, StoreError, memory::MemoryStore,
 };
 
 /// Run the full contract suite against `store` under `prefix`.
@@ -44,6 +46,233 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
     test_declared_length_mismatch(&store, &p("declared-length")).await;
     test_multipart_path(&store, &p("multi")).await;
     test_compose(&store, &p("compose")).await;
+    store
+        .verify_versioning()
+        .await
+        .expect("the contract requires bucket versioning");
+    test_version_history(&store, &p("versions")).await;
+    if store.backend() == "s3" {
+        test_s3_delete_marker_history(&store, &p("delete-markers")).await;
+    }
+}
+
+async fn test_version_history(store: &DynStore, key: &str) {
+    let first = put_bytes(store, key, b"same-payload".as_slice(), PutMode::Create).await;
+    let second = put_bytes(store, key, b"same-payload".as_slice(), PutMode::Overwrite).await;
+    let third = put_bytes(store, key, b"same-payload".as_slice(), PutMode::Overwrite).await;
+    let first_id = first
+        .object_version_id
+        .clone()
+        .expect("version-aware PUT must return ObjectVersionID");
+    let second_id = second
+        .object_version_id
+        .clone()
+        .expect("overwrite must return ObjectVersionID");
+    let third_id = third
+        .object_version_id
+        .clone()
+        .expect("second overwrite must return ObjectVersionID");
+    if store.backend() == "s3" {
+        assert_eq!(
+            first.version, second.version,
+            "identical single-part bytes must exercise the same-ETag case"
+        );
+        assert_eq!(second.version, third.version);
+    }
+    assert_ne!(first_id, second_id, "same bytes need distinct version IDs");
+    assert_ne!(second_id, third_id, "each overwrite needs a new version ID");
+
+    let old = store
+        .get_version(key, &first_id, None)
+        .await
+        .expect("exact-version GET");
+    let (old_meta, old_body) = collect_body(old).await;
+    assert_eq!(old_meta.object_version_id, Some(first_id.clone()));
+    assert_eq!(&old_body[..], b"same-payload");
+    assert_eq!(
+        store
+            .head_version(key, &first_id)
+            .await
+            .expect("exact-version HEAD")
+            .expect("old version exists")
+            .object_version_id,
+        Some(first_id.clone())
+    );
+
+    store
+        .delete_version(key, &first_id)
+        .await
+        .expect("exact-version delete");
+    assert!(
+        store
+            .head_version(key, &first_id)
+            .await
+            .expect("head deleted exact version")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .head(key)
+            .await
+            .expect("head current")
+            .expect("current survives deleting old version")
+            .object_version_id,
+        Some(third_id.clone())
+    );
+
+    let mut cursor = None;
+    let mut history = Vec::new();
+    let mut saw_continuation = false;
+    for _ in 0..16 {
+        let page = store
+            .list_versions(key, cursor.as_ref(), 1)
+            .await
+            .expect("paginated version listing");
+        history.extend(page.versions);
+        cursor = page.next;
+        saw_continuation |= cursor.is_some();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "version listing did not terminate");
+    assert!(saw_continuation, "limit=1 must force continuation paging");
+    assert_eq!(history.len(), 2);
+    let listed_ids: HashSet<_> = history
+        .iter()
+        .map(|version| version.object_version_id.as_str())
+        .collect();
+    assert_eq!(listed_ids.len(), history.len(), "duplicate version IDs");
+    assert_eq!(
+        listed_ids,
+        HashSet::from([second_id.as_str(), third_id.as_str()])
+    );
+    let latest: Vec<_> = history
+        .iter()
+        .filter(|version| version.kind == ObjectVersionKind::Object && version.is_latest)
+        .collect();
+    assert_eq!(latest.len(), 1, "exactly one live generation is latest");
+    let current = latest
+        .first()
+        .expect("current generation must be enumerated");
+    assert_eq!(current.object_version_id, third_id);
+
+    let multipart_key = format!("{key}-multipart");
+    let multipart = put_bytes(
+        store,
+        &multipart_key,
+        Bytes::from(vec![0x5a; 6 * 1024 * 1024]),
+        PutMode::Create,
+    )
+    .await;
+    let multipart_id = multipart
+        .object_version_id
+        .clone()
+        .expect("multipart completion must return ObjectVersionID");
+    assert_eq!(
+        store
+            .head_version(&multipart_key, &multipart_id)
+            .await
+            .expect("multipart exact head")
+            .expect("multipart version exists")
+            .object_version_id,
+        Some(multipart_id.clone())
+    );
+
+    store.delete_version(key, &second_id).await.unwrap();
+    store.delete_version(key, &third_id).await.unwrap();
+    store
+        .delete_version(&multipart_key, &multipart_id)
+        .await
+        .unwrap();
+}
+
+async fn test_s3_delete_marker_history(store: &DynStore, key: &str) {
+    let first = put_bytes(store, key, b"first".as_slice(), PutMode::Create).await;
+    let second = put_bytes(store, key, b"second".as_slice(), PutMode::Overwrite).await;
+    let first_id = first.object_version_id.clone().expect("first S3 VersionId");
+    let second_id = second
+        .object_version_id
+        .clone()
+        .expect("second S3 VersionId");
+    store.delete(key, None).await.expect("create delete marker");
+    assert!(store.head(key).await.expect("head marker").is_none());
+
+    let mut cursor = None;
+    let mut history = Vec::new();
+    let mut saw_continuation = false;
+    for _ in 0..16 {
+        let page = store
+            .list_versions(key, cursor.as_ref(), 1)
+            .await
+            .expect("list paginated marker history");
+        history.extend(page.versions);
+        cursor = page.next;
+        saw_continuation |= cursor.is_some();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "mixed S3 pagination did not terminate");
+    assert!(saw_continuation, "limit=1 must force mixed pagination");
+    assert_eq!(history.len(), 3);
+    let listed_ids: HashSet<_> = history
+        .iter()
+        .map(|version| version.object_version_id.as_str())
+        .collect();
+    assert_eq!(listed_ids.len(), history.len(), "duplicate mixed versions");
+    assert!(listed_ids.contains(first_id.as_str()));
+    assert!(listed_ids.contains(second_id.as_str()));
+
+    let marker = history
+        .iter()
+        .find(|version| version.kind == ObjectVersionKind::DeleteMarker && version.is_latest)
+        .expect("latest S3 delete marker");
+    let marker_id = marker.object_version_id.clone();
+    assert!(listed_ids.contains(marker_id.as_str()));
+    assert_eq!(
+        history.iter().filter(|version| version.is_latest).count(),
+        1,
+        "only the delete marker is latest"
+    );
+    assert!(
+        history
+            .iter()
+            .filter(|version| { version.kind == ObjectVersionKind::Object && !version.is_latest })
+            .count()
+            == 2
+    );
+    assert!(
+        store
+            .head_version(key, &marker_id)
+            .await
+            .expect("exact marker HEAD")
+            .is_none()
+    );
+    let (_, hidden) = store
+        .get_version(key, &second_id, None)
+        .await
+        .expect("historical GET behind marker")
+        .bytes()
+        .await
+        .expect("collect hidden version")
+        .expect("hidden version body");
+    assert_eq!(&hidden[..], b"second");
+    store
+        .delete_version(key, &marker_id)
+        .await
+        .expect("delete exact marker");
+    assert_eq!(
+        store
+            .head(key)
+            .await
+            .expect("head restored current")
+            .expect("prior current restored")
+            .object_version_id,
+        Some(second_id.clone())
+    );
+    store.delete_version(key, &first_id).await.unwrap();
+    store.delete_version(key, &second_id).await.unwrap();
 }
 
 /// A backend must never complete a shortened object or ignore bytes beyond a
@@ -107,7 +336,7 @@ async fn test_compose(store: &DynStore, key: &str) {
     let body = Bytes::from(body);
     let h = format!("{key}.hdr");
     let b = format!("{key}.body");
-    store
+    let header_meta = store
         .put(
             &h,
             PutBody::Bytes(header.clone()),
@@ -115,7 +344,7 @@ async fn test_compose(store: &DynStore, key: &str) {
         )
         .await
         .expect("put header");
-    store
+    let body_meta = store
         .put(
             &b,
             PutBody::Bytes(body.clone()),
@@ -123,10 +352,22 @@ async fn test_compose(store: &DynStore, key: &str) {
         )
         .await
         .expect("put body");
+    let sources = [
+        ComposeSource::try_from(header_meta).expect("exact header source"),
+        ComposeSource::try_from(body_meta).expect("exact body source"),
+    ];
+    let overwritten_header = store
+        .put(
+            &h,
+            PutBody::Bytes(Bytes::from_static(b"overwritten")),
+            PutOptions::from(PutMode::Overwrite),
+        )
+        .await
+        .expect("overwrite source after capturing exact reference");
     let meta = store
         .compose(
             key,
-            &[h.clone(), b.clone()],
+            &sources,
             PutOptions {
                 mode: PutMode::Create,
                 immutable: true,
@@ -146,18 +387,20 @@ async fn test_compose(store: &DynStore, key: &str) {
     assert_eq!(&got[header.len()..], &body[..], "composed body differs");
     // Create on an existing object is a precondition failure.
     let again = store
-        .compose(
-            key,
-            &[h.clone(), b.clone()],
-            PutOptions::from(PutMode::Create),
-        )
+        .compose(key, &sources, PutOptions::from(PutMode::Create))
         .await;
     assert!(
         matches!(again, Err(StoreError::PreconditionFailed { .. })),
         "{again:?}"
     );
-    for k in [key, h.as_str(), b.as_str()] {
-        let _ = store.delete(k, None).await;
+    let mut cleanup = sources.to_vec();
+    cleanup.push(ComposeSource::try_from(overwritten_header).expect("new header version"));
+    cleanup.push(ComposeSource::try_from(meta).expect("composed version"));
+    for temporary in cleanup {
+        store
+            .delete_version(&temporary.key, &temporary.object_version_id)
+            .await
+            .expect("exact compose-test cleanup");
     }
 }
 
@@ -340,7 +583,7 @@ async fn test_get_if_none_match(store: &DynStore, key: &str) {
         .get(
             key,
             GetOptions {
-                if_none_match: Some(walgit_store::Version::new("different")),
+                if_none_match: Some(walgit_store::CasToken::new("different")),
                 ..Default::default()
             },
         )
@@ -363,7 +606,7 @@ async fn test_get_if_match_mismatch(store: &DynStore, key: &str) {
         .get(
             key,
             GetOptions {
-                if_match: Some(walgit_store::Version::new("wrong-etag")),
+                if_match: Some(walgit_store::CasToken::new("wrong-etag")),
                 ..Default::default()
             },
         )
@@ -468,7 +711,7 @@ async fn test_delete(store: &DynStore, key: &str) {
 
     // Put then conditional delete with wrong version → fail.
     let meta = put_bytes(store, key, b"delete-me".as_slice(), PutMode::Create).await;
-    let wrong = walgit_store::Version::new("wrong");
+    let wrong = walgit_store::CasToken::new("wrong");
     let err = store.delete(key, Some(wrong)).await;
     assert!(err.is_err(), "delete with wrong version should fail");
     assert!(
@@ -500,7 +743,7 @@ async fn test_delete(store: &DynStore, key: &str) {
 
     // Conditional delete of absent key → NotFound.
     let err = store
-        .delete(key, Some(walgit_store::Version::new("anything")))
+        .delete(key, Some(walgit_store::CasToken::new("anything")))
         .await;
     assert!(err.is_err(), "conditional delete absent should fail");
     assert!(
@@ -907,17 +1150,39 @@ async fn s3_contract() {
     run_contract(store.clone(), &prefix).await;
     test_s3_multipart_failures_and_conditions(&store, &prefix).await;
 
-    // Cleanup: delete all objects under the prefix.
-    let to_delete: Vec<_> = futures::stream::iter(
-        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
-            .collect::<Vec<_>>()
-            .await,
-    )
-    .filter_map(|r| async move { r.ok() })
-    .collect::<Vec<_>>()
-    .await;
-    for m in to_delete {
-        store.delete(&m.key, None).await.expect("contract cleanup");
+    // Cleanup exact historical versions when versioning is enabled. Deleting
+    // only current objects would leave noncurrent versions and delete markers.
+    if store.verify_versioning().await.is_ok() {
+        loop {
+            let page = store
+                .list_versions(&format!("{prefix}/"), None, 1_000)
+                .await
+                .expect("list versions for cleanup");
+            if page.versions.is_empty() {
+                break;
+            }
+            for version in page.versions {
+                store
+                    .delete_version(&version.key, &version.object_version_id)
+                    .await
+                    .expect("delete exact version during cleanup");
+            }
+        }
+    } else {
+        let to_delete: Vec<_> = futures::stream::iter(
+            walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
+                .collect::<Vec<_>>()
+                .await,
+        )
+        .filter_map(|r| async move { r.ok() })
+        .collect::<Vec<_>>()
+        .await;
+        for meta in to_delete {
+            store
+                .delete(&meta.key, None)
+                .await
+                .expect("contract cleanup");
+        }
     }
     let leftovers = walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
         .collect::<Vec<_>>()
@@ -972,20 +1237,34 @@ async fn gcs_contract() {
 
     run_contract(store.clone(), &prefix).await;
 
-    // Cleanup: delete all objects under the prefix.
-    let to_delete: Vec<_> = futures::stream::iter(
-        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
-            .collect::<Vec<_>>()
-            .await,
-    )
-    .filter_map(|r| async move { r.ok() })
-    .collect::<Vec<_>>()
-    .await;
-    let count = to_delete.len();
-    for m in &to_delete {
-        let _ = store.delete(&m.key, None).await;
+    // Cleanup every exact generation. Soft delete is rejected at startup, so
+    // a successful exact delete permanently removes the named generation.
+    let cleanup_prefix = format!("{prefix}/");
+    let mut count = 0usize;
+    loop {
+        let page = store
+            .list_versions(&cleanup_prefix, None, 1_000)
+            .await
+            .expect("list GCS generations for cleanup");
+        if page.versions.is_empty() {
+            assert!(page.next.is_none());
+            break;
+        }
+        for version in page.versions {
+            store
+                .delete_version(&version.key, &version.object_version_id)
+                .await
+                .expect("exact-delete GCS contract generation");
+            count += 1;
+        }
     }
-    eprintln!("[gcs_contract] cleanup done ({count} objects deleted)");
+    let final_page = store
+        .list_versions(&cleanup_prefix, None, 1)
+        .await
+        .expect("verify empty GCS generation inventory");
+    assert!(final_page.versions.is_empty());
+    assert!(final_page.next.is_none());
+    eprintln!("[gcs_contract] cleanup done ({count} generations exact-deleted)");
 }
 
 /// Control plane must stay fast under bulk load (prod 2026-08-20: a 184-byte
@@ -1032,7 +1311,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         .get(
             &big_key,
             GetOptions {
-                if_none_match: Some(walgit_store::Version::new("1")),
+                if_none_match: Some(walgit_store::CasToken::new("1")),
                 range: Some(0..16),
                 ..Default::default()
             },
@@ -1093,7 +1372,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
             .get(
                 &big_key,
                 GetOptions {
-                    if_none_match: Some(walgit_store::Version::new("1")),
+                    if_none_match: Some(walgit_store::CasToken::new("1")),
                     range: Some(0..16),
                     ..Default::default()
                 },

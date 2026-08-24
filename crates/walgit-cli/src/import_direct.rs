@@ -1179,7 +1179,7 @@ fn idx_object_count(idx: &Path) -> Result<u64> {
 async fn cas_update_bundle_list<F>(
     store: &Prefixed,
     mut f: F,
-) -> Result<(walgit_store::Version, BundleList)>
+) -> Result<(walgit_store::CasToken, BundleList)>
 where
     F: FnMut(Option<&BundleList>) -> BundleList,
 {
