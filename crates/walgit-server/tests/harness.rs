@@ -328,7 +328,7 @@ impl std::ops::Deref for TestRepo {
 
 /// Run `git` with `args` in `cwd`.
 pub fn git(args: &[&str], cwd: &Path) -> Result<()> {
-    let out = Command::new("git").current_dir(cwd).args(args).output()?;
+    let out = git_command(cwd).args(args).output()?;
     ensure!(
         out.status.success(),
         "git {} failed: {}",
@@ -340,7 +340,7 @@ pub fn git(args: &[&str], cwd: &Path) -> Result<()> {
 
 /// Run `git` in `dir`, returning stdout.
 pub fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").current_dir(dir).args(args).output()?;
+    let out = git_command(dir).args(args).output()?;
     ensure!(
         out.status.success(),
         "git {} failed: {}",
@@ -348,4 +348,15 @@ pub fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
         String::from_utf8_lossy(&out.stderr)
     );
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(cwd).envs([
+        ("GIT_AUTHOR_NAME", "walgit test"),
+        ("GIT_AUTHOR_EMAIL", "test@walgit"),
+        ("GIT_COMMITTER_NAME", "walgit test"),
+        ("GIT_COMMITTER_EMAIL", "test@walgit"),
+    ]);
+    command
 }

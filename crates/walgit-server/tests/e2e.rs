@@ -931,10 +931,7 @@ async fn lfs_roundtrip_when_available() -> TestResult {
         "pointer only"
     );
     assert!(
-        !p.join(".git/lfs/objects").exists()
-            || std::fs::read_dir(p.join(".git/lfs/objects"))?
-                .next()
-                .is_none(),
+        !contains_regular_file(&p.join(".git/lfs/objects"))?,
         "no local LFS bytes"
     );
     git_in(p, &["lfs", "install", "--local"])?;
@@ -983,6 +980,50 @@ fn git_lfs_present() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+fn contains_regular_file(root: &std::path::Path) -> std::io::Result<bool> {
+    const MAX_ENTRIES: usize = 4_096;
+
+    if !root.try_exists()? {
+        return Ok(false);
+    }
+
+    let mut directories = vec![root.to_path_buf()];
+    let mut entries_seen = 0;
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            entries_seen += 1;
+            if entries_seen > MAX_ENTRIES {
+                return Err(std::io::Error::other(
+                    "LFS object traversal exceeded the test bound",
+                ));
+            }
+
+            let file_type = entry.file_type()?;
+            if file_type.is_file() {
+                return Ok(true);
+            }
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+#[test]
+fn lfs_object_scan_ignores_empty_fanout_but_finds_files() -> TestResult {
+    let objects = tempfile::tempdir()?;
+    let fanout = objects.path().join("ab/cd");
+    std::fs::create_dir_all(&fanout)?;
+    assert!(!contains_regular_file(objects.path())?);
+
+    std::fs::write(fanout.join("object"), b"payload")?;
+    assert!(contains_regular_file(objects.path())?);
+    Ok(())
 }
 
 fn git_supports_sha256() -> bool {
