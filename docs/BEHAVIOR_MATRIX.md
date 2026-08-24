@@ -14,7 +14,8 @@ disposable bucket and unique prefix. Run
 `just test-gcs <bucket>` only against an approved disposable bucket and unique
 prefix. Exact-provider primitive conformance is a PR2 merge gate. Full-scale
 recovery and production-candidate evidence remain later PR3 gates. PR1 does
-not implement the V5.3 control, event, recovery, or cutover contracts.
+not implement the V5.4 control, identity, signing, event, recovery, or cutover
+contracts.
 
 | Surface | Owner | Entrypoint | PR1 preservation decision | Test or evidence |
 |---|---|---|---|---|
@@ -50,6 +51,11 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | Repair and fsck | CLI / Git / maintainer | `fsck`, `repair` units | Preserve connectivity audit and upstream repair | `cargo test -p walgit-server --test maintain`; `docs/INTEGRITY.md` review |
 | Versioned recovery | future control / store | exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 production approval | Future exact-provider version tests and recovery vertical acceptance in `docs/PRODUCTION_ARCHITECTURE.md` |
 | Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Preserve current routes in PR1; identity/lifecycle/reclamation move to PR2 | `just e2e`; future control gate |
+| V2 direct repository identity | future control / Cloud Core | canonical transport path to routing-digest-derived `repo_control`; UUID/generation payload namespace | Not implemented by PR1; V2 keeps `SHA-256(C)` as the canonical identity digest, uses a separate domain-separated routing digest for keys, and enforces binary global uniqueness plus a non-reusable tombstone while preserving current PR1 routes until the hard cut | Future shared transport corpus, both-digest derivation and binding, independent identity/routing collision errors, namespace, and tombstone gate |
+| V2 bounded control schema | future protobuf / control | `repo_control`, typed inline state, immutable catalog roots | Not implemented by PR1; every variable field, message, repeated field, and catalog uses the exact V5.4 numeric bound and compact-or-reject behavior | Future descriptor-linter, decoder-allocation, boundary, inline/catalog `oneof`, and backpressure gate |
+| V2 normal-read authority | future control / store | one routing-digest-derived control GET, then exact rooted catalog versions only when required | Not implemented by PR1; only the control CAS publishes semantics and mutable auxiliary state stays non-authoritative | Future request-count, exact-version root, cold-ref, stale-host-index, and side-state non-publication gate |
+| Signed create and capabilities | future Cloud Core / control | deterministic CBOR, untagged COSE Sign1, Ed25519 verification ring | Not implemented by PR1; V5.4 freezes payload identity, UUIDv7, time, replay, audience, key-state, and rotation rules | Future cross-language vectors, malformed-CBOR, replay, skew/lifetime, stale-ring, rotation, and revocation gate |
+| No-production-data V2 hard cut | future cutover / selected provider | signed empty-prefix proof, exclusive IAM, conditional `cutover_control` Create | Not implemented by PR1; V2 accepts only a fresh empty prefix and never adopts V1 data or identity | Future all-version/delete-marker/multipart scan, IAM race, crash recovery, V1 rejection, and no-fallback gate |
 | Placement | config / server | serve/maintain include/exclude | Preserve prefix routing and explicit placement | `cargo test -p walgit-server --test routing_prefix --test maintain` |
 | Push broker | server | forwarding and trusted principal | Preserve broker fallback and opaque client credential lane | `just e2e`; config/code review |
 | Drain | server / maintainer | SIGTERM phases, `/readyz` | Preserve serving during phase 1 and refusal in phase 2 | `cargo test -p walgit-server --test drain` |
@@ -62,7 +68,7 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | HTTP/2 | server | h2c or TLS ALPN | Preserve direct standalone support | server/config code review; later runtime probe |
 | Standalone | CLI / server | `walgit-server --config`, one binary | Preserve no-edge operation and self-signed default shape | `walgit config check --config walgit.standalone.toml`; `just e2e` |
 | Memory store | `walgit-store` | `MemoryStore` | Preserve full object-store contract | `cargo test -p walgit-store --test contract -- memory_contract` |
-| GCS store | `walgit-store` | `GcsStore` | Preserve GCS behavior and native conditional compose | memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized |
+| GCS store | `walgit-store` | `GcsStore` | Preserve GCS behavior and native conditional compose; future selected-provider use requires bucket Object Versioning enabled, soft-delete retention zero, and fail-closed startup | memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized; future exact-provider permanent-delete gate |
 | S3 store | `walgit-store` | `S3Store` | Harden default credentials, exact lengths, retry mapping, atomic final conditions, bounds and cleanup | unit tests; protected CI against disposable local RustFS via `just test-s3`; PR2 exact-provider primitive gate |
 | S3 credentials | `walgit-store` | SDK chain or configured env names | Empty override names preserve the refreshable default chain and temporary credentials; complete custom access/secret and optional session token override it; incoherent partial overrides fail without printing values | `cargo test -p walgit-store --lib` |
 | S3 endpoint/region/addressing | config / store | endpoint, region, path/virtual style | Preserve exact configured values; make contract test parameters explicit | required `WALGIT_TEST_S3_*` environment plus `just test-s3-provider` |
@@ -87,8 +93,25 @@ calculated 10,000-part boundary, concurrent conditional Create and Update,
 conditional multipart completion, failed and abandoned multipart cleanup,
 Range/HEAD/ETag behavior, mandatory versioning, stable `ObjectVersionID`
 results, paginated version enumeration, exact-version HEAD/GET/delete, and
-delete-marker behavior. Never run these checks against a production data
-prefix.
+delete-marker behavior. Also prove a fully paginated zero count for current
+objects, noncurrent versions, delete markers, and incomplete multipart uploads,
+plus exclusive-IAM denial of a concurrent writer during conditional control
+Create. Run the primitive simulation only in an approved disposable prefix,
+never against a production data prefix.
+
+If GCS is selected, the exact-provider gate must read the bucket configuration
+and prove that Object Versioning is enabled and soft-delete retention is zero.
+Startup fails closed otherwise. An exact-version delete and capacity refund do
+not complete until exact-version HEAD and GET return typed not-found and a
+complete version enumeration omits that generation.
+
+The later V2 bootstrap gate runs only for the authorized fresh deployment
+prefix after Cloud Core has proved that no production repository data exists
+there. It binds the selected provider configuration, versioning, soft-delete,
+retention, four zero counts, exclusive IAM, job image, and signed proof. Any
+object, noncurrent version, delete marker, incomplete multipart upload, V1
+state, or unresolved IAM writer fails the hard cut. V2 has no legacy adoption
+migration.
 
 PR3 must separately prove production-scale object counts, throughput,
 retention, event replay and fanout, exact build pins, recovery, and the stated
