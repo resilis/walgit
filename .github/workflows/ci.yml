@@ -13,42 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
-    name: Format, web, tests, and e2e
+  static-web:
+    name: Format and web
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: read
-    env:
-      CARGO_INCREMENTAL: "0"
     steps:
-      - name: Verify Git version
-        shell: bash
-        run: |
-          set -euo pipefail
-          git --version
-          required_git=2.46
-          installed_git="$(git version | awk '{print $3}')"
-          if [ "$(printf '%s\n' "$required_git" "$installed_git" | sort -V | head -n 1)" != "$required_git" ]; then
-            echo "::error::Git ${required_git} or newer is required; found ${installed_git}"
-            exit 1
-          fi
-
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
 
-      - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
-          protoc --version
-          test -f /usr/include/google/protobuf/timestamp.proto
-
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt
           rustup default 1.97.1
           rustc --version | grep -F 'rustc 1.97.1'
 
@@ -73,8 +52,84 @@ jobs:
           pnpm --dir web install --frozen-lockfile
           pnpm --dir web run build
 
-      - name: Run protected repository gate
+      - name: Upload web assets for Rust compilation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: web-dist-${{ github.sha }}
+          path: web/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  rust-tests:
+    name: Rust workspace tests and e2e
+    needs: static-web
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Verify Git version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git --version
+          required_git=2.46
+          installed_git="$(git version | awk '{print $3}')"
+          if [ "$(printf '%s\n' "$required_git" "$installed_git" | sort -V | head -n 1)" != "$required_git" ]; then
+            echo "::error::Git ${required_git} or newer is required; found ${installed_git}"
+            exit 1
+          fi
+
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Download web assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: web-dist-${{ github.sha }}
+          path: web/dist
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+          protoc --version
+          test -f /usr/include/google/protobuf/timestamp.proto
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+          rustc --version | grep -F 'rustc 1.97.1'
+
+      - name: Run single-fingerprint Rust gate
         run: bash scripts/ci.sh
+
+  quality:
+    name: Format, web, tests, and e2e
+    needs:
+      - static-web
+      - rust-tests
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Require every quality gate
+        env:
+          STATIC_WEB_RESULT: ${{ needs.static-web.result }}
+          RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
+        run: |
+          set -euo pipefail
+          if [ "$STATIC_WEB_RESULT" != success ] || [ "$RUST_TESTS_RESULT" != success ]; then
+            echo "::error::Required quality gates did not all succeed"
+            exit 1
+          fi
 
   dependency-audit:
     name: Dependency security audit
