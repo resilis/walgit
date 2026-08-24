@@ -694,15 +694,40 @@ fn compose_copy_source(bucket: &str, source: &ComposeSource) -> String {
     )
 }
 
-fn is_exact_delete_marker_head_response(
+const DELETE_MARKER_PROOF_MAX_PAGES: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactDeleteMarkerHeadEvidence {
+    Confirmed,
+    RequiresListing,
+    Unrelated,
+}
+
+fn exact_delete_marker_head_evidence(
     status: u16,
     delete_marker: Option<&str>,
     response_version_id: Option<&str>,
     requested_version_id: &ObjectVersionId,
-) -> bool {
-    status == 405
-        && delete_marker == Some("true")
-        && response_version_id == Some(requested_version_id.as_str())
+) -> ExactDeleteMarkerHeadEvidence {
+    if status != 405 {
+        return ExactDeleteMarkerHeadEvidence::Unrelated;
+    }
+    if delete_marker == Some("true") && response_version_id == Some(requested_version_id.as_str()) {
+        ExactDeleteMarkerHeadEvidence::Confirmed
+    } else {
+        ExactDeleteMarkerHeadEvidence::RequiresListing
+    }
+}
+
+fn exact_listed_version_kind(
+    versions: &[ObjectVersion],
+    key: &str,
+    version_id: &ObjectVersionId,
+) -> Option<ObjectVersionKind> {
+    versions
+        .iter()
+        .find(|version| version.key == key && version.object_version_id == *version_id)
+        .map(|version| version.kind)
 }
 
 #[async_trait::async_trait]
@@ -869,16 +894,31 @@ impl ObjectStore for S3Store {
                 }))
             }
             Err(error) => {
-                let is_delete_marker = error.raw_response().is_some_and(|response| {
-                    is_exact_delete_marker_head_response(
-                        response.status().as_u16(),
-                        response.headers().get("x-amz-delete-marker"),
-                        response.headers().get("x-amz-version-id"),
-                        version_id,
-                    )
-                });
-                if is_delete_marker {
-                    return Ok(None);
+                let evidence = error
+                    .raw_response()
+                    .map(|response| {
+                        exact_delete_marker_head_evidence(
+                            response.status().as_u16(),
+                            response.headers().get("x-amz-delete-marker"),
+                            response.headers().get("x-amz-version-id"),
+                            version_id,
+                        )
+                    })
+                    .unwrap_or(ExactDeleteMarkerHeadEvidence::Unrelated);
+                match evidence {
+                    ExactDeleteMarkerHeadEvidence::Confirmed => return Ok(None),
+                    ExactDeleteMarkerHeadEvidence::RequiresListing => {
+                        let mapped = classify_sdk_error("head exact version", key, error);
+                        return if self
+                            .prove_exact_delete_marker_by_listing(key, version_id)
+                            .await?
+                        {
+                            Ok(None)
+                        } else {
+                            Err(mapped)
+                        };
+                    }
+                    ExactDeleteMarkerHeadEvidence::Unrelated => {}
                 }
                 match classify_sdk_error("head exact version", key, error) {
                     StoreError::NotFound { .. } => Ok(None),
@@ -1364,6 +1404,36 @@ struct ListState {
 // ---- multipart upload --------------------------------------------------
 
 impl S3Store {
+    async fn prove_exact_delete_marker_by_listing(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<bool> {
+        let mut cursor = None;
+        for _ in 0..DELETE_MARKER_PROOF_MAX_PAGES {
+            let page = self
+                .list_versions(key, cursor.as_ref(), MAX_VERSION_PAGE_SIZE)
+                .await?;
+            if let Some(kind) = exact_listed_version_kind(&page.versions, key, version_id) {
+                return Ok(kind == ObjectVersionKind::DeleteMarker);
+            }
+            match page.next {
+                None => return Ok(false),
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "progressing exact delete-marker version enumeration",
+                    });
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(StoreError::UnsupportedCapability {
+            backend: "s3",
+            capability: "bounded exact delete-marker version enumeration",
+        })
+    }
+
     async fn multipart_put(
         &self,
         key: &str,
@@ -1532,6 +1602,9 @@ impl S3Store {
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
 //    stripped consistently in our CasToken.
 // 9. force_path_style: required for rustfs local dev.
+// 10. Exact HEAD of a delete marker returns a bare 405 without the AWS
+//     delete-marker/version headers. The failure path proves the exact marker
+//     through bounded ListObjectVersions pagination instead.
 
 #[cfg(test)]
 mod tests {
@@ -1652,25 +1725,96 @@ mod tests {
     }
 
     #[test]
-    fn exact_head_recognizes_only_the_requested_delete_marker() {
+    fn exact_head_uses_only_405_for_delete_marker_evidence() {
         let requested = ObjectVersionId::new("marker-version");
-        assert!(is_exact_delete_marker_head_response(
-            405,
-            Some("true"),
-            Some("marker-version"),
-            &requested
-        ));
-        for (status, marker, version) in [
-            (404, Some("true"), Some("marker-version")),
-            (405, None, Some("marker-version")),
-            (405, Some("false"), Some("marker-version")),
-            (405, Some("true"), Some("other-version")),
-            (405, Some("true"), None),
+        assert_eq!(
+            exact_delete_marker_head_evidence(
+                405,
+                Some("true"),
+                Some("marker-version"),
+                &requested
+            ),
+            ExactDeleteMarkerHeadEvidence::Confirmed
+        );
+        for (marker, version) in [
+            (None, Some("marker-version")),
+            (Some("false"), Some("marker-version")),
+            (Some("true"), Some("other-version")),
+            (Some("true"), None),
         ] {
-            assert!(!is_exact_delete_marker_head_response(
-                status, marker, version, &requested
-            ));
+            assert_eq!(
+                exact_delete_marker_head_evidence(405, marker, version, &requested),
+                ExactDeleteMarkerHeadEvidence::RequiresListing
+            );
         }
+        assert_eq!(
+            exact_delete_marker_head_evidence(
+                404,
+                Some("true"),
+                Some("marker-version"),
+                &requested
+            ),
+            ExactDeleteMarkerHeadEvidence::Unrelated
+        );
+        assert_eq!(
+            exact_delete_marker_head_evidence(500, None, None, &requested),
+            ExactDeleteMarkerHeadEvidence::Unrelated
+        );
+    }
+
+    #[test]
+    fn exact_listing_proof_matches_both_key_and_version_kind() {
+        let requested = ObjectVersionId::new("requested");
+        let versions = vec![
+            ObjectVersion {
+                key: "same-prefix-sibling".into(),
+                object_version_id: requested.clone(),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: false,
+            },
+            ObjectVersion {
+                key: "key".into(),
+                object_version_id: ObjectVersionId::new("other"),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: false,
+            },
+        ];
+        assert_eq!(
+            exact_listed_version_kind(&versions, "key", &requested),
+            None
+        );
+
+        let mut exact_object = versions.clone();
+        exact_object.push(ObjectVersion {
+            key: "key".into(),
+            object_version_id: requested.clone(),
+            cas_token: Some(CasToken::new("etag")),
+            size: 1,
+            kind: ObjectVersionKind::Object,
+            is_latest: false,
+        });
+        assert_eq!(
+            exact_listed_version_kind(&exact_object, "key", &requested),
+            Some(ObjectVersionKind::Object)
+        );
+
+        let mut exact_marker = versions;
+        exact_marker.push(ObjectVersion {
+            key: "key".into(),
+            object_version_id: requested.clone(),
+            cas_token: None,
+            size: 0,
+            kind: ObjectVersionKind::DeleteMarker,
+            is_latest: true,
+        });
+        assert_eq!(
+            exact_listed_version_kind(&exact_marker, "key", &requested),
+            Some(ObjectVersionKind::DeleteMarker)
+        );
     }
 
     #[test]
