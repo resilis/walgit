@@ -6,11 +6,14 @@ use prost::Message;
 use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor};
 
 use super::{
-    CredentialControl, MAX_CREDENTIAL_CONTROL_BYTES, MAX_MUTATION_RECEIPT_BYTES,
-    MAX_MUTATION_RESULT_BYTES, MAX_RECEIPT_CATALOG_BYTES, MAX_REPO_CONTROL_BYTES, MutationReceipt,
-    MutationResult, ReceiptCatalog, RepoControl, keys::DeploymentPrefix,
-    validate_credential_control, validate_mutation_receipt, validate_mutation_result,
-    validate_receipt_catalog, validate_repo_control,
+    CapacityControl, CapacityShard, CredentialControl, MAX_CAPACITY_CONTROL_BYTES,
+    MAX_CAPACITY_SHARD_BYTES, MAX_CREDENTIAL_CONTROL_BYTES, MAX_MUTATION_RECEIPT_BYTES,
+    MAX_MUTATION_RESULT_BYTES, MAX_RECEIPT_CATALOG_BYTES, MAX_REPO_CONTROL_BYTES,
+    MAX_TENANT_CAPACITY_CATALOG_BYTES, MutationReceipt, MutationResult, ReceiptCatalog,
+    RepoControl, TenantCapacityCatalogPage, keys::DeploymentPrefix, validate_capacity_control,
+    validate_capacity_shard, validate_credential_control, validate_mutation_receipt,
+    validate_mutation_result, validate_receipt_catalog, validate_repo_control,
+    validate_tenant_capacity_catalog_page,
 };
 
 const MAX_NESTING_DEPTH: usize = 16;
@@ -118,6 +121,91 @@ pub fn decode_receipt_catalog(bytes: &[u8]) -> Result<ReceiptCatalog, ControlCod
 pub fn preflight_receipt_catalog(bytes: &[u8]) -> Result<(), ControlCodecError> {
     let schema = preflight_schema();
     preflight_message(schema, schema.receipt_catalog_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_tenant_capacity_catalog_page(
+    page: &TenantCapacityCatalogPage,
+) -> Result<Vec<u8>, ControlCodecError> {
+    validate_tenant_capacity_catalog_page(page)?;
+    encode_bounded(
+        page,
+        "walgit.v2.TenantCapacityCatalogPage",
+        MAX_TENANT_CAPACITY_CATALOG_BYTES,
+        preflight_tenant_capacity_catalog_page,
+    )
+}
+
+pub fn decode_tenant_capacity_catalog_page(
+    bytes: &[u8],
+) -> Result<TenantCapacityCatalogPage, ControlCodecError> {
+    preflight_tenant_capacity_catalog_page(bytes)?;
+    let value = TenantCapacityCatalogPage::decode(bytes)?;
+    validate_tenant_capacity_catalog_page(&value)?;
+    require_canonical(&value, bytes)?;
+    Ok(value)
+}
+
+pub fn preflight_tenant_capacity_catalog_page(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.tenant_capacity_catalog_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_capacity_shard(
+    shard: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<Vec<u8>, ControlCodecError> {
+    validate_capacity_shard(shard, prefix)?;
+    encode_bounded(
+        shard,
+        "walgit.v2.CapacityShard",
+        MAX_CAPACITY_SHARD_BYTES,
+        preflight_capacity_shard,
+    )
+}
+
+pub fn decode_capacity_shard(
+    bytes: &[u8],
+    prefix: &DeploymentPrefix,
+) -> Result<CapacityShard, ControlCodecError> {
+    preflight_capacity_shard(bytes)?;
+    let value = CapacityShard::decode(bytes)?;
+    validate_capacity_shard(&value, prefix)?;
+    require_canonical(&value, bytes)?;
+    Ok(value)
+}
+
+pub fn preflight_capacity_shard(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.capacity_shard_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_capacity_control(
+    control: &CapacityControl,
+    prefix: &DeploymentPrefix,
+) -> Result<Vec<u8>, ControlCodecError> {
+    validate_capacity_control(control, prefix)?;
+    encode_bounded(
+        control,
+        "walgit.v2.CapacityControl",
+        MAX_CAPACITY_CONTROL_BYTES,
+        preflight_capacity_control,
+    )
+}
+
+pub fn decode_capacity_control(
+    bytes: &[u8],
+    prefix: &DeploymentPrefix,
+) -> Result<CapacityControl, ControlCodecError> {
+    preflight_capacity_control(bytes)?;
+    let value = CapacityControl::decode(bytes)?;
+    validate_capacity_control(&value, prefix)?;
+    require_canonical(&value, bytes)?;
+    Ok(value)
+}
+
+pub fn preflight_capacity_control(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.capacity_control_root, bytes, 1).map(|_| ())
 }
 
 fn encode_bounded<M: Message>(
@@ -366,6 +454,9 @@ struct PreflightSchema {
     mutation_receipt_root: usize,
     mutation_result_root: usize,
     receipt_catalog_root: usize,
+    tenant_capacity_catalog_root: usize,
+    capacity_shard_root: usize,
+    capacity_control_root: usize,
     messages: Vec<PreflightMessage>,
 }
 
@@ -427,6 +518,19 @@ impl PreflightSchema {
         })?;
         let receipt_catalog_root = *indexes.get("walgit.v2.ReceiptCatalog").ok_or_else(|| {
             ControlCodecError::Descriptor("ReceiptCatalog descriptor is missing".into())
+        })?;
+        let tenant_capacity_catalog_root = *indexes
+            .get("walgit.v2.TenantCapacityCatalogPage")
+            .ok_or_else(|| {
+                ControlCodecError::Descriptor(
+                    "TenantCapacityCatalogPage descriptor is missing".into(),
+                )
+            })?;
+        let capacity_shard_root = *indexes.get("walgit.v2.CapacityShard").ok_or_else(|| {
+            ControlCodecError::Descriptor("CapacityShard descriptor is missing".into())
+        })?;
+        let capacity_control_root = *indexes.get("walgit.v2.CapacityControl").ok_or_else(|| {
+            ControlCodecError::Descriptor("CapacityControl descriptor is missing".into())
         })?;
         let mut messages = Vec::with_capacity(descriptors.len());
         for descriptor in &descriptors {
@@ -519,6 +623,9 @@ impl PreflightSchema {
             mutation_receipt_root,
             mutation_result_root,
             receipt_catalog_root,
+            tenant_capacity_catalog_root,
+            capacity_shard_root,
+            capacity_control_root,
             messages,
         })
     }

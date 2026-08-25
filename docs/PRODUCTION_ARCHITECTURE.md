@@ -267,7 +267,7 @@ authority.
 | Message or object | Maximum encoded bytes |
 |---|---:|
 | `repo_control` or `cutover_control` | 1,048,576 |
-| `capacity_control`, capacity shard, or checkpoint | 1,048,576 |
+| `capacity_control`, its redistribution state payload, capacity shard, or checkpoint | 1,048,576 |
 | `credential_control`, `bucket_admin_control`, or `recovery_control` | 65,536 |
 | Catalog node | 524,288 |
 | Event archive watermark | 524,288 |
@@ -317,9 +317,11 @@ Repeated fields have these maxima: 4,096 inline pack roots; 256 inline WAL-tail
 entries; 256 direct grants; 64 immutable dependencies per receipt; 256 ref
 changes or superseded object-version IDs per tail entry; 4,096 aggregate inline
 ref changes across all WAL-tail entries in one control object; exactly 256
-shard-budget rows per `capacity_control`; exactly 256 shard slices per
+shard-budget rows per `capacity_control`; exactly 256 target shard budgets and,
+in `APPLYING`, exactly 256 drained-shard baselines; exactly 256 shard slices per
 tenant-capacity row; at most 262 bootstrap creation-plan rows per cutover
-generation; 2,048 children per catalog node; 4,096 items per catalog leaf; and 4,096 reservations
+generation; 2,048 children per catalog node; 4,096 items per catalog leaf;
+4,096 reservations per capacity shard; and 4,096 current tenant-account rows
 per capacity shard. Any other repeated field has at most 64 items. The
 credential binding has exactly one current and at most one next and one previous
 root, at most 64 revoked key IDs, and no other ring slot. A webhook has exactly
@@ -353,10 +355,20 @@ batch. Reaching a maximum applies bounded backpressure. It never silently drops
 or replaces an item. The dormant flat-catalog slice has the lower explicit
 limit of 4,096 retained rows and does not implement multilevel compaction.
 
-The global tenant-capacity catalog has at most 65,536 allocation rows. Each row
-binds one opaque tenant ID, a finite total tenant budget, and exactly 256
-nonnegative per-shard slices. The slices sum to no more than that tenant budget.
-For each shard, the sum of all tenant slices is no more than the shard budget.
+The dormant global tenant-capacity catalog is one immutable flat page with at
+most 4,096 binary-sorted unique allocation rows and at most 524,288 exact
+encoded bytes. Either bound can apply first and causes explicit backpressure.
+Each row binds one opaque tenant ID, a finite total tenant budget, and exactly
+256 positive per-shard slices whose checked sum equals that budget. Before
+activation, a later explicit schema and controller phase must introduce the
+deferred multilevel topology and its 65,536-row target. For each shard column,
+the checked sum of all tenants' slices must be no greater than that shard's
+budget, and the checked aggregate must be no greater than the plan's global
+allocatable bytes. The exported cross-object validator exact-binds loaded page
+bytes to the control root and proves these sums for the current plan and, while
+PREPARING, the target plan. A page reference alone cannot prove the referenced
+body, so the future controller must run that validator immediately after exact
+strict loads and before publishing a plan or admitting a reservation.
 
 ### Normal-read inline and catalog split
 
@@ -1168,46 +1180,152 @@ allocatable capacity excludes computed system and emergency reserves.
 Capacity uses the fixed repository-hashed shards and the CAS-owned
 `capacity_control` allocation authority. Every `STABLE(e)` control version
 contains one global allocatable byte budget, one exact tenant-allocation catalog
-root, and exactly 256 immutable per-shard byte budgets. The shard budgets sum to
+root, and exactly 256 binary-sorted shard budgets with exact epoch-start shard
+key, `ObjectVersionID`, digest, and size proofs. The checked shard-budget sum is
 no more than global allocatable capacity. A capacity shard binds the allocation
-epoch and its exact budget; it cannot change that budget. Each tenant catalog
-row divides its finite tenant allocation into exactly 256 shard slices. A shard
-enforces both its total budget and the tenant slice for every reservation, so
-simultaneous reservations in different shards cannot oversubscribe either
-limit.
+epoch and its immutable budget. It cannot change that budget within the epoch.
+The first byte of `SHA-256(repository_uuid)` selects the shard.
 
-Redistribution is `STABLE(e) -> PREPARING(e+1) -> STABLE(e+1)`. The first CAS
-binds the proposed 256 immutable budgets and exact tenant-catalog root and
-installs a global writer and reservation-admission fence. Under that fence, the
-controller paginates all 256 shards to completion and requires zero
-`RESERVED` or `COMMITTING` reservations. It also requires every proposed shard
-and tenant slice to cover already `CHARGED` usage. Otherwise redistribution is
-rejected. The controller then CASes every shard to epoch `e+1` with its new
-immutable budget and finally CASes `capacity_control` to `STABLE(e+1)` with the
-same plan. Admission requires the exact stable control and matching shard epoch.
-A rejected plan can return to `STABLE(e)` only after proving that no shard
-changed. A crash or ambiguous CAS stays fenced and resumes or reverts every
-changed shard from exact version proofs; it never admits across mixed epochs.
+Each shard has a separate binary-sorted current tenant-account table. Every
+tenant with retained non-`ABORTED` usage has exactly one account, no account is
+extraneous, and its positive current slice is no greater than the immutable
+shard budget. Checked `RESERVED + COMMITTING + CHARGED` usage must fit both the
+current account and shard budget. Historical reservation rows retain their
+original allocation epoch and tenant slice without rewriting. Therefore rows
+from older epochs remain exact receipt proofs after redistribution, and mixed
+historical slices are valid when their aggregate fits the current account.
+`ABORTED` does not charge and an `ABORTED`-only tenant has no account.
+The future controller uses two distinct exact shard-object gates. The retained-
+budget gate loads the body rooted by the matching
+`CapacityShardBudget.shard_object` and binds its shard, prior allocation epoch,
+and budget. It works for `STABLE` and for the retained prior plan in both
+`PREPARING/DRAINING` and `PREPARING/APPLYING`. The mutable-current gate instead
+binds the loaded body to caller-observed provider key, `ObjectVersionID`,
+digest, and size, then compares shard, retained current epoch, and budget. It
+does not compare that mutable metadata with the historical STABLE epoch-start
+proof. After exact page and current-shard loads, the current-shard-view
+validator composes the mutable gate, requires every account to equal that
+tenant's exact page slice for the selected shard, and requires every current-
+epoch non-`ABORTED` reservation to repeat the same slice. Historical terminal
+rows keep their earlier proof slice. The admission-specific wrapper
+additionally requires `STABLE`. The composed STABLE successor gate binds that
+entire predecessor view, a legal transition at caller-observed `now`, and the
+candidate shard against the same page, epoch, and budget. The composed
+`PREPARING/DRAINING` gate permits only `RESERVED -> ABORTED(expired)`,
+`COMMITTING -> CHARGED`, or `COMMITTING -> ABORTED(conflict)`. It rejects new
+rows and `RESERVED -> COMMITTING`. Lower-level object, account, and successor
+validators are insufficient for publication on their own.
+
+Redistribution uses the closed control states and phases
+`STABLE(e) -> PREPARING/DRAINING(e+1) -> PREPARING/APPLYING(e+1) ->
+STABLE(e+1)`. The first control CAS retains the complete prior stable plan,
+binds the proposed catalog, global budget, and 256 shard budgets, and installs
+the exact global writer plus UUIDv7 admission fence. Only terminal reservation
+transitions are allowed while draining. The future controller must exact-load
+the current and proposed pages and run the cross-object validator so the sum of
+all tenant slices in each shard column fits that plan's shard budget.
+References alone cannot prove page contents.
+
+After it proves that all 256 exact current shards contain zero `RESERVED` or
+`COMMITTING` rows, the second control CAS enters `APPLYING` and binds exactly
+256 drained baseline proofs. A drained baseline retains the prior allocation
+epoch, budget, shard identity, and key, but its provider version, digest, and
+size can be newer than the historical `STABLE(e)` epoch-start proof because
+terminal transitions mutated the shard. The exact-baseline validator binds the
+loaded body to that proof, rechecks prior epoch and budget, and rejects any
+remaining nonterminal row. Each successor is deterministic from
+that exact drained body and the target plan: it preserves every terminal
+reservation byte-for-byte and replaces current tenant accounts with the exact
+target-page slices after proving they cover retained usage. Recovery accepts a
+shard only at its exact baseline or at that deterministic successor. A successful advance
+finishes with `STABLE(e+1)` binding all 256 exact new epoch-start successor
+proofs. A successful reversion first restores and exactly verifies every
+changed shard, then publishes `STABLE(e)` with the exact restored proofs; it
+does not reuse historical epoch-start `ObjectVersionID` values. A crash or
+ambiguous CAS stays fenced and never admits across mixed epochs.
 
 Shards are idempotent, bounded, and reconciled. They are not repository
-authority and cannot publish roots or authorize work. One writer means a
-repository has at most one active reservation.
+authority and cannot publish roots or authorize work. There is at most one
+`RESERVED` or `COMMITTING` row per repository. Commit-bearing rows also reject
+reuse of one mutation ID within the same repository, while another repository
+can use the same UUID in its independent namespace.
 
 A reservation moves through these states:
 
-1. `RESERVED` is provisional and can expire.
-2. `COMMITTING` is non-expiring and binds the expected control `CasToken` and
-   `ObjectVersionID`, writer epoch, mutation ID, kind, and exact byte count.
+1. `RESERVED` is provisional. It records explicit creation and expiry seconds,
+   with `created < expires` and a checked maximum lifetime of 900 seconds. The
+   shard successor validator receives caller-observed `now` and accepts a new
+   row only when `created <= now < expires`; it rejects future-dated creation.
+   No validator reads a clock.
+2. `COMMITTING` is non-expiring and binds writer epoch, mutation ID, kind, and
+   a closed predecessor. `CREATE` requires explicit `NONE`; every other
+   non-settlement kind requires the prior control `CasToken` and
+   `ObjectVersionID`.
 3. The writer publishes immutable payloads and then CASes `repo_control`.
 4. `CHARGED` records the successful control publication exactly once.
-5. `ABORTED` releases capacity only when durable historical proof shows that
-   another mutation won and the expected CAS can no longer succeed.
+5. `ABORTED` releases capacity through one explicit proof arm. Expiry repeats
+   the original creation/expiry window and records an observed `now >= expiry`.
+   Conflict repeats the exact commit binding and records the durable conflicting
+   landed control and mutation that makes the expected CAS impossible.
+
+The public shard successor validator accepts a byte-exact retry without a new
+revision. Every real successor advances `control_revision` by exactly one and
+changes exactly one reservation through `RESERVED -> COMMITTING`,
+`RESERVED -> ABORTED(expired)`, `COMMITTING -> CHARGED`, or
+`COMMITTING -> ABORTED(conflict)`. It preserves the shard, allocation epoch,
+budget, immutable reservation fields, all untouched rows, and all unaffected
+accounts. `RESERVED -> COMMITTING` requires
+`created_at <= observed_now < expires_at`. Expiry repeats the exact reserved
+window and binds the supplied observed `now`. Terminal rows and same-state rows
+cannot change.
+
+CHARGED and conflicting-commit ABORTED require public composition gates. Both
+exact-bind the prior COMMITTING shard body to caller-observed provider metadata,
+locate the exact reservation row, and bind every prepared receipt
+`CapacityObligation` field to that row and shard object. CHARGED additionally
+strict-loads the landed `RepoControl` and its exact flat receipt catalog. The
+catalog gate validates its content-addressed key, canonical body digest and
+size, flat-root counts, identity, one-unresolved maximum, and the exact
+representation of `last_internal_mutation_id`. The CHARGED mutation must be
+the rooted receipt row. Writer takeover binds landed epoch `E+1`; other
+CHARGED mutations bind `E`.
+
+A conflict gate accepts the prepared expected receipt separately because the
+failed candidate control never rooted it. It proves that expected mutation is
+absent as both a receipt and settlement ID in the exact current catalog, while
+the conflicting current ID is represented by that catalog. The durable
+`CapacityConflictClass` is closed and corroborated by the exact current
+control. `CREATE_CONTROL_EXISTS` requires Create with explicit `NONE` and
+accepts any control at the same derived by-path key, including an exact
+same-identity occupancy or a different-identity routing-key collision.
+`SAME_WRITER_VERSION_ADVANCED` requires non-Create with an exact prior,
+different landed `ObjectVersionID`, the same identity, and loaded writer epoch
+`E`. `WRITER_EPOCH_ADVANCED` requires the same facts at an exact typed-current
+writer epoch strictly greater than `E`. It accepts `E+1` and later epochs
+because successive takeovers can land and settle while this external
+COMMITTING row remains unresolved. Every arm binds canonical control
+key/body/digest/size and its current last mutation. The conflict proof must
+originate from a typed current provider GET at the abort decision. Its stored
+object version supports later exact replay, but protobuf validation alone
+cannot prove provider currentness.
 
 A lost result after the control CAS is success. Reconciliation uses the
 control receipt and exact object version to finish `CHARGED`. It resumes a
-still-possible `COMMITTING` reservation and never aborts it because of a clock
-or timeout. Every transition checks the exact capacity-control epoch, shard
-budget, and tenant slice.
+still-possible `COMMITTING` reservation and never aborts that non-expiring state
+because of a clock or timeout. `RepoControl.CapacityBinding` is the
+repository's last exact capacity witness, not a claim about the current shared
+shard. Admission independently loads the current hashed shard and compares its
+epoch, key, budget, and tenant slice. Receipt `CapacityObligation` binds the
+exact `COMMITTING` shard `ObjectVersionID`; settlement advances the repository
+binding to the exact `CHARGED` shard version.
+
+This slice freezes only the dormant protobuf messages, strict canonical codecs,
+semantic validation, keys, and tests. It has no capacity controller, store CAS
+adapter, provider operation, server/CLI/config route, V1 adapter, or runtime
+reader/writer. The boundary is greenfield: no production V2 capacity objects
+exist, no migration or mixed-version behavior is supported, and activation
+requires a later hard cut with all readers and writers on the same contract.
+Recovery for this dormant slice is code revert only.
 
 Reclamation is typed, bounded by objects and bytes per pass, and resumable from
 a control-rooted cursor. A pass exact-version-deletes at most 1,000 objects and

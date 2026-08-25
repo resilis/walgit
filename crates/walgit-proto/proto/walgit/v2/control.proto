@@ -102,6 +102,37 @@ enum ReceiptState {
   RECEIPT_STATE_SETTLED = 2;
 }
 
+// Persisted numeric values are frozen. PREPARING always carries one closed
+// redistribution phase; STABLE never does.
+enum CapacityControlState {
+  CAPACITY_CONTROL_STATE_UNSPECIFIED = 0;
+  CAPACITY_CONTROL_STATE_STABLE = 1;
+  CAPACITY_CONTROL_STATE_PREPARING = 2;
+}
+
+enum RedistributionPhase {
+  REDISTRIBUTION_PHASE_UNSPECIFIED = 0;
+  REDISTRIBUTION_PHASE_DRAINING = 1;
+  REDISTRIBUTION_PHASE_APPLYING = 2;
+}
+
+enum CapacityReservationState {
+  CAPACITY_RESERVATION_STATE_UNSPECIFIED = 0;
+  CAPACITY_RESERVATION_STATE_RESERVED = 1;
+  CAPACITY_RESERVATION_STATE_COMMITTING = 2;
+  CAPACITY_RESERVATION_STATE_CHARGED = 3;
+  CAPACITY_RESERVATION_STATE_ABORTED = 4;
+}
+
+// Closed evidence classification for a commit whose expected repository CAS
+// cannot land. The exact-loaded RepoControl must corroborate the selected cell.
+enum CapacityConflictClass {
+  CAPACITY_CONFLICT_CLASS_UNSPECIFIED = 0;
+  CAPACITY_CONFLICT_CLASS_CREATE_CONTROL_EXISTS = 1;
+  CAPACITY_CONFLICT_CLASS_SAME_WRITER_VERSION_ADVANCED = 2;
+  CAPACITY_CONFLICT_CLASS_WRITER_EPOCH_ADVANCED = 3;
+}
+
 message RepositoryIdentity {
   option (max_encoded_bytes) = 2048;
 
@@ -152,6 +183,9 @@ message QuotaState {
   uint64 charged_lfs_bytes = 3;
 }
 
+// The repository's last exact capacity witness. Admission must independently
+// load the current repository-hashed shard and compare epoch, key, budget, and
+// tenant slice. Settlement advances this binding to the exact CHARGED version.
 message CapacityBinding {
   option (max_encoded_bytes) = 4096;
 
@@ -263,6 +297,8 @@ message NoCapacityObligation {
   option (max_encoded_bytes) = 1;
 }
 
+// The exact COMMITTING shard version that must become terminal before receipt
+// settlement. The ObjectVersionID is the provider version of that shard body.
 message CapacityObligation {
   option (max_encoded_bytes) = 8192;
 
@@ -375,6 +411,204 @@ message ReceiptCatalog {
   uint32 schema_version = 1;
   RepositoryIdentity identity = 2;
   repeated ReceiptCatalogRow rows = 3 [(min_items) = 0, (max_items) = 4096];
+}
+
+// Exact provider metadata for a global capacity object. Repository-scoped
+// TargetObjectRef is deliberately not reused for global capacity authority.
+message CapacityObjectRef {
+  option (max_encoded_bytes) = 4096;
+
+  bytes key = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 4;
+}
+
+// One STABLE shard budget and its exact epoch-start shard proof.
+message CapacityShardBudget {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 budget_bytes = 2;
+  CapacityObjectRef shard_object = 3;
+}
+
+// A target budget has no provider proof until its deterministic successor is
+// written and the final STABLE control roots that exact version.
+message CapacityShardBudgetProposal {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 budget_bytes = 2;
+}
+
+message TenantShardSlice {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 byte_count = 2;
+}
+
+message TenantCapacityAllocation {
+  option (max_encoded_bytes) = 16384;
+
+  bytes tenant_id = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 total_bytes = 2;
+  repeated TenantShardSlice slices = 3 [(min_items) = 256, (max_items) = 256];
+}
+
+// This dormant slice is one immutable flat page. A later explicit schema and
+// controller phase must introduce the deferred multilevel topology.
+message TenantCapacityCatalogPage {
+  option (max_encoded_bytes) = 524288;
+
+  uint32 schema_version = 1;
+  repeated TenantCapacityAllocation allocations = 2 [(min_items) = 0, (max_items) = 4096];
+}
+
+message ReservedCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 created_at_unix_seconds = 1;
+  uint64 expires_at_unix_seconds = 2;
+}
+
+message CapacityCommitBinding {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 writer_epoch = 1;
+  bytes mutation_id = 2 [(min_bytes) = 16, (max_bytes) = 16];
+  MutationKind kind = 3;
+  oneof predecessor {
+    NoPriorControl no_prior_control = 4;
+    PriorControlBinding prior_control = 5;
+  }
+}
+
+message CommittingCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  CapacityCommitBinding commit = 1;
+}
+
+message ChargedCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  CapacityCommitBinding commit = 1;
+  LandedControlRef landed_control = 2;
+}
+
+message ExpiredCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 created_at_unix_seconds = 1;
+  uint64 expires_at_unix_seconds = 2;
+  uint64 observed_now_unix_seconds = 3;
+}
+
+message ConflictingCapacityCommit {
+  option (max_encoded_bytes) = 4096;
+
+  CapacityCommitBinding commit = 1;
+  LandedControlRef conflicting_control = 2;
+  bytes conflicting_mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  CapacityConflictClass conflict_class = 4;
+}
+
+message AbortedCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  oneof proof {
+    ExpiredCapacityReservation expired = 1;
+    ConflictingCapacityCommit conflicting_commit = 2;
+  }
+}
+
+// The state enum and oneof must select the same closed state cell.
+message CapacityReservation {
+  option (max_encoded_bytes) = 16384;
+
+  bytes reservation_id = 1 [(min_bytes) = 16, (max_bytes) = 16];
+  RepositoryIdentity identity = 2;
+  bytes tenant_id = 3 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 allocation_epoch = 4;
+  uint64 byte_count = 5;
+  uint64 tenant_slice_bytes = 6;
+  CapacityReservationState state = 7;
+  oneof state_payload {
+    ReservedCapacityReservation reserved = 8;
+    CommittingCapacityReservation committing = 9;
+    ChargedCapacityReservation charged = 10;
+    AbortedCapacityReservation aborted = 11;
+  }
+}
+
+// Current-epoch accounting is separate from immutable historical reservation
+// proofs so redistribution never rewrites a receipt-bound epoch or slice.
+message CapacityTenantAccount {
+  option (max_encoded_bytes) = 4096;
+
+  bytes tenant_id = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 current_slice_bytes = 2;
+}
+
+message CapacityShard {
+  option (max_encoded_bytes) = 1048576;
+
+  uint32 schema_version = 1;
+  uint64 control_revision = 2;
+  uint32 shard = 3;
+  uint64 allocation_epoch = 4;
+  uint64 budget_bytes = 5;
+  repeated CapacityTenantAccount tenant_accounts = 6 [(min_items) = 0, (max_items) = 4096];
+  repeated CapacityReservation reservations = 7 [(min_items) = 0, (max_items) = 4096];
+}
+
+// APPLYING captures the exact current drained shard version. Terminal
+// transitions can make its provider metadata newer than the historical
+// STABLE epoch-start proof, while epoch and immutable budget stay unchanged.
+message CapacityShardBaseline {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 allocation_epoch = 2;
+  uint64 budget_bytes = 3;
+  CapacityObjectRef shard_object = 4;
+}
+
+message StableCapacityState {
+  option (max_encoded_bytes) = 1;
+}
+
+message CapacityRedistribution {
+  option (max_encoded_bytes) = 1048576;
+
+  RedistributionPhase phase = 1;
+  uint64 target_epoch = 2;
+  uint64 target_global_allocatable_bytes = 3;
+  CapacityObjectRef target_tenant_catalog = 4;
+  repeated CapacityShardBudgetProposal target_shard_budgets = 5 [(min_items) = 256, (max_items) = 256];
+  bytes admission_fence_id = 6 [(min_bytes) = 16, (max_bytes) = 16];
+  repeated CapacityShardBaseline baselines = 7 [(min_items) = 0, (max_items) = 256];
+}
+
+// Dormant global allocation authority. During PREPARING, fields 5 through 8
+// retain the exact prior STABLE plan while redistribution binds the target.
+message CapacityControl {
+  option (max_encoded_bytes) = 1048576;
+
+  uint32 schema_version = 1;
+  uint64 control_revision = 2;
+  CapacityControlState state = 3;
+  WriterFence writer = 4;
+  uint64 allocation_epoch = 5;
+  uint64 global_allocatable_bytes = 6;
+  CapacityObjectRef tenant_catalog = 7;
+  repeated CapacityShardBudget shard_budgets = 8 [(min_items) = 256, (max_items) = 256];
+  oneof state_payload {
+    StableCapacityState stable = 9;
+    CapacityRedistribution redistribution = 10;
+  }
 }
 
 // The one future repository semantic authority. No V1 runtime path reads or

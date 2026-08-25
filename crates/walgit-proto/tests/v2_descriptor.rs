@@ -357,6 +357,323 @@ fn mutation_receipt_schema_has_the_frozen_numeric_contract() {
     );
 }
 
+#[test]
+fn capacity_schema_has_the_frozen_numeric_tags_types_and_bounds() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    assert_enum(
+        &pool,
+        "CapacityControlState",
+        &[
+            ("CAPACITY_CONTROL_STATE_UNSPECIFIED", 0),
+            ("CAPACITY_CONTROL_STATE_STABLE", 1),
+            ("CAPACITY_CONTROL_STATE_PREPARING", 2),
+        ],
+    );
+    assert_enum(
+        &pool,
+        "RedistributionPhase",
+        &[
+            ("REDISTRIBUTION_PHASE_UNSPECIFIED", 0),
+            ("REDISTRIBUTION_PHASE_DRAINING", 1),
+            ("REDISTRIBUTION_PHASE_APPLYING", 2),
+        ],
+    );
+    assert_enum(
+        &pool,
+        "CapacityReservationState",
+        &[
+            ("CAPACITY_RESERVATION_STATE_UNSPECIFIED", 0),
+            ("CAPACITY_RESERVATION_STATE_RESERVED", 1),
+            ("CAPACITY_RESERVATION_STATE_COMMITTING", 2),
+            ("CAPACITY_RESERVATION_STATE_CHARGED", 3),
+            ("CAPACITY_RESERVATION_STATE_ABORTED", 4),
+        ],
+    );
+    assert_enum(
+        &pool,
+        "CapacityConflictClass",
+        &[
+            ("CAPACITY_CONFLICT_CLASS_UNSPECIFIED", 0),
+            ("CAPACITY_CONFLICT_CLASS_CREATE_CONTROL_EXISTS", 1),
+            ("CAPACITY_CONFLICT_CLASS_SAME_WRITER_VERSION_ADVANCED", 2),
+            ("CAPACITY_CONFLICT_CLASS_WRITER_EPOCH_ADVANCED", 3),
+        ],
+    );
+
+    let fields = [
+        (
+            "CapacityObjectRef",
+            vec![
+                ("key", 1, "bytes"),
+                ("object_version_id", 2, "bytes"),
+                ("digest", 3, "bytes"),
+                ("size", 4, "uint64"),
+            ],
+        ),
+        (
+            "CapacityShardBudget",
+            vec![
+                ("shard", 1, "uint32"),
+                ("budget_bytes", 2, "uint64"),
+                ("shard_object", 3, "message"),
+            ],
+        ),
+        (
+            "CapacityShardBudgetProposal",
+            vec![("shard", 1, "uint32"), ("budget_bytes", 2, "uint64")],
+        ),
+        (
+            "TenantShardSlice",
+            vec![("shard", 1, "uint32"), ("byte_count", 2, "uint64")],
+        ),
+        (
+            "TenantCapacityAllocation",
+            vec![
+                ("tenant_id", 1, "bytes"),
+                ("total_bytes", 2, "uint64"),
+                ("slices", 3, "message"),
+            ],
+        ),
+        (
+            "TenantCapacityCatalogPage",
+            vec![
+                ("schema_version", 1, "uint32"),
+                ("allocations", 2, "message"),
+            ],
+        ),
+        (
+            "ReservedCapacityReservation",
+            vec![
+                ("created_at_unix_seconds", 1, "uint64"),
+                ("expires_at_unix_seconds", 2, "uint64"),
+            ],
+        ),
+        (
+            "CapacityCommitBinding",
+            vec![
+                ("writer_epoch", 1, "uint64"),
+                ("mutation_id", 2, "bytes"),
+                ("kind", 3, "enum"),
+                ("no_prior_control", 4, "message"),
+                ("prior_control", 5, "message"),
+            ],
+        ),
+        (
+            "CommittingCapacityReservation",
+            vec![("commit", 1, "message")],
+        ),
+        (
+            "ChargedCapacityReservation",
+            vec![("commit", 1, "message"), ("landed_control", 2, "message")],
+        ),
+        (
+            "ExpiredCapacityReservation",
+            vec![
+                ("created_at_unix_seconds", 1, "uint64"),
+                ("expires_at_unix_seconds", 2, "uint64"),
+                ("observed_now_unix_seconds", 3, "uint64"),
+            ],
+        ),
+        (
+            "ConflictingCapacityCommit",
+            vec![
+                ("commit", 1, "message"),
+                ("conflicting_control", 2, "message"),
+                ("conflicting_mutation_id", 3, "bytes"),
+                ("conflict_class", 4, "enum"),
+            ],
+        ),
+        (
+            "AbortedCapacityReservation",
+            vec![
+                ("expired", 1, "message"),
+                ("conflicting_commit", 2, "message"),
+            ],
+        ),
+        (
+            "CapacityReservation",
+            vec![
+                ("reservation_id", 1, "bytes"),
+                ("identity", 2, "message"),
+                ("tenant_id", 3, "bytes"),
+                ("allocation_epoch", 4, "uint64"),
+                ("byte_count", 5, "uint64"),
+                ("tenant_slice_bytes", 6, "uint64"),
+                ("state", 7, "enum"),
+                ("reserved", 8, "message"),
+                ("committing", 9, "message"),
+                ("charged", 10, "message"),
+                ("aborted", 11, "message"),
+            ],
+        ),
+        (
+            "CapacityTenantAccount",
+            vec![
+                ("tenant_id", 1, "bytes"),
+                ("current_slice_bytes", 2, "uint64"),
+            ],
+        ),
+        (
+            "CapacityShard",
+            vec![
+                ("schema_version", 1, "uint32"),
+                ("control_revision", 2, "uint64"),
+                ("shard", 3, "uint32"),
+                ("allocation_epoch", 4, "uint64"),
+                ("budget_bytes", 5, "uint64"),
+                ("tenant_accounts", 6, "message"),
+                ("reservations", 7, "message"),
+            ],
+        ),
+        (
+            "CapacityShardBaseline",
+            vec![
+                ("shard", 1, "uint32"),
+                ("allocation_epoch", 2, "uint64"),
+                ("budget_bytes", 3, "uint64"),
+                ("shard_object", 4, "message"),
+            ],
+        ),
+        ("StableCapacityState", vec![]),
+        (
+            "CapacityRedistribution",
+            vec![
+                ("phase", 1, "enum"),
+                ("target_epoch", 2, "uint64"),
+                ("target_global_allocatable_bytes", 3, "uint64"),
+                ("target_tenant_catalog", 4, "message"),
+                ("target_shard_budgets", 5, "message"),
+                ("admission_fence_id", 6, "bytes"),
+                ("baselines", 7, "message"),
+            ],
+        ),
+        (
+            "CapacityControl",
+            vec![
+                ("schema_version", 1, "uint32"),
+                ("control_revision", 2, "uint64"),
+                ("state", 3, "enum"),
+                ("writer", 4, "message"),
+                ("allocation_epoch", 5, "uint64"),
+                ("global_allocatable_bytes", 6, "uint64"),
+                ("tenant_catalog", 7, "message"),
+                ("shard_budgets", 8, "message"),
+                ("stable", 9, "message"),
+                ("redistribution", 10, "message"),
+            ],
+        ),
+    ];
+    for (message, expected) in fields {
+        assert_fields(&pool, message, &expected);
+    }
+
+    for (message, maximum) in [
+        ("CapacityObjectRef", 4_096),
+        ("CapacityShardBudget", 4_096),
+        ("CapacityShardBudgetProposal", 4_096),
+        ("TenantShardSlice", 4_096),
+        ("TenantCapacityAllocation", 16_384),
+        ("TenantCapacityCatalogPage", 524_288),
+        ("ReservedCapacityReservation", 4_096),
+        ("CapacityCommitBinding", 4_096),
+        ("CommittingCapacityReservation", 4_096),
+        ("ChargedCapacityReservation", 4_096),
+        ("ExpiredCapacityReservation", 4_096),
+        ("ConflictingCapacityCommit", 4_096),
+        ("AbortedCapacityReservation", 4_096),
+        ("CapacityReservation", 16_384),
+        ("CapacityTenantAccount", 4_096),
+        ("CapacityShard", 1_048_576),
+        ("CapacityShardBaseline", 4_096),
+        ("StableCapacityState", 1),
+        ("CapacityRedistribution", 1_048_576),
+        ("CapacityControl", 1_048_576),
+    ] {
+        let descriptor = pool
+            .get_message_by_name(&format!("walgit.v2.{message}"))
+            .unwrap();
+        assert_eq!(
+            option(&pool, descriptor.options(), "walgit.v2.max_encoded_bytes"),
+            maximum,
+            "wrong maximum for {message}"
+        );
+    }
+
+    for (message, field_name, minimum, maximum) in [
+        ("TenantCapacityAllocation", "slices", 256, 256),
+        ("TenantCapacityCatalogPage", "allocations", 0, 4_096),
+        ("CapacityShard", "tenant_accounts", 0, 4_096),
+        ("CapacityShard", "reservations", 0, 4_096),
+        ("CapacityRedistribution", "target_shard_budgets", 256, 256),
+        ("CapacityRedistribution", "baselines", 0, 256),
+        ("CapacityControl", "shard_budgets", 256, 256),
+    ] {
+        let field = pool
+            .get_message_by_name(&format!("walgit.v2.{message}"))
+            .unwrap()
+            .get_field_by_name(field_name)
+            .unwrap();
+        assert_eq!(
+            option(&pool, field.options(), "walgit.v2.min_items"),
+            minimum
+        );
+        assert_eq!(
+            option(&pool, field.options(), "walgit.v2.max_items"),
+            maximum
+        );
+    }
+
+    for (message, field_name, minimum, maximum) in [
+        ("CapacityObjectRef", "key", 1, 1_024),
+        ("CapacityObjectRef", "object_version_id", 1, 1_024),
+        ("CapacityObjectRef", "digest", 32, 32),
+        ("TenantCapacityAllocation", "tenant_id", 1, 256),
+        ("CapacityCommitBinding", "mutation_id", 16, 16),
+        (
+            "ConflictingCapacityCommit",
+            "conflicting_mutation_id",
+            16,
+            16,
+        ),
+        ("CapacityReservation", "reservation_id", 16, 16),
+        ("CapacityReservation", "tenant_id", 1, 256),
+        ("CapacityTenantAccount", "tenant_id", 1, 256),
+        ("CapacityRedistribution", "admission_fence_id", 16, 16),
+    ] {
+        let field = pool
+            .get_message_by_name(&format!("walgit.v2.{message}"))
+            .unwrap()
+            .get_field_by_name(field_name)
+            .unwrap();
+        assert_eq!(
+            option(&pool, field.options(), "walgit.v2.min_bytes"),
+            minimum,
+            "wrong byte minimum for {message}.{field_name}"
+        );
+        assert_eq!(
+            option(&pool, field.options(), "walgit.v2.max_bytes"),
+            maximum,
+            "wrong byte maximum for {message}.{field_name}"
+        );
+    }
+}
+
+fn assert_enum(pool: &DescriptorPool, name: &str, expected: &[(&str, i32)]) {
+    let actual = pool
+        .get_enum_by_name(&format!("walgit.v2.{name}"))
+        .unwrap()
+        .values()
+        .map(|value| (value.name().to_owned(), value.number()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(name, number)| ((*name).to_owned(), *number))
+            .collect::<Vec<_>>()
+    );
+}
+
 fn assert_fields(pool: &DescriptorPool, message: &str, expected: &[(&str, u32, &str)]) {
     let message = pool
         .get_message_by_name(&format!("walgit.v2.{message}"))

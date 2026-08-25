@@ -25,7 +25,9 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `proto/walgit/v2/options.proto`; the strict
   `v2::{encode_repo_control,decode_repo_control,preflight_repo_control}` and
   `v2::{encode_credential_control,decode_credential_control,preflight_credential_control}`
-  codecs; distinct canonical-path, routing, protobuf-object, raw-payload,
+  codecs; the dormant capacity
+  `v2::{encode,decode,preflight}_{tenant_capacity_catalog_page,capacity_shard,capacity_control}`
+  codec families; distinct canonical-path, routing, protobuf-object, raw-payload,
   signed-envelope, and verification-ring digest types; and the exhaustive
   `v2::keys` grammar with a closed key-kind-to-digest mapping from the frozen
   V5.9 production architecture. Credential encode and decode plus
@@ -47,6 +49,83 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   read or written by the V1 registry, WAL, server, CLI, bundle, policy, or
   coordination paths. These dormant types and APIs do not create a production
   V2 object, activate a mutation path, or create a legacy-adoption migration.
+
+  The dormant capacity schema is version 1. One immutable flat tenant page is
+  binary-sorted and unique, with at most 4,096 rows and 524,288 exact encoded
+  bytes. Each allocation has exactly 256 positive slices whose checked sum
+  equals its finite total. `CapacityObjectRef` is the distinct global exact
+  key/`ObjectVersionID`/digest/size reference; it never reuses the
+  repository-scoped `TargetObjectRef`. Capacity controls and shards are at most
+  1 MiB. A stable control binds a positive global budget, an exact tenant page,
+  exactly 256 sorted positive shard budgets, and exact epoch-start shard
+  proofs. The checked budget sum cannot exceed the global budget. The pure
+  cross-object validator exact-binds loaded current and target pages, computes
+  all 256 checked tenant-slice column sums, and requires each column to fit its
+  shard budget and the aggregate to fit the global budget.
+
+  A shard has at most 4,096 sorted retained reservations and 4,096 sorted
+  current tenant accounts. Every non-`ABORTED` byte is checked against the
+  shard budget and the one non-extraneous current account for its tenant.
+  Historical terminal rows keep their original epoch and slice across
+  redistribution. `RESERVED` and `COMMITTING` must use the current shard epoch;
+  terminal rows can use a nonzero earlier epoch. `RESERVED` has an explicit
+  checked lifetime of at most 900 seconds. `COMMITTING` is non-expiring and
+  uses a closed predecessor: `CREATE` requires explicit `NONE`; every other
+  non-settlement mutation requires the exact prior control CAS token and
+  object version. `ABORTED` has separate expiry and conflicting-commit proof
+  arms. Commit mutation IDs are unique per repository across retained rows. A
+  public successor validator accepts only a byte-exact retry or one legal
+  reservation transition with shard revision `+1`. It freezes the shard,
+  epoch, budget, immutable reservation fields, untouched rows, and unaffected
+  accounts. The caller supplies observed `now`: creation requires
+  `created_at <= now < expires_at`, `RESERVED -> COMMITTING` requires the same
+  live window, and expiry repeats the original window and records that exact
+  `now >= expires_at`. Terminal rows cannot change.
+
+  The retained-shard-budget object validator exact-binds an epoch-start body
+  to the matching `CapacityShardBudget.shard_object` for both STABLE and the
+  retained prior plan in either PREPARING phase. A separate mutable-shard
+  object validator exact-binds the current body to caller-observed provider
+  metadata, then compares shard, current control epoch, and budget without
+  equating that metadata to the historical epoch-start proof. The pure
+  current-shard-view validator composes the mutable object gate and requires
+  every tenant account to equal the exact current page slice. Every current-
+  epoch non-`ABORTED` reservation must repeat that exact slice; older terminal
+  proof rows keep their historical slice. The admission wrapper requires
+  STABLE. Publication uses the composed STABLE successor gate so a new row
+  cannot bypass the exact current page, account, epoch, budget, object, or
+  caller-observed time checks. PREPARING publication uses the separate
+  DRAINING gate, which permits only an expiry, charge, or conflict abort.
+  Lower-level object and successor helpers are not publication gates.
+  Before CHARGED or conflicting-commit ABORTED is accepted, the future
+  controller must run the state-specific composition gate. Both gates exact-
+  bind the prior COMMITTING shard and prepared `CapacityObligation`. CHARGED
+  also exact-binds the current `RepoControl` and its rooted receipt catalog;
+  conflict exact-binds a typed current GET and catalog, proves the prepared
+  mutation is absent, and proves the conflicting current mutation is present.
+  `CREATE_CONTROL_EXISTS` accepts any exact control at the by-path key.
+  `SAME_WRITER_VERSION_ADVANCED` requires a different object version at epoch
+  `E`; `WRITER_EPOCH_ADVANCED` requires a different object version at an exact
+  typed-current writer epoch strictly greater than `E`. This includes `E+1`
+  and later epochs after successive takeovers. All arms match canonical body
+  key/digest/size and the current catalog's represented last mutation. The
+  controller obtains the conflicting proof from a typed current GET at the
+  abort decision; the durable proof can later exact-load that object version.
+  Proto validation cannot prove provider currentness by itself.
+
+  Redistribution has only `STABLE`, `PREPARING/DRAINING`, and
+  `PREPARING/APPLYING` cells. DRAINING retains the exact prior stable plan and
+  binds the target plan plus writer/admission fence. APPLYING additionally
+  binds all 256 exact current drained baselines. Their provider metadata can be
+  newer than the historical epoch-start proofs, but shard, prior epoch, budget,
+  and key stay fixed. The future controller must load those exact objects,
+  use the exact-baseline validator to prove terminal-only drainage, run the
+  exported cross-object gates, and
+  derive deterministic advance or revert successors that preserve terminal
+  reservation bytes and replace only current accounts from the target page.
+  This slice adds no controller, store adapter, provider, V1 compatibility, route, config,
+  migration, or runtime activation. It is a greenfield hard-cut contract; the
+  deferred multilevel 65,536-row topology requires a later explicit phase.
 - `walgit-identity`: dormant pure V2 credential verification. It depends only
   on `walgit-proto` plus bounded hash, Ed25519, and error utilities. Its strict
   cursor rejects unknown, duplicate, reordered, non-minimal, indefinite,

@@ -104,6 +104,10 @@ fn write_marker(path: &Path, m: &Marker) -> anyhow::Result<()> {
 /// with a reflink when source and destination share a filesystem (seconds for 40 GB, no
 /// bytes duplicated until written) and which degrades to a plain copy elsewhere.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    copy_tree_relative(src, dst, Path::new(""))
+}
+
+fn copy_tree_relative(src: &Path, dst: &Path, relative: &Path) -> std::io::Result<u64> {
     std::fs::create_dir_all(dst)?;
     let mut bytes = 0u64;
     for ent in std::fs::read_dir(src)? {
@@ -111,8 +115,12 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
         let from = ent.path();
         let to = dst.join(ent.file_name());
         let ft = ent.file_type()?;
+        let relative = relative.join(ent.file_name());
+        if scratch_copy_excludes(&relative) {
+            continue;
+        }
         if ft.is_dir() {
-            bytes += copy_tree(&from, &to)?;
+            bytes += copy_tree_relative(&from, &to, &relative)?;
         } else if ft.is_file() {
             bytes += std::fs::copy(&from, &to)?;
         } else if ft.is_symlink() {
@@ -123,6 +131,35 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+fn scratch_copy_excludes(relative: &Path) -> bool {
+    relative
+        .extension()
+        .is_some_and(|extension| extension == "lock")
+        || relative == Path::new("objects/info/commit-graph")
+        || relative == Path::new("objects/info/commit-graphs")
+}
+
+fn clear_scratch_commit_graph_workspace(scratch: &LocalRepo) -> anyhow::Result<()> {
+    let info = scratch.path().join("objects/info");
+    for path in [info.join("commit-graph"), info.join("commit-graphs")] {
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("clearing scratch commit-graph workspace {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn disk_avail(path: &Path) -> Option<u64> {
@@ -252,6 +289,19 @@ pub async fn rebuild_base(
         .filter_map(|h| gix_hash::ObjectId::from_hex(h.as_bytes()).ok())
         .collect();
 
+    // Older builds advanced this marker after a failed commit-graph write.
+    // Recover by returning to the last durable phase unless the named side
+    // file is actually present in this scratch repository.
+    if cfg.git.commit_graph
+        && marker.phase >= Phase::CommitGraph
+        && !commit_graph_marker_is_complete(&marker, scratch.path())
+    {
+        log("commit-graph marker has no durable layer; retrying from history-pack phase".into());
+        marker.phase = Phase::HistoryPack;
+        marker.commit_graph = None;
+        write_marker(&marker_path, &marker)?;
+    }
+
     // 3. History pack (D18) of the first base.
     if marker.phase < Phase::HistoryPack {
         if cfg.git.history_pack
@@ -280,30 +330,27 @@ pub async fn rebuild_base(
     // 4. One commit-graph layer on the biggest base.
     if marker.phase < Phase::CommitGraph {
         if cfg.git.commit_graph {
+            // The serving-copy snapshot deliberately excludes this derived
+            // workspace. Clear it again on resume so an interrupted Git
+            // process cannot leave a lock or partial split chain behind.
+            clear_scratch_commit_graph_workspace(&scratch)?;
             let packs = scratch.packs()?;
             let biggest = bases
                 .iter()
                 .filter_map(|b| packs.iter().find(|p| &p.checksum == b))
                 .max_by_key(|p| p.pack_size)
-                .map(|p| p.checksum);
-            if let Some(b) = biggest {
-                let t = Instant::now();
-                match scratch
-                    .write_pack_commit_graph(&b, cfg.git.commit_graph_changed_paths)
-                    .await
-                {
-                    Ok(bytes) => {
-                        log(format!(
-                            "commit-graph layer on pack {b}: {bytes} bytes in {:.1}s",
-                            t.elapsed().as_secs_f64()
-                        ));
-                        marker.commit_graph = Some(b.to_hex().to_string());
-                    }
-                    Err(e) => log(format!(
-                        "commit-graph write failed (continuing without): {e}"
-                    )),
-                }
-            }
+                .map(|p| p.checksum)
+                .context("no rebuilt base pack is available for the required commit-graph")?;
+            let t = Instant::now();
+            let bytes = scratch
+                .write_pack_commit_graph(&biggest, cfg.git.commit_graph_changed_paths)
+                .await
+                .context("writing the required scratch commit-graph layer")?;
+            log(format!(
+                "commit-graph layer on pack {biggest}: {bytes} bytes in {:.1}s",
+                t.elapsed().as_secs_f64()
+            ));
+            marker.commit_graph = Some(biggest.to_hex().to_string());
         }
         marker.phase = Phase::CommitGraph;
         write_marker(&marker_path, &marker)?;
@@ -379,6 +426,18 @@ pub async fn rebuild_base(
     })
 }
 
+fn commit_graph_marker_is_complete(marker: &Marker, scratch_dir: &Path) -> bool {
+    let Some(checksum) = marker.commit_graph.as_deref() else {
+        return false;
+    };
+    marker.new_packs.iter().any(|pack| pack == checksum)
+        && gix_hash::ObjectId::from_hex(checksum.as_bytes()).is_ok()
+        && scratch_dir
+            .join("objects/pack")
+            .join(format!("pack-{checksum}.commit-graph"))
+            .is_file()
+}
+
 fn start_scratch(
     handle: &RepoHandle,
     cfg: &Config,
@@ -423,4 +482,78 @@ fn start_scratch(
     write_marker(marker_path, &m)?;
     abort_after(handle.id(), Phase::Copied)?;
     Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{Marker, Phase, commit_graph_marker_is_complete, copy_tree};
+
+    #[test]
+    fn scratch_copy_excludes_a_concurrent_git_writer_lock() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let graphs = source.path().join("objects/info/commit-graphs");
+        std::fs::create_dir_all(&graphs).unwrap();
+        std::fs::write(graphs.join("commit-graph-chain"), "graph-id\n").unwrap();
+        let mut writer_lock =
+            std::fs::File::create(graphs.join("commit-graph-chain.lock")).unwrap();
+        writer_lock.write_all(b"writer in progress").unwrap();
+        std::fs::write(source.path().join("objects/info/commit-graph"), b"CGPH").unwrap();
+        std::fs::write(source.path().join("packed-refs.lock"), b"another writer").unwrap();
+        std::fs::write(source.path().join("config"), b"ordinary repository state").unwrap();
+
+        copy_tree(source.path(), destination.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.path().join("config")).unwrap(),
+            b"ordinary repository state"
+        );
+        assert!(
+            !destination
+                .path()
+                .join("objects/info/commit-graphs")
+                .exists(),
+            "the source's derived commit-graph workspace must not enter the scratch repository"
+        );
+        assert!(
+            !destination
+                .path()
+                .join("objects/info/commit-graph")
+                .exists()
+        );
+        assert!(
+            !destination.path().join("packed-refs.lock").exists(),
+            "transient source writer locks must not enter the isolated scratch repository"
+        );
+    }
+
+    #[test]
+    fn legacy_commit_graph_marker_requires_its_named_base_side_file() {
+        const CHECKSUM: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let scratch = tempfile::tempdir().unwrap();
+        let mut marker = Marker {
+            started_head_seq: 1,
+            phase: Phase::CommitGraph,
+            new_packs: vec![CHECKSUM.into()],
+            history: None,
+            commit_graph: None,
+        };
+        assert!(!commit_graph_marker_is_complete(&marker, scratch.path()));
+
+        marker.commit_graph = Some(CHECKSUM.into());
+        assert!(!commit_graph_marker_is_complete(&marker, scratch.path()));
+        let pack_dir = scratch.path().join("objects/pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(
+            pack_dir.join(format!("pack-{CHECKSUM}.commit-graph")),
+            b"CGPH",
+        )
+        .unwrap();
+        assert!(commit_graph_marker_is_complete(&marker, scratch.path()));
+
+        marker.new_packs.clear();
+        assert!(!commit_graph_marker_is_complete(&marker, scratch.path()));
+    }
 }
