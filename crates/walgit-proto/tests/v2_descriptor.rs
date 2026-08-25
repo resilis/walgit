@@ -1,4 +1,4 @@
-use prost_reflect::{DescriptorPool, Value};
+use prost_reflect::{DescriptorPool, Kind, Value};
 use walgit_proto::{FILE_DESCRIPTOR_SET, v2::codec::lint_v2_descriptors};
 
 #[test]
@@ -95,6 +95,93 @@ fn repo_control_has_exactly_the_fixed_catalog_slots_and_terminal_oneof_tags() {
         control.get_field_by_name("grant_catalog").unwrap().number(),
         34
     );
+}
+
+#[test]
+fn credential_control_has_the_exact_v5_9_tags_presence_and_bounds() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let root = pool
+        .get_message_by_name("walgit.v2.VerificationRingRoot")
+        .unwrap();
+    assert_eq!(
+        option(&pool, root.options(), "walgit.v2.max_encoded_bytes"),
+        4_096
+    );
+    let root_fields = [
+        ("key", 1),
+        ("object_version_id", 2),
+        ("digest", 3),
+        ("size", 4),
+        ("ring_epoch", 5),
+    ];
+    for (name, tag) in root_fields {
+        assert_eq!(root.get_field_by_name(name).unwrap().number(), tag);
+    }
+    for name in ["key", "object_version_id", "digest"] {
+        assert!(matches!(
+            root.get_field_by_name(name).unwrap().kind(),
+            Kind::Bytes
+        ));
+    }
+    for name in ["size", "ring_epoch"] {
+        assert!(matches!(
+            root.get_field_by_name(name).unwrap().kind(),
+            Kind::Uint64
+        ));
+    }
+
+    let control = pool
+        .get_message_by_name("walgit.v2.CredentialControl")
+        .unwrap();
+    assert_eq!(
+        option(&pool, control.options(), "walgit.v2.max_encoded_bytes"),
+        65_536
+    );
+    let fields = [
+        ("schema_version", 1),
+        ("control_revision", 2),
+        ("issuer_epoch", 3),
+        ("current", 4),
+        ("next", 5),
+        ("previous", 6),
+        ("previous_last_issue_unix_seconds", 7),
+        ("revoked_kids", 8),
+        ("verifier_set_digest", 9),
+        ("acknowledgement_proof_digest", 10),
+    ];
+    for (name, tag) in fields {
+        assert_eq!(control.get_field_by_name(name).unwrap().number(), tag);
+    }
+    assert!(matches!(
+        control.get_field_by_name("schema_version").unwrap().kind(),
+        Kind::Uint32
+    ));
+    for name in ["control_revision", "issuer_epoch"] {
+        assert!(matches!(
+            control.get_field_by_name(name).unwrap().kind(),
+            Kind::Uint64
+        ));
+    }
+    for name in ["current", "next", "previous"] {
+        let Kind::Message(message) = control.get_field_by_name(name).unwrap().kind() else {
+            panic!("{name} is not a message")
+        };
+        assert_eq!(message.full_name(), "walgit.v2.VerificationRingRoot");
+    }
+    let last_issue = control
+        .get_field_by_name("previous_last_issue_unix_seconds")
+        .unwrap();
+    assert!(last_issue.supports_presence());
+    assert_eq!(
+        last_issue.field_descriptor_proto().proto3_optional,
+        Some(true)
+    );
+    assert!(matches!(last_issue.kind(), Kind::Int64));
+    let revoked = control.get_field_by_name("revoked_kids").unwrap();
+    assert!(revoked.is_list());
+    assert_eq!(option(&pool, revoked.options(), "walgit.v2.min_bytes"), 16);
+    assert_eq!(option(&pool, revoked.options(), "walgit.v2.max_bytes"), 16);
+    assert_eq!(option(&pool, revoked.options(), "walgit.v2.max_items"), 64);
 }
 
 fn option(pool: &DescriptorPool, options: prost_reflect::DynamicMessage, name: &str) -> u64 {

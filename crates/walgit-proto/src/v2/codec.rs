@@ -1,11 +1,14 @@
-//! Strict deterministic codec for persisted V2 repository control.
+//! Strict deterministic codec for persisted V2 controls.
 
 use std::sync::OnceLock;
 
 use prost::Message;
 use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor};
 
-use super::{MAX_REPO_CONTROL_BYTES, RepoControl, validate_repo_control};
+use super::{
+    CredentialControl, MAX_CREDENTIAL_CONTROL_BYTES, MAX_REPO_CONTROL_BYTES, RepoControl,
+    keys::DeploymentPrefix, validate_credential_control, validate_repo_control,
+};
 
 const MAX_NESTING_DEPTH: usize = 16;
 const MESSAGE_MAX_OPTION: &str = "walgit.v2.max_encoded_bytes";
@@ -42,7 +45,44 @@ pub fn decode_repo_control(bytes: &[u8]) -> Result<RepoControl, ControlCodecErro
 
 pub fn preflight_repo_control(bytes: &[u8]) -> Result<(), ControlCodecError> {
     let schema = preflight_schema();
-    preflight_message(schema, schema.root, bytes, 1).map(|_| ())
+    preflight_message(schema, schema.repo_control_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_credential_control(
+    control: &CredentialControl,
+    prefix: &DeploymentPrefix,
+) -> Result<Vec<u8>, ControlCodecError> {
+    validate_credential_control(control, prefix)?;
+    if control.encoded_len() > MAX_CREDENTIAL_CONTROL_BYTES {
+        return Err(ControlCodecError::MessageTooLarge {
+            message: "walgit.v2.CredentialControl".to_string(),
+            actual: control.encoded_len(),
+            maximum: MAX_CREDENTIAL_CONTROL_BYTES,
+        });
+    }
+    let bytes = control.encode_to_vec();
+    preflight_credential_control(&bytes)?;
+    Ok(bytes)
+}
+
+pub fn decode_credential_control(
+    bytes: &[u8],
+    prefix: &DeploymentPrefix,
+) -> Result<CredentialControl, ControlCodecError> {
+    preflight_credential_control(bytes)?;
+    let control = CredentialControl::decode(bytes)?;
+    validate_credential_control(&control, prefix)?;
+    if control.encode_to_vec() != bytes {
+        return Err(ControlCodecError::NonCanonical(
+            "generated re-encoding differs from the stored bytes",
+        ));
+    }
+    Ok(control)
+}
+
+pub fn preflight_credential_control(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.credential_control_root, bytes, 1).map(|_| ())
 }
 
 /// Prove that every persisted V2 message and variable field has descriptor
@@ -123,9 +163,9 @@ fn preflight_message(
         }
 
         match &field.kind {
-            PreflightKind::Uint32 | PreflightKind::Uint64 => {
+            PreflightKind::Int64 | PreflightKind::Uint32 | PreflightKind::Uint64 => {
                 require_wire(field, wire, 0)?;
-                if take_varint(&mut input)? == 0 {
+                if take_varint(&mut input)? == 0 && !field.allows_explicit_default {
                     return Err(ControlCodecError::NonCanonical(
                         "an explicit proto3 scalar default is prohibited",
                     ));
@@ -198,7 +238,8 @@ fn preflight_message(
 
 #[derive(Debug)]
 struct PreflightSchema {
-    root: usize,
+    repo_control_root: usize,
+    credential_control_root: usize,
     messages: Vec<PreflightMessage>,
 }
 
@@ -221,10 +262,12 @@ struct PreflightField {
     maximum_bytes: u64,
     minimum_items: u64,
     maximum_items: u64,
+    allows_explicit_default: bool,
 }
 
 #[derive(Debug)]
 enum PreflightKind {
+    Int64,
     Uint32,
     Uint64,
     Enum(Vec<i32>),
@@ -243,9 +286,13 @@ impl PreflightSchema {
             .enumerate()
             .map(|(index, message)| (message.full_name().to_string(), index))
             .collect::<std::collections::HashMap<_, _>>();
-        let root = *indexes.get("walgit.v2.RepoControl").ok_or_else(|| {
+        let repo_control_root = *indexes.get("walgit.v2.RepoControl").ok_or_else(|| {
             ControlCodecError::Descriptor("RepoControl descriptor is missing".into())
         })?;
+        let credential_control_root =
+            *indexes.get("walgit.v2.CredentialControl").ok_or_else(|| {
+                ControlCodecError::Descriptor("CredentialControl descriptor is missing".into())
+            })?;
         let mut messages = Vec::with_capacity(descriptors.len());
         for descriptor in &descriptors {
             let maximum = usize::try_from(message_bound(descriptor)?).map_err(|_| {
@@ -274,6 +321,7 @@ impl PreflightSchema {
                     (0, 1)
                 };
                 let kind = match field.kind() {
+                    Kind::Int64 => PreflightKind::Int64,
                     Kind::Uint32 => PreflightKind::Uint32,
                     Kind::Uint64 => PreflightKind::Uint64,
                     Kind::Enum(enumeration) => {
@@ -301,10 +349,15 @@ impl PreflightSchema {
                         )));
                     }
                 };
-                let oneof = field.containing_oneof().map(|oneof| {
-                    usize::try_from(*oneof.path().last().expect("oneof path has an index"))
-                        .expect("descriptor linter rejected a negative oneof index")
-                });
+                let proto3_optional = field.field_descriptor_proto().proto3_optional == Some(true);
+                let oneof = if proto3_optional {
+                    None
+                } else {
+                    field.containing_oneof().map(|oneof| {
+                        usize::try_from(*oneof.path().last().expect("oneof path has an index"))
+                            .expect("descriptor linter rejected a negative oneof index")
+                    })
+                };
                 fields.push(PreflightField {
                     number: field.number(),
                     name: field.full_name().to_string(),
@@ -315,6 +368,7 @@ impl PreflightSchema {
                     maximum_bytes,
                     minimum_items,
                     maximum_items,
+                    allows_explicit_default: proto3_optional,
                 });
             }
             messages.push(PreflightMessage {
@@ -324,7 +378,11 @@ impl PreflightSchema {
                 inline_ref_changes: descriptor.full_name() == "walgit.v2.InlineRefChanges",
             });
         }
-        Ok(Self { root, messages })
+        Ok(Self {
+            repo_control_root,
+            credential_control_root,
+            messages,
+        })
     }
 }
 

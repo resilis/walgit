@@ -263,3 +263,36 @@ message RepoControl {
     CatalogRoot grant_catalog = 34;
   }
 }
+
+// Exact immutable-object binding for one verification-ring slot.
+message VerificationRingRoot {
+  option (max_encoded_bytes) = 4096;
+
+  bytes key = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 4;
+  uint64 ring_epoch = 5;
+}
+
+// The dormant V2 authority for verification-ring slots and revoked data keys.
+// No runtime path reads or writes this message before the production hard cut.
+message CredentialControl {
+  option (max_encoded_bytes) = 65536;
+
+  uint32 schema_version = 1;
+  uint64 control_revision = 2;
+  uint64 issuer_epoch = 3;
+  VerificationRingRoot current = 4;
+  VerificationRingRoot next = 5;
+  VerificationRingRoot previous = 6;
+  optional int64 previous_last_issue_unix_seconds = 7;
+  repeated bytes revoked_kids = 8 [
+    (min_bytes) = 16,
+    (max_bytes) = 16,
+    (min_items) = 0,
+    (max_items) = 64
+  ];
+  bytes verifier_set_digest = 9 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes acknowledgement_proof_digest = 10 [(min_bytes) = 32, (max_bytes) = 32];
+}

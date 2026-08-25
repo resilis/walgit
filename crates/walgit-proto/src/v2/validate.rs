@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use sha2::{Digest, Sha256};
 
 use super::{
-    BucketSafetyBinding, CapacityBinding, CatalogKind, CatalogRoot, GrantRole, Lifecycle,
-    ObjectFormat, PackRoot, REPO_CONTROL_SCHEMA_VERSION, ReclamationPhase, RepoControl,
-    RepositoryGrant, RepositoryIdentity, TargetObjectRef, Visibility, WalEntryKind, WalState,
+    BucketSafetyBinding, CREDENTIAL_CONTROL_SCHEMA_VERSION, CapacityBinding, CatalogKind,
+    CatalogRoot, CredentialControl, GrantRole, Lifecycle, ObjectFormat, PackRoot,
+    REPO_CONTROL_SCHEMA_VERSION, ReclamationPhase, RepoControl, RepositoryGrant,
+    RepositoryIdentity, TargetObjectRef, VerificationRingRoot, Visibility, WalEntryKind, WalState,
     keys::{
         CanonicalPathDigest, DeploymentPrefix, ParsedV2Key, RepositoryKeyIdentity, RoutingDigest,
         V2KeyKind, parse_key, repo_control_key,
@@ -19,6 +20,382 @@ const MAX_CATALOG_NODES: u64 = 131_072;
 const MAX_CATALOG_BYTES: u64 = 68_719_476_736;
 const MAX_RECLAMATION_OBJECTS: u64 = 1_000;
 const MAX_RECLAMATION_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialTransitionKind {
+    InstallNext,
+    PromoteNext,
+    RetirePrevious,
+    RevokeKid,
+    VerifierSetUpdate,
+    AcknowledgementUpdate,
+}
+
+pub fn validate_credential_control(
+    control: &CredentialControl,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    if control.schema_version != CREDENTIAL_CONTROL_SCHEMA_VERSION {
+        return Err(invalid("credential.schema_version", "must be exactly 2"));
+    }
+    nonzero("credential.control_revision", control.control_revision)?;
+    nonzero("credential.issuer_epoch", control.issuer_epoch)?;
+
+    let current = control
+        .current
+        .as_ref()
+        .ok_or_else(|| missing("credential.current"))?;
+    validate_verification_ring_root("credential.current", current, prefix)?;
+    let mut roots = vec![current];
+    if let Some(next) = &control.next {
+        validate_verification_ring_root("credential.next", next, prefix)?;
+        let expected = current
+            .ring_epoch
+            .checked_add(1)
+            .ok_or_else(|| invalid("credential.next.ring_epoch", "would wrap current epoch"))?;
+        if next.ring_epoch != expected {
+            return Err(invalid(
+                "credential.next.ring_epoch",
+                "must be checked current ring epoch plus one",
+            ));
+        }
+        roots.push(next);
+    }
+    if let Some(previous) = &control.previous {
+        validate_verification_ring_root("credential.previous", previous, prefix)?;
+        let expected = previous.ring_epoch.checked_add(1).ok_or_else(|| {
+            invalid(
+                "credential.previous.ring_epoch",
+                "cannot precede current without wrapping",
+            )
+        })?;
+        if current.ring_epoch != expected {
+            return Err(invalid(
+                "credential.previous.ring_epoch",
+                "must immediately precede current ring epoch",
+            ));
+        }
+        roots.push(previous);
+    }
+    if control.previous.is_some() != control.previous_last_issue_unix_seconds.is_some() {
+        return Err(invalid(
+            "credential.previous_last_issue_unix_seconds",
+            "must be present if and only if previous is present",
+        ));
+    }
+    for (index, left) in roots.iter().enumerate() {
+        for right in &roots[index + 1..] {
+            if left.key == right.key || left.digest == right.digest {
+                return Err(invalid(
+                    "credential.ring_roots",
+                    "slot root identities must be distinct",
+                ));
+            }
+            if left.ring_epoch == right.ring_epoch {
+                return Err(invalid(
+                    "credential.ring_roots",
+                    "slot ring epochs must be distinct",
+                ));
+            }
+        }
+    }
+
+    if control.revoked_kids.len() > 64 {
+        return Err(invalid(
+            "credential.revoked_kids",
+            "must contain at most 64 entries",
+        ));
+    }
+    for kid in &control.revoked_kids {
+        exact_len("credential.revoked_kids", kid, 16)?;
+    }
+    if control
+        .revoked_kids
+        .windows(2)
+        .any(|pair| pair[0].as_ref() >= pair[1].as_ref())
+    {
+        return Err(invalid(
+            "credential.revoked_kids",
+            "must be binary-sorted and unique",
+        ));
+    }
+    exact_len(
+        "credential.verifier_set_digest",
+        &control.verifier_set_digest,
+        32,
+    )?;
+    exact_len(
+        "credential.acknowledgement_proof_digest",
+        &control.acknowledgement_proof_digest,
+        32,
+    )?;
+
+    if control.control_revision == 1
+        && (control.issuer_epoch != 1
+            || current.ring_epoch != 1
+            || control.next.is_some()
+            || control.previous.is_some()
+            || control.previous_last_issue_unix_seconds.is_some()
+            || !control.revoked_kids.is_empty())
+    {
+        return Err(invalid(
+            "credential.bootstrap",
+            "revision one must use the exact frozen bootstrap values",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate only transition invariants visible in the two protobuf controls.
+///
+/// This structural check is not transition authorization. Lineage, ring UUID
+/// and data-key non-reuse, prior-ring digest, retirement union, bound-key
+/// revocation, and proof acknowledgements require later verified immutable-ring
+/// and signed-proof evidence. A runtime caller must fail closed without it.
+pub fn validate_credential_control_transition_structure(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+    kind: CredentialTransitionKind,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_credential_control(predecessor, prefix)?;
+    validate_credential_control(successor, prefix)?;
+    let revision = predecessor
+        .control_revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("credential.control_revision", "cannot wrap"))?;
+    if successor.control_revision != revision {
+        return Err(invalid(
+            "credential.control_revision",
+            "must increment by exactly one",
+        ));
+    }
+    if successor.issuer_epoch < predecessor.issuer_epoch {
+        return Err(invalid("credential.issuer_epoch", "must never decrease"));
+    }
+    if successor.acknowledgement_proof_digest == predecessor.acknowledgement_proof_digest {
+        return Err(invalid(
+            "credential.acknowledgement_proof_digest",
+            "must bind the new transition proof",
+        ));
+    }
+    if !is_sorted_subset(&predecessor.revoked_kids, &successor.revoked_kids) {
+        return Err(invalid("credential.revoked_kids", "must be append-only"));
+    }
+
+    match kind {
+        CredentialTransitionKind::InstallNext => validate_install_next(predecessor, successor),
+        CredentialTransitionKind::PromoteNext => validate_promote_next(predecessor, successor),
+        CredentialTransitionKind::RetirePrevious => {
+            validate_retire_previous(predecessor, successor)
+        }
+        CredentialTransitionKind::RevokeKid => validate_revoke_kid(predecessor, successor),
+        CredentialTransitionKind::VerifierSetUpdate => {
+            validate_verifier_set_update(predecessor, successor)
+        }
+        CredentialTransitionKind::AcknowledgementUpdate => {
+            validate_acknowledgement_update(predecessor, successor)
+        }
+    }
+}
+
+fn validate_verification_ring_root(
+    field: &'static str,
+    root: &VerificationRingRoot,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    bounded_bytes(field, &root.key, 1, 1_024)?;
+    bounded_bytes(field, &root.object_version_id, 1, 1_024)?;
+    exact_len(field, &root.digest, 32)?;
+    if root.size == 0 || root.size > 65_536 {
+        return Err(invalid(field, "size must be in 1..=65536"));
+    }
+    nonzero(field, root.ring_epoch)?;
+
+    let parsed = parse_key(prefix, &root.key)
+        .map_err(|_| invalid(field, "key is outside the closed V2 grammar"))?;
+    if parsed.kind != V2KeyKind::VerificationKeyRing
+        || parsed
+            .content_digest
+            .is_none_or(|digest| digest.as_bytes().as_slice() != root.digest.as_ref())
+        || parsed.repository.is_some()
+        || parsed.sequence.is_some()
+    {
+        return Err(invalid(field, "key does not bind this verification ring"));
+    }
+    Ok(())
+}
+
+fn validate_install_next(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+) -> Result<(), ControlValidationError> {
+    if predecessor.next.is_some()
+        || successor.next.is_none()
+        || predecessor.current != successor.current
+        || predecessor.previous != successor.previous
+        || predecessor.previous_last_issue_unix_seconds
+            != successor.previous_last_issue_unix_seconds
+        || predecessor.revoked_kids != successor.revoked_kids
+        || predecessor.verifier_set_digest != successor.verifier_set_digest
+        || predecessor.issuer_epoch != successor.issuer_epoch
+    {
+        return Err(invalid(
+            "credential.install_next",
+            "must add only one checked next root",
+        ));
+    }
+    let candidate = successor.next.as_ref().expect("checked above");
+    for root in [predecessor.current.as_ref(), predecessor.previous.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if candidate.key == root.key || candidate.digest == root.digest {
+            return Err(invalid(
+                "credential.install_next",
+                "must not reuse a bound ring root identity",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_promote_next(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+) -> Result<(), ControlValidationError> {
+    let expected_current = predecessor
+        .next
+        .as_ref()
+        .ok_or_else(|| invalid("credential.promote_next", "requires next"))?;
+    let expected_previous = predecessor
+        .current
+        .as_ref()
+        .ok_or_else(|| missing("credential.current"))?;
+    if predecessor.previous.is_some()
+        || predecessor.previous_last_issue_unix_seconds.is_some()
+        || successor.current.as_ref() != Some(expected_current)
+        || successor.previous.as_ref() != Some(expected_previous)
+        || successor.next.is_some()
+        || successor.previous_last_issue_unix_seconds.is_none()
+        || predecessor.revoked_kids != successor.revoked_kids
+        || predecessor.verifier_set_digest != successor.verifier_set_digest
+        || successor.issuer_epoch != checked_increment(predecessor.issuer_epoch)?
+    {
+        return Err(invalid(
+            "credential.promote_next",
+            "must perform only the exact slot move and issuer-epoch increment",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retire_previous(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+) -> Result<(), ControlValidationError> {
+    if predecessor.previous.is_none()
+        || predecessor.previous_last_issue_unix_seconds.is_none()
+        || successor.previous.is_some()
+        || successor.previous_last_issue_unix_seconds.is_some()
+        || predecessor.current != successor.current
+        || predecessor.next != successor.next
+        || predecessor.verifier_set_digest != successor.verifier_set_digest
+    {
+        return Err(invalid(
+            "credential.retire_previous",
+            "must remove only previous and its issue time while extending the deny set",
+        ));
+    }
+    let grew = predecessor.revoked_kids != successor.revoked_kids;
+    let expected_epoch = if grew {
+        checked_increment(predecessor.issuer_epoch)?
+    } else {
+        predecessor.issuer_epoch
+    };
+    if successor.issuer_epoch != expected_epoch {
+        return Err(invalid(
+            "credential.issuer_epoch",
+            "must increment exactly when retirement grows the deny set",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_revoke_kid(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+) -> Result<(), ControlValidationError> {
+    if predecessor.current != successor.current
+        || predecessor.next != successor.next
+        || predecessor.previous != successor.previous
+        || predecessor.previous_last_issue_unix_seconds
+            != successor.previous_last_issue_unix_seconds
+        || predecessor.verifier_set_digest != successor.verifier_set_digest
+        || successor.revoked_kids.len() != predecessor.revoked_kids.len() + 1
+        || successor.issuer_epoch != checked_increment(predecessor.issuer_epoch)?
+    {
+        return Err(invalid(
+            "credential.revoke_kid",
+            "must append exactly one kid and increment issuer epoch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_verifier_set_update(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+) -> Result<(), ControlValidationError> {
+    if !same_ring_state(predecessor, successor)
+        || predecessor.revoked_kids != successor.revoked_kids
+        || predecessor.issuer_epoch != successor.issuer_epoch
+        || predecessor.verifier_set_digest == successor.verifier_set_digest
+    {
+        return Err(invalid(
+            "credential.verifier_set_update",
+            "must change only verifier-set and proof digests",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_acknowledgement_update(
+    predecessor: &CredentialControl,
+    successor: &CredentialControl,
+) -> Result<(), ControlValidationError> {
+    if !same_ring_state(predecessor, successor)
+        || predecessor.revoked_kids != successor.revoked_kids
+        || predecessor.issuer_epoch != successor.issuer_epoch
+        || predecessor.verifier_set_digest != successor.verifier_set_digest
+    {
+        return Err(invalid(
+            "credential.acknowledgement_update",
+            "must change only control revision and proof digest",
+        ));
+    }
+    Ok(())
+}
+
+fn same_ring_state(left: &CredentialControl, right: &CredentialControl) -> bool {
+    left.current == right.current
+        && left.next == right.next
+        && left.previous == right.previous
+        && left.previous_last_issue_unix_seconds == right.previous_last_issue_unix_seconds
+}
+
+fn is_sorted_subset(subset: &[bytes::Bytes], superset: &[bytes::Bytes]) -> bool {
+    let mut candidate = superset.iter();
+    subset
+        .iter()
+        .all(|expected| candidate.by_ref().any(|actual| actual == expected))
+}
+
+fn checked_increment(value: u64) -> Result<u64, ControlValidationError> {
+    value
+        .checked_add(1)
+        .ok_or_else(|| invalid("credential.issuer_epoch", "cannot wrap"))
+}
 
 pub fn validate_repo_control(control: &RepoControl) -> Result<(), ControlValidationError> {
     if control.schema_version != REPO_CONTROL_SCHEMA_VERSION {
@@ -870,7 +1247,7 @@ fn invalid(field: &'static str, reason: &'static str) -> ControlValidationError 
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ControlValidationError {
-    #[error("invalid V2 repository control field {field}: {reason}")]
+    #[error("invalid V2 control field {field}: {reason}")]
     Invalid {
         field: &'static str,
         reason: &'static str,
