@@ -17,7 +17,8 @@ mod validate;
 
 pub use codec::{
     ControlCodecError, decode_credential_control, decode_repo_control, encode_credential_control,
-    encode_repo_control, lint_v2_descriptors, preflight_credential_control, preflight_repo_control,
+    encode_credential_control_projection, encode_repo_control, lint_v2_descriptors,
+    preflight_credential_control, preflight_repo_control,
 };
 pub use validate::{
     ControlValidationError, CredentialTransitionKind, validate_credential_control,

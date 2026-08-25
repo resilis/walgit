@@ -47,6 +47,21 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   read or written by the V1 registry, WAL, server, CLI, bundle, policy, or
   coordination paths. These dormant types and APIs do not create a production
   V2 object, activate a mutation path, or create a legacy-adoption migration.
+- `walgit-identity`: dormant pure V2 credential verification. It depends only
+  on `walgit-proto` plus bounded hash, Ed25519, and error utilities. Its strict
+  cursor rejects unknown, duplicate, reordered, non-minimal, indefinite,
+  tagged, text-valued, floating, simple, trailing, and oversized CBOR before
+  allocation. Envelope-specific APIs accept only attached untagged
+  `COSE_Sign1`; bind exact rooted ring objects and the full slot/state/deny
+  matrix; authenticate create intents and capabilities; and verify the exact
+  verifier-set, acknowledgement-set, projection, predecessor/bootstrap, and
+  transition-proof chain through one all-or-nothing result. Data-key validity
+  uses signed `issued_at` without key skew. Envelope time uses explicit `now`
+  with the frozen 30-second skew and checked `expiry - issued_at` lifetime.
+  Ring and verifier-set IDs require UUIDv7 form but no timestamp proximity.
+  Data and acknowledgement kids are opaque; only the root kid is derived.
+  `AuthenticatedCapability` is not repository authorization. No V1, server,
+  store, configuration, CLI, route, or runtime path calls this crate.
 - `walgit-store`: `CasToken` is the opaque conditional-write identity. `ObjectVersionId` is the distinct
   immutable history identity carried by `ObjectMeta::object_version_id`
   and `GetOptions::object_version_id`. `ObjectStore` provides exact-version GET/HEAD/delete and bounded opaque

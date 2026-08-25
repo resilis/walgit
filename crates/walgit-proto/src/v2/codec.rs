@@ -65,6 +65,30 @@ pub fn encode_credential_control(
     Ok(bytes)
 }
 
+/// Encode the signed transition projection: validated fields 1 through 9,
+/// with field 10 absent so the transition proof cannot refer to its own digest.
+///
+/// The input must first be a complete, valid control. This deliberately does
+/// not provide a relaxed encoder for partially constructed controls.
+pub fn encode_credential_control_projection(
+    control: &CredentialControl,
+    prefix: &DeploymentPrefix,
+) -> Result<Vec<u8>, ControlCodecError> {
+    validate_credential_control(control, prefix)?;
+    let mut projection = control.clone();
+    projection.acknowledgement_proof_digest.clear();
+    if projection.encoded_len() > MAX_CREDENTIAL_CONTROL_BYTES {
+        return Err(ControlCodecError::MessageTooLarge {
+            message: "walgit.v2.CredentialControl projection".to_string(),
+            actual: projection.encoded_len(),
+            maximum: MAX_CREDENTIAL_CONTROL_BYTES,
+        });
+    }
+    let bytes = projection.encode_to_vec();
+    preflight_credential_control(&bytes)?;
+    Ok(bytes)
+}
+
 pub fn decode_credential_control(
     bytes: &[u8],
     prefix: &DeploymentPrefix,
