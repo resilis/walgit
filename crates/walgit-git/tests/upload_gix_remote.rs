@@ -183,11 +183,13 @@ async fn diff_sized_fetch_without_base_pack_data() {
     // Fetch: want c3, have base tip.
     let want = gix_hash::ObjectId::from_hex(c3.as_bytes()).unwrap();
     let mut out = Vec::new();
+    const PACK_PROGRESS: &str = "remote base read from object storage";
     let stats = served
-        .upload_pack_gix_with(
+        .upload_pack_gix_with_pack_progress(
             req(vec![want], vec![base_tip_oid], true),
             &mut out,
             Some(&*faulter),
+            Some(PACK_PROGRESS),
         )
         .await
         .unwrap();
@@ -250,6 +252,7 @@ async fn diff_sized_fetch_without_base_pack_data() {
     let lines = cm::parse_pkt_lines(&out);
     let mut saw_packfile_framed = false;
     let mut saw_progress = false;
+    let mut saw_pack_progress = false;
     for l in &lines {
         if let cm::PktLine::Data(b) = l {
             if b.first() == Some(&1) && b[1..].starts_with(b"packfile\n") {
@@ -257,6 +260,13 @@ async fn diff_sized_fetch_without_base_pack_data() {
             }
             if b.first() == Some(&2) {
                 saw_progress = true;
+                if b[1..].strip_suffix(b"\n") == Some(PACK_PROGRESS.as_bytes()) {
+                    assert!(
+                        saw_packfile_framed,
+                        "client-visible pack progress must follow the packfile section header"
+                    );
+                    saw_pack_progress = true;
+                }
             }
             assert!(
                 !b.starts_with(b"packfile\n"),
@@ -264,7 +274,7 @@ async fn diff_sized_fetch_without_base_pack_data() {
             );
         }
     }
-    assert!(saw_packfile_framed && saw_progress);
+    assert!(saw_packfile_framed && saw_progress && saw_pack_progress);
 
     // CI's clone: zero haves, depth 1, blob:none — the whole tree of c3 is
     // read from the base one level per round, no blobs, one commit.
