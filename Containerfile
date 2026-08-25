@@ -14,8 +14,8 @@
 # bucket is the only durable state. `nix build .#image` produces the same thing from flake.nix.
 
 # ---- 1. web UI (embedded into the binary at compile time) ---------------------------
-FROM docker.io/library/node:24-bookworm-slim AS web
-RUN corepack enable && corepack prepare pnpm@10 --activate
+FROM docker.io/library/node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS web
+RUN corepack enable && corepack prepare pnpm@10.10.0 --activate
 WORKDIR /src/web
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
@@ -23,7 +23,7 @@ COPY web/ ./
 RUN pnpm run build && test -f dist/index.html && test -f dist/repos.js
 
 # ---- 2. rust build ------------------------------------------------------------------------
-FROM docker.io/library/rust:1.97-bookworm AS build
+FROM docker.io/library/rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config cmake perl python3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ---- 3. runtime -----------------------------------------------------------------------------
 # trixie ships git 2.47+: walgit wants >= 2.47 on the server (pack.writeReverseIndex, bundle-uri,
 # `index-pack --rev-index`); clients need >= 2.46.
-FROM docker.io/library/debian:trixie-slim
+FROM docker.io/library/debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 RUN apt-get update && apt-get install -y --no-install-recommends git git-lfs ca-certificates tini curl \
     && rm -rf /var/lib/apt/lists/* \
     && git --version

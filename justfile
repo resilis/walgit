@@ -73,29 +73,37 @@ dev-store-stop:
 # Never run `cargo test --workspace --no-fail-fast` interactively: a single
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
 test:
-    timeout 300 cargo test --workspace --lib --bins
-    timeout 300 cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
-    timeout 300 cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+    timeout 300 cargo test --locked --workspace --lib --bins
+    timeout 300 cargo test --locked -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
+    timeout 300 cargo test --locked -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
-    timeout 600 cargo test -p walgit-server --test e2e {{ARGS}}
+    timeout 600 cargo test --locked -p walgit-server --test e2e {{ARGS}}
 
 # Zero rustc warnings, workspace-wide, all targets (tests, benches, examples).
 # Done by grepping the normal build instead of RUSTFLAGS=-D warnings, which would
 # change every crate's fingerprint and force full rebuilds in every shell.
 warnings:
     #!/usr/bin/env bash
-    set -uo pipefail
-    out="$(timeout 900 cargo build --workspace --all-targets 2>&1)"
-    if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
-        printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
+    set -euo pipefail
+    warnings_output="$(mktemp)"
+    trap 'rm -f "$warnings_output"' EXIT
+    build_status=0
+    timeout 900 cargo build --locked --workspace --all-targets >"$warnings_output" 2>&1 || build_status=$?
+    if (( build_status != 0 )); then
+        cat "$warnings_output" || true
+        exit "$build_status"
+    fi
+    if grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)' "$warnings_output"; then
+        grep -E '^warning' -A4 "$warnings_output" | grep -vE '^warning: `walgit-[a-z]+`' || true
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
     fi
     echo "no rustc warnings"
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings test e2e
+ci:
+    bash scripts/ci.sh
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
@@ -103,23 +111,44 @@ test-slow:
 
 # Store contract against a real GCS bucket (unique prefix per run, cleaned up).
 test-gcs bucket:
-    WALGIT_TEST_GCS_BUCKET={{bucket}} cargo test -p walgit-store --features gcs --test contract -- gcs_contract --nocapture
+    WALGIT_TEST_GCS_BUCKET={{bucket}} cargo test --locked -p walgit-store --features gcs --test contract -- gcs_contract --nocapture
 
 # Run walgit-store contract tests against memory only.
 store-test:
-    cargo test -p walgit-store --test contract -- memory_contract
+    cargo test --locked -p walgit-store --test contract -- memory_contract
 
 # Run walgit-store contract tests against rustfs (requires `just dev-store` first).
 # Store contract against local rustfs (run `just dev-store` first).
 test-s3: store-test-s3
 
 store-test-s3:
-    WALGIT_TEST_S3_ENDPOINT=http://127.0.0.1:9000 \
-    WALGIT_TEST_BUCKET=walgit-test \
-    AWS_ACCESS_KEY_ID=walgit-dev \
-    AWS_SECRET_ACCESS_KEY=walgit-dev-secret \
-    cargo test -p walgit-store --test contract -- --nocapture
+    WALGIT_TEST_S3_ENDPOINT="${WALGIT_TEST_S3_ENDPOINT:-http://127.0.0.1:9000}" \
+    WALGIT_TEST_S3_REGION="${WALGIT_TEST_S3_REGION:-us-east-1}" \
+    WALGIT_TEST_S3_BUCKET="${WALGIT_TEST_S3_BUCKET:-walgit-test}" \
+    WALGIT_TEST_S3_FORCE_PATH_STYLE="${WALGIT_TEST_S3_FORCE_PATH_STYLE:-true}" \
+    WALGIT_TEST_S3_PREFIX="${WALGIT_TEST_S3_PREFIX:-contract-test}" \
+    WALGIT_TEST_S3_CREDENTIAL_MODE="${WALGIT_TEST_S3_CREDENTIAL_MODE:-default}" \
+    WALGIT_TEST_S3_ACCESS_KEY_ENV="${WALGIT_TEST_S3_ACCESS_KEY_ENV:-}" \
+    WALGIT_TEST_S3_SECRET_KEY_ENV="${WALGIT_TEST_S3_SECRET_KEY_ENV:-}" \
+    WALGIT_TEST_S3_SESSION_TOKEN_ENV="${WALGIT_TEST_S3_SESSION_TOKEN_ENV:-}" \
+    AWS_ACCESS_KEY_ID="walgit-dev" \
+    AWS_SECRET_ACCESS_KEY="walgit-dev-secret" \
+    cargo test --locked -p walgit-store --test contract -- s3_contract --nocapture
+
+# Run the same contract against the exact selected provider. Credentials are
+# inherited by the AWS SDK default chain; this recipe accepts no interpolated
+# shell arguments and never installs local keys.
+test-s3-provider:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${WALGIT_TEST_S3_ENDPOINT:?set WALGIT_TEST_S3_ENDPOINT}"
+    : "${WALGIT_TEST_S3_REGION:?set WALGIT_TEST_S3_REGION}"
+    : "${WALGIT_TEST_S3_BUCKET:?set WALGIT_TEST_S3_BUCKET}"
+    : "${WALGIT_TEST_S3_FORCE_PATH_STYLE:?set WALGIT_TEST_S3_FORCE_PATH_STYLE to true or false}"
+    export WALGIT_TEST_S3_PREFIX="${WALGIT_TEST_S3_PREFIX:-contract-test}"
+    export WALGIT_TEST_S3_CREDENTIAL_MODE="${WALGIT_TEST_S3_CREDENTIAL_MODE:-default}"
+    cargo test --locked -p walgit-store --test contract -- s3_contract --nocapture
 
 # Run all walgit-store tests (memory + S3 if env set).
 store-test-all:
-    cargo test -p walgit-store
+    cargo test --locked -p walgit-store

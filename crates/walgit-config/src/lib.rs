@@ -263,8 +263,15 @@ fn default_bulk_concurrency() -> usize {
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
+    /// Custom environment-variable name for an explicit access key. Empty
+    /// leaves credentials under the refreshable AWS SDK default chain.
     pub access_key_env: String,
+    /// Custom environment-variable name for an explicit secret key. This and
+    /// `access_key_env` must both be empty or both resolve to non-empty values.
     pub secret_key_env: String,
+    /// Optional custom environment-variable name for the session token that
+    /// accompanies deliberately configured temporary explicit credentials.
+    pub session_token_env: String,
     pub force_path_style: bool,
 }
 
@@ -1069,8 +1076,9 @@ impl Default for S3Config {
         S3Config {
             endpoint: "http://127.0.0.1:9000".into(),
             region: "us-east-1".into(),
-            access_key_env: "AWS_ACCESS_KEY_ID".into(),
-            secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
+            access_key_env: String::new(),
+            secret_key_env: String::new(),
+            session_token_env: String::new(),
             force_path_style: true,
         }
     }

@@ -76,8 +76,8 @@ gix-validate = "0.11"
 google-cloud-storage = "1"
 google-cloud-gax = "1"
 google-cloud-auth = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
+aws-config = { version = "1.11.0", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
+aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
 aws-smithy-types = "1"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
@@ -101,13 +101,14 @@ async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 pin-project-lite = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 base64 = "0.22"
-jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
+aws-lc-rs = { version = "1.18.0", default-features = false, features = ["aws-lc-sys", "ring-io"] }
 libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 # TLS (in-process termination)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "logging", "ring"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
@@ -136,5 +137,20 @@ debug = "line-tables-only"
 # `package."*"` would otherwise opt-2 proc-macros and build.rs too — the
 # usual compile-time footgun, with no test-runtime payoff.
 [profile.dev.build-override]
+opt-level = 0
+debug = 0
+
+# CI checks correctness, not optimized runtime performance. Keep one small,
+# non-incremental fingerprint for compilation and every test execution.
+[profile.ci]
+inherits = "dev"
+debug = 0
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 2
+debug = 0
+
+[profile.ci.build-override]
 opt-level = 0
 debug = 0

@@ -1,0 +1,8 @@
+[advisories]
+# Temporary exception accepted 2026-08-24. aws-sdk-s3 1.143 constrains lru
+# to ^0.16.3 for its S3 Express identity cache. WalGit uses configured standard
+# S3-compatible buckets, and the upstream cache key is String, whose Drop does
+# not panic. The RUSTSEC-2026-0253 preconditions (a panicking key Drop combined
+# with catch_unwind) are absent. Remove this exception as soon as aws-sdk-s3
+# permits lru >=0.18.2.
+ignore = ["RUSTSEC-2026-0253"]

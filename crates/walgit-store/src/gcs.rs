@@ -594,12 +594,19 @@ impl GcsStore {
                 builder.send_unbuffered().await
             }
             PutBody::File(path) => {
-                let small = tokio::fs::metadata(&path)
+                let len = tokio::fs::metadata(&path)
                     .await
-                    .map(|m| m.len() <= SINGLE_SHOT_PUT_LIMIT)
-                    .unwrap_or(false);
+                    .map_err(StoreError::other)?
+                    .len();
+                let small = len <= SINGLE_SHOT_PUT_LIMIT;
                 if small {
                     let bytes = tokio::fs::read(&path).await.map_err(StoreError::other)?;
+                    if bytes.len() as u64 != len {
+                        return Err(StoreError::InvalidArgument(format!(
+                            "file length changed during upload: expected {len} bytes, read {}",
+                            bytes.len()
+                        )));
+                    }
                     let (client, _permit) = self.data_client(key, false).await;
                     let mut builder = client.write_object(
                         self.bucket_resource.clone(),
@@ -612,6 +619,9 @@ impl GcsStore {
                     let stream = crate::util::file_stream(path, None, FILE_CHUNK_SIZE);
                     let source = StoreStreamSource {
                         inner: tokio::sync::Mutex::new(stream),
+                        expected: len,
+                        supplied: 0,
+                        terminal: false,
                     };
                     let (client, _permit) = self.data_client(key, false).await;
                     let mut builder =
@@ -621,16 +631,19 @@ impl GcsStore {
                 }
             }
             PutBody::Stream { len, stream } if len <= SINGLE_SHOT_PUT_LIMIT => {
-                let bytes = crate::util::collect(stream, len as usize).await?;
+                let bytes = crate::util::collect_exact(stream, len).await?;
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
                     client.write_object(self.bucket_resource.clone(), key.to_owned(), bytes);
                 builder = apply_put_opts(builder, &opts);
                 builder.send_unbuffered().await
             }
-            PutBody::Stream { stream, .. } => {
+            PutBody::Stream { len, stream } => {
                 let source = StoreStreamSource {
                     inner: tokio::sync::Mutex::new(stream),
+                    expected: len,
+                    supplied: 0,
+                    terminal: false,
                 };
                 let (client, _permit) = self.data_client(key, false).await;
                 let mut builder =
@@ -1099,13 +1112,48 @@ fn unfold_response(
 /// keeping async access to the inner stream.
 struct StoreStreamSource {
     inner: tokio::sync::Mutex<ByteStream>,
+    expected: u64,
+    supplied: u64,
+    terminal: bool,
 }
 
 impl StreamingSource for StoreStreamSource {
     type Error = StoreError;
     async fn next(&mut self) -> Option<std::result::Result<Bytes, Self::Error>> {
+        if self.terminal {
+            return None;
+        }
         let mut guard = self.inner.lock().await;
-        guard.next().await
+        match guard.next().await {
+            Some(Ok(bytes)) => {
+                let next = self.supplied.saturating_add(bytes.len() as u64);
+                if next > self.expected {
+                    self.terminal = true;
+                    Some(Err(StoreError::InvalidArgument(format!(
+                        "declared body length is {} bytes but the body supplied more data",
+                        self.expected
+                    ))))
+                } else {
+                    self.supplied = next;
+                    Some(Ok(bytes))
+                }
+            }
+            Some(Err(error)) => {
+                self.terminal = true;
+                Some(Err(error))
+            }
+            None if self.supplied != self.expected => {
+                self.terminal = true;
+                Some(Err(StoreError::InvalidArgument(format!(
+                    "declared body length is {} bytes but the body ended after {} bytes",
+                    self.expected, self.supplied
+                ))))
+            }
+            None => {
+                self.terminal = true;
+                None
+            }
+        }
     }
 }
 

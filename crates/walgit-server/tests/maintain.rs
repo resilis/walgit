@@ -813,20 +813,20 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     std::fs::write(src.path().join("f.txt"), "one\n")?;
     git_in(src.path(), &["add", "."])?;
     git_in(src.path(), &["commit", "-q", "-m", "one"])?;
-    // Publish the first state 31 hours in the past so that 30 closed hourly slots exist.
+    // Publish the first state before establishing the current weekly base.
     let id = walgit_git::RepoId::new("o", "r")?;
     let h = step!("open", server.state.registry.open(&id))?;
     let now = std::time::SystemTime::now();
     let c1 = git_in(src.path(), &["rev-parse", "HEAD"])?
         .trim()
         .to_string();
-    // Push normally first (objects), then time-shift the ref history with an explicit created_at.
+    // Push the objects and sync the ref history before selecting the weekly slot.
     git(
         &["push", "-q", &server.repo_url("o", "r"), "main"],
         src.path(),
     )?;
     step!("sync", h.sync())?;
-    // A weekly cut at the Sunday before yesterday (earliest state), via the op.
+    // Build the current weekly cut via the op so the plan and pass use the same base.
     let weekly = server
         .state
         .cfg
@@ -836,11 +836,7 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         .find(|s| s.name == "weekly")
         .unwrap()
         .clone();
-    let sunday = walgit_bundle::slots::last_slot_at_or_before(
-        &weekly,
-        now - std::time::Duration::from_secs(36 * 3600),
-    )?
-    .unwrap();
+    let sunday = walgit_bundle::slots::last_slot_at_or_before(&weekly, now)?.unwrap();
     let mut params = std::collections::HashMap::new();
     params.insert("strategy".to_string(), "weekly".to_string());
     params.insert("slot".to_string(), sunday.to_string());

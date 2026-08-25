@@ -1,6 +1,7 @@
 {
   "name": "walgit-web",
   "private": true,
+  "packageManager": "pnpm@10.10.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

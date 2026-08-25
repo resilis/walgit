@@ -41,8 +41,54 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
     test_delete(&store, &p("del")).await;
     test_list(&store, &p("list")).await;
     test_large_streamed_roundtrip(&store, &p("large")).await;
+    test_declared_length_mismatch(&store, &p("declared-length")).await;
     test_multipart_path(&store, &p("multi")).await;
     test_compose(&store, &p("compose")).await;
+}
+
+/// A backend must never complete a shortened object or ignore bytes beyond a
+/// declared stream length.
+async fn test_declared_length_mismatch(store: &DynStore, key: &str) {
+    let _ = store.delete(key, None).await;
+    let short = store
+        .put(
+            key,
+            PutBody::Stream {
+                len: 4,
+                stream: walgit_store::util::once(Bytes::from_static(b"abc")),
+            },
+            PutOptions::from(PutMode::Create),
+        )
+        .await;
+    assert!(short.is_err(), "early EOF must fail");
+    assert!(
+        store
+            .head(key)
+            .await
+            .expect("head after early EOF")
+            .is_none(),
+        "early EOF must not create a shortened object"
+    );
+
+    let long = store
+        .put(
+            key,
+            PutBody::Stream {
+                len: 3,
+                stream: walgit_store::util::once(Bytes::from_static(b"abcd")),
+            },
+            PutOptions::from(PutMode::Create),
+        )
+        .await;
+    assert!(long.is_err(), "bytes beyond the declared length must fail");
+    assert!(
+        store
+            .head(key)
+            .await
+            .expect("head after long body")
+            .is_none(),
+        "a body longer than declared must not create an object"
+    );
 }
 
 /// `compose`: a small header object followed by a body larger than S3's 5 MiB minimum
@@ -656,6 +702,139 @@ async fn test_multipart_path(store: &DynStore, key: &str) {
     let _ = store.delete(key, None).await;
 }
 
+#[cfg(feature = "s3")]
+async fn test_s3_multipart_failures_and_conditions(store: &DynStore, prefix: &str) {
+    let key = |suffix: &str| format!("{prefix}/multipart-{suffix}");
+    let mib = 1024 * 1024usize;
+
+    let short_key = key("short");
+    let short = store
+        .put(
+            &short_key,
+            PutBody::Stream {
+                len: (6 * mib) as u64,
+                stream: walgit_store::util::once(Bytes::from(vec![b's'; 5 * mib])),
+            },
+            PutOptions::from(PutMode::Create),
+        )
+        .await;
+    assert!(short.is_err(), "multipart early EOF must fail");
+    assert!(
+        store.head(&short_key).await.expect("head short").is_none(),
+        "multipart early EOF must not publish an object"
+    );
+
+    let extra_key = key("extra");
+    let extra = store
+        .put(
+            &extra_key,
+            PutBody::Stream {
+                len: (6 * mib) as u64,
+                stream: walgit_store::util::once(Bytes::from(vec![b'e'; 6 * mib + 1])),
+            },
+            PutOptions::from(PutMode::Create),
+        )
+        .await;
+    assert!(extra.is_err(), "multipart trailing data must fail");
+    assert!(
+        store.head(&extra_key).await.expect("head extra").is_none(),
+        "multipart trailing data must not publish an object"
+    );
+
+    let update_key = key("update");
+    let first = store
+        .put(
+            &update_key,
+            PutBody::Bytes(Bytes::from(vec![0x11; 6 * mib])),
+            PutOptions::from(PutMode::Overwrite),
+        )
+        .await
+        .expect("initial multipart put");
+    let second = store
+        .put(
+            &update_key,
+            PutBody::Bytes(Bytes::from(vec![0x22; 6 * mib])),
+            PutOptions::from(PutMode::Update(first.version.clone())),
+        )
+        .await
+        .expect("multipart update");
+    assert_ne!(first.version, second.version);
+    let stale = store
+        .put(
+            &update_key,
+            PutBody::Bytes(Bytes::from(vec![0x33; 6 * mib])),
+            PutOptions::from(PutMode::Update(first.version)),
+        )
+        .await
+        .expect_err("stale multipart update must fail");
+    assert!(stale.is_precondition_failed());
+
+    let create_key = key("concurrent-create");
+    let left = store.put(
+        &create_key,
+        PutBody::Bytes(Bytes::from(vec![0x44; 6 * mib])),
+        PutOptions::from(PutMode::Create),
+    );
+    let right = store.put(
+        &create_key,
+        PutBody::Bytes(Bytes::from(vec![0x55; 6 * mib])),
+        PutOptions::from(PutMode::Create),
+    );
+    let (left, right) = tokio::join!(left, right);
+    assert_eq!(left.is_ok() as u8 + right.is_ok() as u8, 1);
+    let loser = if let Err(error) = left {
+        error
+    } else {
+        right.expect_err("one concurrent create must lose")
+    };
+    assert!(loser.is_precondition_failed());
+
+    store
+        .delete(&update_key, None)
+        .await
+        .expect("delete update key");
+    store
+        .delete(&create_key, None)
+        .await
+        .expect("delete create key");
+}
+
+#[cfg(feature = "s3")]
+async fn s3_test_client(cfg: &walgit_config::StoreConfig) -> aws_sdk_s3::Client {
+    use aws_sdk_s3::config::{Credentials, Region};
+
+    let region = Region::new(cfg.s3.region.clone());
+    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(region.clone())
+        .load()
+        .await;
+    let mut builder = aws_sdk_s3::config::Builder::from(&shared)
+        .region(region)
+        .force_path_style(cfg.s3.force_path_style)
+        .behavior_version_latest();
+    if !cfg.s3.access_key_env.is_empty() {
+        let access = std::env::var(&cfg.s3.access_key_env)
+            .expect("configured S3 contract access-key variable");
+        let secret = std::env::var(&cfg.s3.secret_key_env)
+            .expect("configured S3 contract secret-key variable");
+        let token = (!cfg.s3.session_token_env.is_empty()).then(|| {
+            std::env::var(&cfg.s3.session_token_env)
+                .expect("configured S3 contract session-token variable")
+        });
+        builder = builder.credentials_provider(Credentials::new(
+            access,
+            secret,
+            token,
+            None,
+            "walgit-contract-explicit-env",
+        ));
+    }
+    if !cfg.s3.endpoint.is_empty() {
+        builder = builder.endpoint_url(&cfg.s3.endpoint);
+    }
+    aws_sdk_s3::Client::from_conf(builder.build())
+}
+
 // ---- test wrappers -----------------------------------------------------
 
 #[tokio::test]
@@ -674,14 +853,32 @@ async fn s3_contract() {
             return;
         }
     };
-    let bucket = std::env::var("WALGIT_TEST_BUCKET").unwrap_or_else(|_| "walgit-test".into());
-    let _access_key =
-        std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID required for S3 tests");
-    let _secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .expect("AWS_SECRET_ACCESS_KEY required for S3 tests");
+    let bucket = std::env::var("WALGIT_TEST_S3_BUCKET").unwrap_or_else(|_| "walgit-test".into());
+    let region = std::env::var("WALGIT_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+    let force_path_style = std::env::var("WALGIT_TEST_S3_FORCE_PATH_STYLE")
+        .map(|value| value.parse::<bool>().expect("true or false"))
+        .unwrap_or(true);
+    let credential_mode =
+        std::env::var("WALGIT_TEST_S3_CREDENTIAL_MODE").unwrap_or_else(|_| "default".into());
+    let (access_key_env, secret_key_env, session_token_env) = match credential_mode.as_str() {
+        "default" => (String::new(), String::new(), String::new()),
+        "explicit" => (
+            std::env::var("WALGIT_TEST_S3_ACCESS_KEY_ENV")
+                .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".into()),
+            std::env::var("WALGIT_TEST_S3_SECRET_KEY_ENV")
+                .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".into()),
+            std::env::var("WALGIT_TEST_S3_SESSION_TOKEN_ENV").unwrap_or_default(),
+        ),
+        other => panic!("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit, got {other}"),
+    };
 
     // Unique prefix per run.
-    let prefix = format!("contract-test-{}", uuid::Uuid::new_v4().simple());
+    let prefix_base =
+        std::env::var("WALGIT_TEST_S3_PREFIX").unwrap_or_else(|_| "contract-test".into());
+    let prefix = format!("{prefix_base}-{}", uuid::Uuid::new_v4().simple());
+    eprintln!(
+        "[s3_contract] endpoint={endpoint} region={region} path_style={force_path_style} bucket={bucket} prefix={prefix} credentials={credential_mode}"
+    );
 
     let cfg = walgit_config::StoreConfig {
         backend: walgit_config::StoreBackend::S3,
@@ -689,15 +886,18 @@ async fn s3_contract() {
         prefix: prefix.clone(),
         s3: walgit_config::S3Config {
             endpoint: endpoint.clone(),
-            region: "us-east-1".into(),
-            access_key_env: "AWS_ACCESS_KEY_ID".into(),
-            secret_key_env: "AWS_SECRET_ACCESS_KEY".into(),
-            force_path_style: true,
+            region,
+            access_key_env,
+            secret_key_env,
+            session_token_env,
+            force_path_style,
         },
         multipart_threshold: bytesize::ByteSize::mib(5),
         multipart_part_size: bytesize::ByteSize::mib(5),
         ..Default::default()
     };
+
+    let raw_client = s3_test_client(&cfg).await;
 
     let store = walgit_store::s3::S3Store::new(&cfg)
         .await
@@ -705,6 +905,7 @@ async fn s3_contract() {
     let store: DynStore = Arc::new(store);
 
     run_contract(store.clone(), &prefix).await;
+    test_s3_multipart_failures_and_conditions(&store, &prefix).await;
 
     // Cleanup: delete all objects under the prefix.
     let to_delete: Vec<_> = futures::stream::iter(
@@ -716,8 +917,27 @@ async fn s3_contract() {
     .collect::<Vec<_>>()
     .await;
     for m in to_delete {
-        let _ = store.delete(&m.key, None).await;
+        store.delete(&m.key, None).await.expect("contract cleanup");
     }
+    let leftovers = walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
+        .collect::<Vec<_>>()
+        .await;
+    assert!(
+        leftovers.is_empty(),
+        "contract cleanup left objects: {leftovers:?}"
+    );
+
+    let incomplete = raw_client
+        .list_multipart_uploads()
+        .bucket(&bucket)
+        .prefix(format!("{prefix}/"))
+        .send()
+        .await
+        .expect("list incomplete multipart uploads");
+    assert!(
+        incomplete.uploads().is_empty(),
+        "contract cleanup left incomplete multipart uploads under the disposable prefix"
+    );
 }
 
 #[cfg(feature = "gcs")]

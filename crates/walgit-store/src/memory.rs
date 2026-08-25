@@ -63,7 +63,7 @@ impl MemoryStore {
 async fn body_bytes(body: PutBody) -> Result<Bytes> {
     Ok(match body {
         PutBody::Bytes(b) => b,
-        PutBody::Stream { len, stream } => util::collect(stream, len as usize).await?,
+        PutBody::Stream { len, stream } => util::collect_exact(stream, len).await?,
         PutBody::File(p) => Bytes::from(tokio::fs::read(&p).await.map_err(StoreError::other)?),
     })
 }
