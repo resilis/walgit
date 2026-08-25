@@ -59,6 +59,11 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | S3 conditional delete | 1 conditional DELETE; after a 412 only, 1 HEAD distinguishes absent from moved | 1 happy path; **one fewer HEAD** | `s3.rs::delete` |
 | S3 exact-version HEAD | 1 HEAD; an exact delete-marker 405 with complete AWS headers returns directly, while an ambiguous RustFS 405 pages version history until the named key/version is proved | 1 normal path; listing is bounded to 1,000 pages on the delete-marker failure path only | `s3.rs::head_version` |
 
+S3 lane selection and bulk admission are local. Independent control/bulk
+transports add no provider request or sequential round trip to these budgets.
+Multipart and compose acquire one bulk permit for each provider call; a ranged
+GET retains one permit for its returned body lifetime.
+
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
 counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an
 extra unconditional manifest GET (3 requests, 3 sequential rounds); it now applies the manifest it already

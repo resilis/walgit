@@ -387,10 +387,23 @@ numeric status, and an allowlisted service code. Raw SDK/provider messages,
 request URLs, credential values, bucket names, prefixes, and unknown service
 codes are not included in errors or provider-contract banners.
 
+S3 owns one control AWS SDK transport and presigned-GET HTTP pool plus
+`store.s3.bulk_clients` independent bulk SDK transports and HTTP pools. The
+closed shared GCS/S3 data classifier admits only known V1 and V2 control
+encodings to the control data lane; malformed, unknown, future, or
+wrong-prefix data keys and every ranged read use bulk. Multipart and compose
+byte-moving requests always use bulk. Metadata requests and enumeration remain
+on the control SDK transport. `store.s3.bulk_clients` is bounded to `1..=16`,
+and `store.s3.bulk_concurrency` bounds in-flight bulk provider requests in
+`1..=256`; streamed GET bodies retain their permit until EOF, error,
+cancellation, or drop. A closed or saturated bulk lane never falls back to
+control. Every SDK transport is constructed with the same resolved credential
+provider and closed endpoint settings but with a distinct connection pool.
+
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for S3 when `WALGIT_TEST_S3_ENDPOINT` is set (endpoint, region, bucket, prefix, addressing mode,
 and closed default-chain/explicit-env credentials are parameterized with `WALGIT_TEST_S3_*`; the exact configured
-deployment prefix is validated and every run writes only below a unique child key),
+deployment prefix is validated and every run writes only below a unique repository key),
 for gcs when `WALGIT_TEST_GCS_BUCKET` set.
 
 S3 large writes and compose use multipart completion as the destination's

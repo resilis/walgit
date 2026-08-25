@@ -25,6 +25,7 @@ pub mod gcs;
 pub mod memory;
 #[cfg(feature = "s3")]
 pub mod s3;
+mod traffic;
 pub mod util;
 pub mod v2_capacity;
 pub mod v2_control;
@@ -872,7 +873,11 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
         walgit_config::StoreBackend::S3 => {
             #[cfg(feature = "s3")]
             {
-                Arc::new(s3::S3Store::new(&cfg.store).await?)
+                Arc::new(
+                    s3::S3Store::new(&cfg.store)
+                        .await?
+                        .with_permit_wait_warn(cfg.telemetry.lock_wait_warn),
+                )
             }
             #[cfg(not(feature = "s3"))]
             {

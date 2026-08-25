@@ -1239,9 +1239,9 @@ async fn s3_contract() {
     // valid instead of being lengthened by the UUID.
     let run_child = format!("contract-run-{}", uuid::Uuid::new_v4().simple());
     let prefix = if configured_prefix.is_empty() {
-        run_child
+        format!("repos/{run_child}/contract")
     } else {
-        format!("{configured_prefix}/{run_child}")
+        format!("{configured_prefix}/repos/{run_child}/contract")
     };
     eprintln!(
         "[s3_contract] provider parameters loaded: path_style={force_path_style} credentials={credential_mode_label}"
@@ -1259,6 +1259,8 @@ async fn s3_contract() {
             secret_key_env,
             session_token_env,
             force_path_style,
+            bulk_clients: 2,
+            bulk_concurrency: 1,
         },
         multipart_threshold: bytesize::ByteSize::mib(5),
         multipart_part_size: bytesize::ByteSize::mib(5),
@@ -1271,6 +1273,8 @@ async fn s3_contract() {
         .await
         .expect("S3Store::new");
     let store: DynStore = Arc::new(store);
+
+    test_s3_control_lane_isolation(&store, &prefix).await;
 
     run_contract(store.clone(), &prefix).await;
     test_s3_multipart_failures_and_conditions(&store, &prefix).await;
@@ -1328,6 +1332,66 @@ async fn s3_contract() {
         incomplete.uploads().is_empty(),
         "contract cleanup left incomplete multipart uploads under the disposable prefix"
     );
+}
+
+#[cfg(feature = "s3")]
+async fn test_s3_control_lane_isolation(store: &DynStore, repo_root: &str) {
+    let control_key = format!("{repo_root}/manifest.pb");
+    let bulk_key = format!("{repo_root}/wal/lane-probe.pack");
+    put_bytes(
+        store,
+        &control_key,
+        Bytes::from_static(b"control"),
+        PutMode::Create,
+    )
+    .await;
+    put_bytes(
+        store,
+        &bulk_key,
+        Bytes::from_static(b"bulk"),
+        PutMode::Create,
+    )
+    .await;
+
+    let held = store
+        .get(&bulk_key, GetOptions::default())
+        .await
+        .expect("first bulk GET");
+    let held_body = match held {
+        GetResult::Object { body, .. } => body,
+        GetResult::NotModified { .. } => panic!("unconditional bulk GET was not modified"),
+    };
+
+    let waiting_store = store.clone();
+    let waiting_key = bulk_key.clone();
+    let mut waiting =
+        tokio::spawn(async move { waiting_store.get(&waiting_key, GetOptions::default()).await });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err(),
+        "the second bulk GET must remain queued while the first body is open"
+    );
+
+    let control = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.get(&control_key, GetOptions::default()),
+    )
+    .await
+    .expect("control GET must not wait behind the held bulk body")
+    .expect("control GET");
+    let (_, bytes) = collect_body(control).await;
+    assert_eq!(bytes, Bytes::from_static(b"control"));
+
+    drop(held_body);
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("queued bulk GET resumes after body drop")
+        .expect("queued bulk task")
+        .expect("second bulk GET");
+    let (_, bytes) = collect_body(resumed).await;
+    assert_eq!(bytes, Bytes::from_static(b"bulk"));
 }
 
 #[test]

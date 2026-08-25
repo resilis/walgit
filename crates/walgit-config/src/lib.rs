@@ -281,6 +281,14 @@ pub struct S3Config {
     /// accompanies deliberately configured temporary explicit credentials.
     pub session_token_env: String,
     pub force_path_style: bool,
+    /// Independent AWS SDK and HTTP connection pools for pack, bundle, LFS,
+    /// temporary raw-payload, and ranged traffic.
+    #[serde(default = "default_bulk_clients")]
+    pub bulk_clients: usize,
+    /// Per-process cap for bulk operations. Control traffic never acquires
+    /// these permits.
+    #[serde(default = "default_bulk_concurrency")]
+    pub bulk_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1229,6 +1237,8 @@ impl Default for S3Config {
             secret_key_env: String::new(),
             session_token_env: String::new(),
             force_path_style: true,
+            bulk_clients: 4,
+            bulk_concurrency: 32,
         }
     }
 }
@@ -1992,6 +2002,14 @@ impl StoreConfig {
 
     fn validate_s3_credential_selector(&self) -> Result<()> {
         anyhow::ensure!(
+            (1..=16).contains(&self.s3.bulk_clients),
+            "store.s3.bulk_clients must be in 1..=16"
+        );
+        anyhow::ensure!(
+            (1..=256).contains(&self.s3.bulk_concurrency),
+            "store.s3.bulk_concurrency must be in 1..=256"
+        );
+        anyhow::ensure!(
             !self.s3.region.is_empty()
                 && self.s3.region.len() <= 64
                 && self
@@ -2306,6 +2324,21 @@ mod tests {
         );
         cfg.store.multipart_part_size = ByteSize::mib(32);
         cfg.validate().unwrap();
+
+        for bulk_clients in [0, 17] {
+            cfg.store.s3.bulk_clients = bulk_clients;
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.s3.bulk_clients"), "{error}");
+        }
+        cfg.store.s3.bulk_clients = 4;
+
+        for bulk_concurrency in [0, 257] {
+            cfg.store.s3.bulk_concurrency = bulk_concurrency;
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.s3.bulk_concurrency"), "{error}");
+        }
+        cfg.store.s3.bulk_concurrency = 32;
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -2328,6 +2361,14 @@ mod tests {
                     "WALGIT__STORE__S3__ENDPOINT".to_string(),
                     "http://rustfs:9000".to_string(),
                 ),
+                (
+                    "WALGIT__STORE__S3__BULK_CLIENTS".to_string(),
+                    "6".to_string(),
+                ),
+                (
+                    "WALGIT__STORE__S3__BULK_CONCURRENCY".to_string(),
+                    "24".to_string(),
+                ),
                 ("WALGIT__WAL__MAX_BATCH".to_string(), "7".to_string()),
                 ("PORT".to_string(), "9090".to_string()),
             ]
@@ -2336,6 +2377,8 @@ mod tests {
         .unwrap();
         assert_eq!(c.store.backend, StoreBackend::S3);
         assert_eq!(c.store.s3.endpoint, "http://rustfs:9000");
+        assert_eq!(c.store.s3.bulk_clients, 6);
+        assert_eq!(c.store.s3.bulk_concurrency, 24);
         assert_eq!(c.wal.max_batch, 7);
         assert_eq!(c.server.listen.port(), 9090);
     }
@@ -3008,6 +3051,8 @@ audiences = ["walgit-cli", "https://git.example.com"]
             "https://gcs-user:gcs-pass@gcs.example/gcs-path?gcs-query#gcs-fragment".into();
         cfg.store.s3.endpoint =
             "https://s3-user:s3-pass@s3.example/s3-path?s3-query#s3-fragment".into();
+        cfg.store.s3.bulk_clients = 7;
+        cfg.store.s3.bulk_concurrency = 19;
         cfg.wal.push_broker_url = Some(
             "https://broker-user:broker-pass@broker.example/broker-path?broker-query#broker-fragment"
                 .into(),
@@ -3032,6 +3077,8 @@ audiences = ["walgit-cli", "https://git.example.com"]
         );
         assert!(text.contains("webhook_secret_configured = true"), "{text}");
         assert!(text.contains("webhook_url_configured = true"), "{text}");
+        assert!(text.contains("bulk_clients = 7"), "{text}");
+        assert!(text.contains("bulk_concurrency = 19"), "{text}");
         for diagnostic in [
             "public.example/_path_redacted_",
             "issuer.example/_path_redacted_",
