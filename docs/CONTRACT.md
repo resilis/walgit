@@ -93,7 +93,9 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   it. No V1 registry, WAL, server, CLI, route, or runtime path constructs this
   adapter yet.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
-  only `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]` in repo-scoped settings.
+  only `[bundles]`, `[maintenance]`, `[compaction]`, and `[upstream]` in repo-scoped settings. Public settings
+  serialization uses the closed `EffectiveSettingsView`; diagnostic config dumps use the separate
+  credential-safe `SafeConfigView`. Neither boundary serializes `Config` directly.
 
 ## walgit-git (owner: GitEngine)
 

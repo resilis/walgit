@@ -96,6 +96,7 @@ pub async fn receive_pack(
     let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
+            let error = crate::redact_request_url(error);
             tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis() as u64, "push broker unavailable; falling back");
             return ForwardOutcome::Fallback;
         }
@@ -115,7 +116,12 @@ pub async fn receive_pack(
     let status = response.status();
     let response_headers = response.headers().clone();
     let stream = response.bytes_stream().map(|chunk| {
-        chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        chunk.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                crate::redact_request_url(e).to_string(),
+            )
+        })
     });
     let mut builder = Response::builder().status(status);
     for name in [

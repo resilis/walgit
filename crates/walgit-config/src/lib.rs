@@ -2,6 +2,10 @@
 //! `WALGIT__SECTION__KEY=value` (double underscore = nesting), applied after
 //! the file is parsed. `PORT` (a serverless host) overrides `server.listen` port.
 
+mod views;
+
+pub use views::{EffectiveSettingsView, SafeConfigView};
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
@@ -800,8 +804,142 @@ fn default_true() -> bool {
 
 /// D24: the top-level sections a repository's settings may override.
 pub const SETTINGS_SECTIONS: &[&str] = &["bundles", "maintenance", "compaction", "upstream"];
+const SETTINGS_BUNDLES_FIELDS: &[&str] = &[
+    "enabled",
+    "strategy",
+    "min_commits",
+    "min_bytes",
+    "serve_via",
+    "signed_url_ttl",
+    "advertise",
+    "advertise_filtered",
+    "require",
+    "signed_url_for",
+    "main_only",
+    "extra_refs",
+];
+const SETTINGS_BUNDLE_STRATEGY_FIELDS: &[&str] = &[
+    "name",
+    "kind",
+    "schedule",
+    "base",
+    "keep",
+    "refs",
+    "backfill_max",
+    "min_commits",
+    "filter",
+    "chain",
+];
+const SETTINGS_MAINTENANCE_FIELDS: &[&str] = &[
+    "interval",
+    "checkpoints",
+    "max_pack_bytes",
+    "disk",
+    "host",
+    "fsck_interval",
+    "follow_interval",
+];
+const SETTINGS_COMPACTION_FIELDS: &[&str] = &[
+    "enabled",
+    "factor",
+    "trigger_packs",
+    "trigger_bytes",
+    "lease_ttl",
+    "retention_superseded",
+    "engine",
+];
+const SETTINGS_UPSTREAM_FIELDS: &[&str] = &["git", "lfs", "token_env", "follow"];
 /// D24: maximum size of a settings document.
 pub const SETTINGS_MAX_BYTES: usize = 16 * 1024;
+
+fn settings_section_fields(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "bundles" => Some(SETTINGS_BUNDLES_FIELDS),
+        "maintenance" => Some(SETTINGS_MAINTENANCE_FIELDS),
+        "compaction" => Some(SETTINGS_COMPACTION_FIELDS),
+        "upstream" => Some(SETTINGS_UPSTREAM_FIELDS),
+        _ => None,
+    }
+}
+
+fn ensure_settings_fields(table: &toml::Table, path: &str, allowed: &[&str]) -> Result<()> {
+    for key in table.keys() {
+        anyhow::ensure!(
+            allowed.contains(&key.as_str()),
+            "settings: key {path}.{key} may not be set per repository"
+        );
+    }
+    Ok(())
+}
+
+fn reject_settings_child_keys(value: &toml::Value, path: &str) -> Result<()> {
+    match value {
+        toml::Value::Table(table) => {
+            if let Some(key) = table.keys().next() {
+                anyhow::bail!("settings: key {path}.{key} may not be set per repository");
+            }
+        }
+        toml::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                reject_settings_child_keys(item, &format!("{path}[{index}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_settings_strategy(table: &toml::Table, path: &str) -> Result<()> {
+    ensure_settings_fields(table, path, SETTINGS_BUNDLE_STRATEGY_FIELDS)?;
+    for (key, value) in table {
+        reject_settings_child_keys(value, &format!("{path}.{key}"))?;
+    }
+    Ok(())
+}
+
+fn validate_settings_fields(overrides: &toml::Table) -> Result<()> {
+    for (section, value) in overrides {
+        let Some(allowed) = settings_section_fields(section) else {
+            anyhow::bail!(
+                "settings: section [{section}] may not be set per repository (allowed: {})",
+                SETTINGS_SECTIONS.join(", ")
+            );
+        };
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        ensure_settings_fields(table, section, allowed)?;
+        for (key, value) in table {
+            if section != "bundles" || key != "strategy" {
+                reject_settings_child_keys(value, &format!("{section}.{key}"))?;
+            }
+        }
+        if section == "bundles"
+            && let Some(strategy) = table.get("strategy")
+        {
+            match strategy {
+                toml::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() {
+                        if let Some(item) = item.as_table() {
+                            validate_settings_strategy(
+                                item,
+                                &format!("bundles.strategy[{index}]"),
+                            )?;
+                        } else {
+                            reject_settings_child_keys(
+                                item,
+                                &format!("bundles.strategy[{index}]"),
+                            )?;
+                        }
+                    }
+                }
+                toml::Value::Table(item) => validate_settings_strategy(item, "bundles.strategy")?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Config {
     /// D24: the effective configuration for one repository = this (the host's
@@ -816,14 +954,10 @@ impl Config {
             settings_toml.len() <= SETTINGS_MAX_BYTES,
             "settings document larger than {SETTINGS_MAX_BYTES} bytes"
         );
-        let overrides: toml::Table = settings_toml.parse().context("settings: parsing TOML")?;
-        for k in overrides.keys() {
-            anyhow::ensure!(
-                SETTINGS_SECTIONS.contains(&k.as_str()),
-                "settings: section [{k}] may not be set per repository (allowed: {})",
-                SETTINGS_SECTIONS.join(", ")
-            );
-        }
+        let overrides: toml::Table = settings_toml
+            .parse()
+            .map_err(|error| source_free_toml_error("settings: invalid TOML", error))?;
+        validate_settings_fields(&overrides)?;
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
         fn merge(into: &mut toml::Table, from: &toml::Table) {
             for (k, v) in from {
@@ -836,7 +970,9 @@ impl Config {
             }
         }
         merge(&mut doc, &overrides);
-        let cfg: Config = doc.try_into().context("settings: applying")?;
+        let cfg: Config = doc.try_into().map_err(|error| {
+            source_free_toml_error("settings: invalid effective configuration", error)
+        })?;
         cfg.validate()
             .context("settings: validating the effective config")?;
         Ok(cfg)
@@ -1231,10 +1367,120 @@ impl Default for TelemetryConfig {
     }
 }
 
+fn authority_contains_userinfo(raw: &str) -> bool {
+    raw.split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
+}
+
+fn validated_http_url(field: &str, raw: &str, allow_query: bool) -> Result<url::Url> {
+    anyhow::ensure!(
+        raw.starts_with("http://") || raw.starts_with("https://"),
+        "{field} must use exact http:// or https:// URL syntax"
+    );
+    anyhow::ensure!(!raw.contains('\\'), "{field} must not contain a backslash");
+    let parsed = url::Url::parse(raw).with_context(|| format!("{field} must be a valid URL"))?;
+    anyhow::ensure!(parsed.host_str().is_some(), "{field} must include a host");
+    anyhow::ensure!(
+        !authority_contains_userinfo(raw)
+            && parsed.username().is_empty()
+            && parsed.password().is_none(),
+        "{field} must not contain userinfo"
+    );
+    anyhow::ensure!(
+        allow_query || parsed.query().is_none(),
+        "{field} must not contain a query"
+    );
+    anyhow::ensure!(
+        parsed.fragment().is_none(),
+        "{field} must not contain a fragment"
+    );
+    Ok(parsed)
+}
+
+fn validated_cors_origin(raw: &str) -> Result<()> {
+    anyhow::ensure!(
+        raw.matches('*').count() <= 1 && (!raw.contains('*') || raw.starts_with("https://*.")),
+        "server.cors_origins entries allow at most one leading https wildcard"
+    );
+    let normalized = raw
+        .strip_prefix("https://*.")
+        .map(|rest| format!("https://walgit-wildcard.{rest}"))
+        .unwrap_or_else(|| raw.to_string());
+    let parsed = validated_http_url("server.cors_origins", &normalized, false)?;
+    anyhow::ensure!(
+        parsed.path() == "/",
+        "server.cors_origins entries must be origins without a path"
+    );
+    anyhow::ensure!(
+        parsed.scheme() == "https"
+            || (parsed.scheme() == "http" && parsed.host_str() == Some("localhost")),
+        "server.cors_origins entries must use https (http is allowed only for localhost)"
+    );
+    Ok(())
+}
+
+pub(crate) fn diagnostic_url(raw: &str) -> Option<String> {
+    if !(raw.starts_with("http://") || raw.starts_with("https://")) || raw.contains('\\') {
+        return None;
+    }
+    let mut parsed = url::Url::parse(raw).ok()?;
+    parsed.host_str()?;
+    parsed.set_password(None).ok()?;
+    parsed.set_username("").ok()?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    if parsed.path() != "/" {
+        parsed.set_path("/_path_redacted_");
+    }
+    Some(parsed.into())
+}
+
+pub(crate) fn diagnostic_cors_origin(raw: &str) -> Option<String> {
+    let wildcard = raw.strip_prefix("https://*.");
+    let normalized = wildcard
+        .map(|rest| format!("https://walgit-wildcard.{rest}"))
+        .unwrap_or_else(|| raw.to_string());
+    let sanitized = diagnostic_url(&normalized)?;
+    Some(if wildcard.is_some() {
+        sanitized.replacen("walgit-wildcard.", "*.", 1)
+    } else {
+        sanitized
+    })
+}
+
+fn config_env_vars(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<Vec<(String, String)>> {
+    let mut config_vars = Vec::new();
+    for (key, value) in vars {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if key != "PORT" && !key.starts_with("WALGIT__") {
+            continue;
+        }
+        let key = key.to_string();
+        let value = value.into_string().map_err(|_| {
+            anyhow::anyhow!("environment variable {key} contains a non-Unicode value")
+        })?;
+        config_vars.push((key, value));
+    }
+    Ok(config_vars)
+}
+
+/// Map TOML deserialization failures without retaining parser messages or
+/// source snippets. `toml::de::Error` can contain the complete attacker- or
+/// operator-authored line, including credential-bearing URL paths.
+fn source_free_toml_error(category: &'static str, _error: toml::de::Error) -> anyhow::Error {
+    anyhow::anyhow!(category)
+}
+
 impl Config {
     pub fn parse(toml_text: &str) -> Result<Config> {
-        let mut cfg: Config = toml::from_str(toml_text).context("parsing walgit.toml")?;
-        cfg.apply_env(std::env::vars())?;
+        let mut cfg: Config = toml::from_str(toml_text)
+            .map_err(|error| source_free_toml_error("config: invalid TOML", error))?;
+        cfg.apply_env(config_env_vars(std::env::vars_os())?.into_iter())?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -1310,12 +1556,8 @@ impl Config {
                 }
                 match set(&mut trial, &path, value) {
                     Err(why) => Some(why),
-                    Ok(()) => trial.clone().try_into::<Config>().err().map(|e| {
-                        e.to_string()
-                            .lines()
-                            .next()
-                            .unwrap_or("invalid")
-                            .to_string()
+                    Ok(()) => trial.clone().try_into::<Config>().err().map(|error| {
+                        source_free_toml_error("invalid configuration override", error).to_string()
                     }),
                 }
             };
@@ -1342,7 +1584,9 @@ impl Config {
             touched = true;
         }
         if touched {
-            *self = doc.try_into().context("applying WALGIT__ env overrides")?;
+            *self = doc
+                .try_into()
+                .map_err(|error| source_free_toml_error("invalid environment overrides", error))?;
         }
         if let Some(port) = port_override {
             self.server.listen.set_port(port);
@@ -1378,10 +1622,18 @@ impl Config {
             );
         }
         if let Some(u) = &self.server.public_url {
-            anyhow::ensure!(
-                u.starts_with("https://") || u.starts_with("http://"),
-                "server.public_url must be an http(s) origin (got {u})"
-            );
+            validated_http_url("server.public_url", u, false)?;
+        }
+        for (field, endpoint) in [
+            ("store.gcs.endpoint", self.store.gcs.endpoint.as_str()),
+            ("store.s3.endpoint", self.store.s3.endpoint.as_str()),
+        ] {
+            if !endpoint.is_empty() {
+                validated_http_url(field, endpoint, false)?;
+            }
+        }
+        if let Some(url) = &self.wal.push_broker_url {
+            validated_http_url("wal.push_broker_url", url, false)?;
         }
         self.validate_bundle_strategies()?;
         // You cannot maintain what you refuse to serve: a host with the serve role
@@ -1410,13 +1662,18 @@ impl Config {
             ("upstream.lfs", &self.upstream.lfs),
         ] {
             if let Some(u) = u {
+                let parsed = validated_http_url(key, u, false)?;
+                let is_https = u.starts_with("https://");
+                let is_local_http = u.starts_with("http://")
+                    && matches!(parsed.host_str(), Some("localhost" | "127.0.0.1"));
                 anyhow::ensure!(
-                    u.starts_with("https://")
-                        || u.starts_with("http://localhost")
-                        || u.starts_with("http://127.0.0.1"),
-                    "{key} must be an https:// URL (got {u})"
+                    is_https || is_local_http,
+                    "{key} must be an https:// URL (http is allowed only for localhost or 127.0.0.1)"
                 );
-                anyhow::ensure!(!u.ends_with('/'), "{key} must not end with '/' (got {u})");
+                anyhow::ensure!(
+                    !parsed.path().ends_with('/'),
+                    "{key} path must not end with '/'"
+                );
             }
         }
         if !self.upstream.follow.is_empty() {
@@ -1431,35 +1688,40 @@ impl Config {
                 );
             }
         }
-        for o in &self.server.cors_origins {
-            let host = o
-                .strip_prefix("https://")
-                .or_else(|| o.strip_prefix("http://localhost").map(|_| "localhost"))
-                .filter(|h| !h.is_empty() && !h.contains('/'));
-            anyhow::ensure!(
-                host.is_some()
-                    && o.matches('*').count() <= 1
-                    && (!o.contains('*') || o.contains("://*.")),
-                "server.cors_origins entries must be https origins (or http://localhost[:port]) with at most one leading `*.` wildcard, got {o:?}"
-            );
+        for origin in &self.server.cors_origins {
+            validated_cors_origin(origin)?;
         }
         // Security contract: identity modes fail closed.
         let a = &self.server.auth;
+        let issuer = if a.issuer.is_empty() {
+            None
+        } else {
+            Some(validated_http_url("server.auth.issuer", &a.issuer, false)?)
+        };
         if a.mode == AuthMode::Token {
             anyhow::ensure!(
                 !a.tokens.is_empty(),
                 "server.auth.tokens must list at least one token in token mode"
             );
         }
-        for t in &a.tokens {
+        for (index, t) in a.tokens.iter().enumerate() {
             anyhow::ensure!(
                 !t.principal.is_empty(),
-                "server.auth.tokens[].principal must not be empty"
+                "server.auth.tokens[{index}].principal must not be empty"
             );
+            if let Some(name) = &t.token_env {
+                anyhow::ensure!(
+                    !name.is_empty(),
+                    "server.auth.tokens[{index}].token_env must not be empty"
+                );
+                anyhow::ensure!(
+                    !name.contains(['=', '\0']),
+                    "server.auth.tokens[{index}].token_env is not a valid environment variable name"
+                );
+            }
             anyhow::ensure!(
-                !t.token.is_empty() || t.token_env.as_deref().is_some_and(|v| !v.is_empty()),
-                "server.auth.tokens[] for {:?} needs `token` or `token_env`",
-                t.principal
+                !t.token.is_empty() || t.token_env.is_some(),
+                "server.auth.tokens[{index}] needs `token` or `token_env`"
             );
         }
         if let Some(secret) = a.session_secret.as_deref().filter(|s| !s.is_empty()) {
@@ -1470,17 +1732,17 @@ impl Config {
         }
         if a.mode == AuthMode::Oidc {
             anyhow::ensure!(
+                issuer.as_ref().is_some_and(|url| url.scheme() == "https")
+                    && !a.issuer.ends_with('/'),
+                "server.auth.issuer must be a non-empty https URL without a trailing slash"
+            );
+            anyhow::ensure!(
                 !a.anonymous_read,
                 "server.auth.anonymous_read must be false in oidc mode"
             );
             anyhow::ensure!(
                 !a.allowed_domains.is_empty() || !a.allowed_emails.is_empty(),
                 "server.auth.allowed_domains (or allowed_emails) must be set in oidc mode"
-            );
-            anyhow::ensure!(
-                a.issuer.starts_with("https://") && !a.issuer.ends_with('/'),
-                "server.auth.issuer must be an https URL without a trailing slash (got {:?})",
-                a.issuer
             );
             let oauth_id = a.oauth_client_id.as_deref().is_some_and(|v| !v.is_empty());
             let oauth_secret = a
@@ -1541,10 +1803,7 @@ impl Config {
             }
         }
         if let Some(u) = &self.events.webhook_url {
-            anyhow::ensure!(
-                u.starts_with("http://") || u.starts_with("https://"),
-                "events.webhook_url must be an http(s) URL"
-            );
+            validated_http_url("events.webhook_url", u, true)?;
         }
         Ok(())
     }
@@ -1666,6 +1925,71 @@ fn rewrite_origin_port(origin: &str, port: u16) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn config_env_filter_ignores_unrelated_non_unicode_entries() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let vars = config_env_vars(
+            vec![
+                (
+                    std::ffi::OsString::from("CUSTOM_TOKEN_ENV"),
+                    std::ffi::OsString::from_vec(b"token-value-sentinel-\xff".to_vec()),
+                ),
+                (
+                    std::ffi::OsString::from_vec(b"UNRELATED_KEY_\xff".to_vec()),
+                    std::ffi::OsString::from_vec(b"unrelated-value-sentinel-\xff".to_vec()),
+                ),
+                (
+                    std::ffi::OsString::from("PORT"),
+                    std::ffi::OsString::from("9000"),
+                ),
+                (
+                    std::ffi::OsString::from("WALGIT__WAL__MAX_BATCH"),
+                    std::ffi::OsString::from("17"),
+                ),
+            ]
+            .into_iter(),
+        )
+        .expect("unrelated non-Unicode environment entries are not config overrides");
+        assert_eq!(
+            vars,
+            vec![
+                ("PORT".to_string(), "9000".to_string()),
+                ("WALGIT__WAL__MAX_BATCH".to_string(), "17".to_string())
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_env_filter_rejects_non_unicode_override_values_without_leaking_them() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for key in ["PORT", "WALGIT__WAL__MAX_BATCH"] {
+            let err = config_env_vars(
+                vec![(
+                    std::ffi::OsString::from(key),
+                    std::ffi::OsString::from_vec(
+                        format!("override-value-sentinel-for-{key}-")
+                            .into_bytes()
+                            .into_iter()
+                            .chain([0xff])
+                            .collect(),
+                    ),
+                )]
+                .into_iter(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(key), "missing override key in error: {err}");
+            assert!(
+                !err.contains("override-value-sentinel"),
+                "non-Unicode override value leaked in error: {err}"
+            );
+        }
+    }
+
     #[test]
     fn defaults_parse_and_validate() {
         let c = Config::parse("").unwrap();
@@ -1676,6 +2000,16 @@ mod tests {
         let text = toml::to_string(&c).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.store.bucket, c.store.bucket);
+    }
+
+    #[test]
+    fn config_parse_errors_are_source_free() {
+        const SENTINEL: &str = "config-malformed-webhook-path-sentinel";
+        let source = format!("[events]\nwebhook_url = \"https://hooks.example/{SENTINEL}\n");
+        let err = Config::parse(&source).unwrap_err().to_string();
+        assert_eq!(err, "config: invalid TOML");
+        assert!(!err.contains(SENTINEL), "config error leaked source: {err}");
+        assert!(!err.contains("webhook_url ="), "{err}");
     }
 
     #[test]
@@ -1823,13 +2157,38 @@ mod tests {
                 "WALGIT__NOSUCHSECTION__X"
             ]
         );
-        assert!(ignored[0].1.contains("unknown field"), "{:?}", ignored[0]);
+        assert_eq!(ignored[0].1, "invalid configuration override");
+        assert_eq!(ignored[1].1, "invalid configuration override");
+        assert_eq!(ignored[2].1, "invalid configuration override");
         // Plain apply_env is the same, just warns.
         let mut c2 = Config::default();
         c2.apply_env(
             vec![("WALGIT__CACHE__NOT_A_KEY_YET".to_string(), "1".to_string())].into_iter(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn env_override_type_errors_do_not_echo_values() {
+        const SENTINEL: &str = "env-override-value-sentinel";
+        let mut config = Config::default();
+        let ignored = config
+            .apply_env_report(
+                vec![(
+                    "WALGIT__WAL__MAX_BATCH".to_string(),
+                    format!("\"{SENTINEL}\""),
+                )]
+                .into_iter(),
+            )
+            .unwrap();
+        assert_eq!(
+            ignored,
+            vec![(
+                "WALGIT__WAL__MAX_BATCH".to_string(),
+                "invalid configuration override".to_string()
+            )]
+        );
+        assert!(!ignored[0].1.contains(SENTINEL));
     }
 
     #[test]
@@ -1879,6 +2238,161 @@ listen = \"0.0.0.0:1\"\n",
     }
 
     #[test]
+    fn settings_parse_and_type_errors_are_source_free() {
+        let mut base = Config::default();
+        base.store.bucket = "b".into();
+
+        const MALFORMED_SENTINEL: &str = "settings-malformed-path-sentinel";
+        let malformed = format!("[upstream]\ngit = \"https://example.test/{MALFORMED_SENTINEL}\n");
+        let err = base.with_settings(&malformed).unwrap_err().to_string();
+        assert_eq!(err, "settings: invalid TOML");
+        assert!(!err.contains(MALFORMED_SENTINEL), "{err}");
+        assert!(!err.contains("git ="), "{err}");
+
+        const TYPE_SENTINEL: &str = "settings-type-value-sentinel";
+        let invalid_type = format!("[bundles]\nmin_commits = \"{TYPE_SENTINEL}\"\n");
+        let err = base.with_settings(&invalid_type).unwrap_err().to_string();
+        assert_eq!(err, "settings: invalid effective configuration");
+        assert!(!err.contains(TYPE_SENTINEL), "{err}");
+        assert!(!err.contains("min_commits ="), "{err}");
+    }
+
+    #[test]
+    fn settings_closed_input_allowlist_accepts_every_current_field() {
+        let mut base = Config::default();
+        base.store.bucket = "b".into();
+        let effective = base
+            .with_settings(
+                r#"
+[bundles]
+enabled = true
+min_commits = 3
+min_bytes = "1.0 KiB"
+serve_via = "proxy"
+signed_url_ttl = "30m"
+advertise = true
+advertise_filtered = true
+require = ["acme/*"]
+signed_url_for = ["acme/large"]
+main_only = false
+extra_refs = ["refs/tags/v*"]
+
+[[bundles.strategy]]
+name = "filtered-full"
+kind = "full"
+schedule = "@weekly"
+keep = 2
+refs = ["refs/heads/main"]
+backfill_max = 1
+min_commits = 4
+filter = "blob:none"
+chain = false
+
+[[bundles.strategy]]
+name = "filtered-incremental"
+kind = "incremental"
+schedule = "@daily"
+base = "filtered-full"
+keep = 0
+refs = ["refs/heads/main"]
+backfill_max = 2
+min_commits = 5
+filter = "blob:none"
+chain = true
+
+[maintenance]
+interval = "2m"
+checkpoints = false
+max_pack_bytes = "2.0 GiB"
+disk = "tmpfs"
+host = "maintainer.example"
+fsck_interval = "2days"
+follow_interval = "45s"
+
+[compaction]
+enabled = true
+factor = 3
+trigger_packs = 9
+trigger_bytes = "3.0 GiB"
+lease_ttl = "11m"
+retention_superseded = "8days"
+engine = "git"
+
+[upstream]
+git = "https://upstream.example/repo.git"
+lfs = "https://upstream.example/repo.git/info/lfs"
+token_env = "UPSTREAM_TOKEN"
+follow = ["refs/heads/main"]
+"#,
+            )
+            .expect("every current repository setting remains allowed");
+
+        assert_eq!(effective.bundles.strategy.len(), 2);
+        assert_eq!(
+            effective.maintenance.host.as_deref(),
+            Some("maintainer.example")
+        );
+        assert_eq!(effective.compaction.factor, 3);
+        assert_eq!(
+            effective.upstream.token_env.as_deref(),
+            Some("UPSTREAM_TOKEN")
+        );
+    }
+
+    #[test]
+    fn settings_closed_input_allowlist_rejects_unknown_paths_without_values() {
+        let mut base = Config::default();
+        base.store.bucket = "b".into();
+        for (document, path, sentinel) in [
+            (
+                "[bundles]\nfuture_field = \"bundles-value-sentinel\"\n",
+                "bundles.future_field",
+                "bundles-value-sentinel",
+            ),
+            (
+                "[maintenance]\nfuture_field = \"maintenance-value-sentinel\"\n",
+                "maintenance.future_field",
+                "maintenance-value-sentinel",
+            ),
+            (
+                "[compaction]\nfuture_field = \"compaction-value-sentinel\"\n",
+                "compaction.future_field",
+                "compaction-value-sentinel",
+            ),
+            (
+                "[upstream]\nfuture_field = \"upstream-value-sentinel\"\n",
+                "upstream.future_field",
+                "upstream-value-sentinel",
+            ),
+            (
+                "[[bundles.strategy]]\nfuture_field = \"strategy-value-sentinel\"\n",
+                "bundles.strategy[0].future_field",
+                "strategy-value-sentinel",
+            ),
+            (
+                "[bundles.min_commits]\nfuture_field = \"nested-value-sentinel\"\n",
+                "bundles.min_commits.future_field",
+                "nested-value-sentinel",
+            ),
+            (
+                "[[bundles.strategy]]\nname = { future_field = \"strategy-nested-value-sentinel\" }\n",
+                "bundles.strategy[0].name.future_field",
+                "strategy-nested-value-sentinel",
+            ),
+        ] {
+            let err = base.with_settings(document).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("settings: key {path} may not be set per repository")
+            );
+            assert!(
+                !err.contains(sentinel),
+                "settings error leaked value {sentinel}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn auth_modes_validate_fail_closed() {
         let multiple = Config::parse(
             r#"
@@ -1909,6 +2423,462 @@ audiences = ["walgit-cli", "https://git.example.com"]
             ok.server.auth.access_token_ttl,
             Duration::from_secs(90 * 86400)
         );
+    }
+
+    #[test]
+    fn upstream_urls_reject_credential_and_suffix_channels() {
+        let mut cfg = Config::default();
+        cfg.store.bucket = "b".into();
+        for (key, url) in [
+            ("userinfo", "https://user:pass@example.com/repo.git"),
+            ("empty userinfo", "https://@example.com/repo.git"),
+            ("query", "https://example.com/repo.git?token=secret"),
+            ("empty query", "https://example.com/repo.git?"),
+            ("fragment", "https://example.com/repo.git#credential"),
+            ("empty fragment", "https://example.com/repo.git#"),
+            (
+                "lookalike localhost",
+                "http://localhost.example.com/repo.git",
+            ),
+            ("opaque https syntax", "https:example.com/repo.git"),
+            ("parsed trailing slash", "https://example.com/repo.git/"),
+            ("backslash suffix", "https://example.com/repo.git\\"),
+        ] {
+            cfg.upstream.git = Some(url.into());
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("upstream.git"),
+                "{key} rejection named the wrong field: {err}"
+            );
+        }
+        for url in [
+            "https://example.com/repo.git",
+            "http://localhost/repo.git",
+            "http://localhost:8080/repo.git",
+            "http://127.0.0.1:8080/repo.git",
+        ] {
+            cfg.upstream.git = Some(url.into());
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("valid URL {url} rejected: {e}"));
+        }
+        cfg.upstream.git = None;
+        cfg.upstream.lfs = Some("https://user@example.com/repo.git/info/lfs".into());
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("upstream.lfs")
+        );
+    }
+
+    #[test]
+    fn static_token_env_names_are_nonempty_and_lookup_safe() {
+        for env_name in ["", "TOKEN=VALUE", "TOKEN\0VALUE"] {
+            let mut cfg = Config::default();
+            cfg.store.bucket = "b".into();
+            cfg.server.auth.tokens = vec![StaticToken {
+                principal: "robot".into(),
+                token: "literal-fallback".into(),
+                token_env: Some(env_name.into()),
+                write: true,
+            }];
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("token_env"), "{err}");
+            assert!(
+                !err.contains("literal-fallback"),
+                "literal token leaked in validation error: {err}"
+            );
+        }
+
+        let mut cfg = Config::default();
+        cfg.store.bucket = "b".into();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.issuer.clear();
+        cfg.server.auth.tokens = vec![StaticToken {
+            principal: "robot".into(),
+            token: "literal-fallback".into(),
+            token_env: Some("ROBOT_TOKEN".into()),
+            write: true,
+        }];
+        cfg.validate().expect("named env with literal fallback");
+        cfg.server.auth.tokens[0].token_env = None;
+        cfg.validate().expect("literal-only fallback");
+        cfg.server.auth.tokens[0].token.clear();
+        cfg.server.auth.tokens[0].token_env = Some("ROBOT_TOKEN".into());
+        cfg.validate()
+            .expect("valid named env without literal fallback");
+    }
+
+    #[test]
+    fn configured_urls_are_parsed_and_errors_never_echo_input() {
+        fn assert_invalid(field: &str, configure: impl FnOnce(&mut Config), sentinels: &[&str]) {
+            let mut cfg = Config::default();
+            cfg.store.bucket = "b".into();
+            configure(&mut cfg);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+            for sentinel in sentinels {
+                assert!(
+                    !err.contains(sentinel),
+                    "{field} leaked URL input sentinel {sentinel}: {err}"
+                );
+            }
+        }
+
+        assert_invalid(
+            "server.public_url",
+            |cfg| {
+                cfg.server.public_url =
+                    Some("https://public-user:public-pass@public.example/base?public-query#public-fragment".into())
+            },
+            &[
+                "public-user",
+                "public-pass",
+                "public-query",
+                "public-fragment",
+            ],
+        );
+        assert_invalid(
+            "server.auth.issuer",
+            |cfg| {
+                cfg.server.auth.issuer =
+                    "https://issuer-user:issuer-pass@issuer.example/tenant?issuer-query#issuer-fragment".into()
+            },
+            &[
+                "issuer-user",
+                "issuer-pass",
+                "issuer-query",
+                "issuer-fragment",
+            ],
+        );
+        assert_invalid(
+            "store.gcs.endpoint",
+            |cfg| {
+                cfg.store.gcs.endpoint =
+                    "https://gcs-user:gcs-pass@gcs.example/storage?gcs-query#gcs-fragment".into()
+            },
+            &["gcs-user", "gcs-pass", "gcs-query", "gcs-fragment"],
+        );
+        assert_invalid(
+            "store.s3.endpoint",
+            |cfg| {
+                cfg.store.s3.endpoint =
+                    "https://s3-user:s3-pass@s3.example/storage?s3-query#s3-fragment".into()
+            },
+            &["s3-user", "s3-pass", "s3-query", "s3-fragment"],
+        );
+        assert_invalid(
+            "wal.push_broker_url",
+            |cfg| {
+                cfg.wal.push_broker_url = Some(
+                    "https://broker-user:broker-pass@broker.example/push?broker-query#broker-fragment"
+                        .into(),
+                )
+            },
+            &[
+                "broker-user",
+                "broker-pass",
+                "broker-query",
+                "broker-fragment",
+            ],
+        );
+        assert_invalid(
+            "server.cors_origins",
+            |cfg| {
+                cfg.server.cors_origins =
+                    vec!["https://cors-user:cors-pass@cors.example?cors-query#cors-fragment".into()]
+            },
+            &["cors-user", "cors-pass", "cors-query", "cors-fragment"],
+        );
+        assert_invalid(
+            "events.webhook_url",
+            |cfg| {
+                cfg.events.webhook_url = Some(
+                    "https://hooks.example/services/webhook-path?webhook-query#webhook-fragment"
+                        .into(),
+                )
+            },
+            &["webhook-query", "webhook-fragment"],
+        );
+
+        let mut valid = Config::default();
+        valid.store.bucket = "b".into();
+        valid.server.cors_origins = vec!["https://*.docs.example.com".into()];
+        valid.events.webhook_url =
+            Some("https://hooks.example/services/secret-path?token=secret-query".into());
+        valid
+            .validate()
+            .expect("documented URL shapes remain valid");
+    }
+
+    #[test]
+    fn effective_settings_projection_is_an_exact_closed_allowlist() {
+        use std::collections::BTreeSet;
+
+        fn keys(table: &toml::Table) -> BTreeSet<&str> {
+            table.keys().map(String::as_str).collect()
+        }
+
+        fn field_set<'a>(fields: &'a [&'a str]) -> BTreeSet<&'a str> {
+            fields.iter().copied().collect()
+        }
+
+        let mut cfg = Config::default();
+        cfg.server.auth.session_secret = Some("settings-session-secret-sentinel".repeat(2));
+        cfg.server.auth.oauth_client_secret = Some("settings-oauth-secret-sentinel".into());
+        cfg.events.webhook_secret = Some("settings-webhook-secret-sentinel".into());
+        cfg.wal.push_broker_token = Some("settings-broker-secret-sentinel".into());
+        cfg.bundles.strategy[0].base = Some("projection-base".into());
+        cfg.bundles.strategy[0].min_commits = Some(7);
+        cfg.bundles.strategy[0].filter = Some("blob:none".into());
+        cfg.maintenance.host = Some("projection-host".into());
+        cfg.upstream.git = Some("https://example.com/repo.git".into());
+        cfg.upstream.lfs = Some("https://example.com/repo.git/info/lfs".into());
+        cfg.upstream.token_env = Some("UPSTREAM_TOKEN".into());
+        cfg.upstream.follow = vec!["refs/heads/main".into()];
+
+        let view = cfg.effective_settings_view();
+        let table = view.to_toml_table().unwrap();
+        assert_eq!(keys(&table), field_set(SETTINGS_SECTIONS));
+        assert_eq!(
+            keys(table["bundles"].as_table().unwrap()),
+            field_set(SETTINGS_BUNDLES_FIELDS)
+        );
+        assert_eq!(
+            keys(table["maintenance"].as_table().unwrap()),
+            field_set(SETTINGS_MAINTENANCE_FIELDS)
+        );
+        assert_eq!(
+            keys(table["compaction"].as_table().unwrap()),
+            field_set(SETTINGS_COMPACTION_FIELDS)
+        );
+        assert_eq!(
+            keys(table["upstream"].as_table().unwrap()),
+            field_set(SETTINGS_UPSTREAM_FIELDS)
+        );
+        let strategy = table["bundles"]["strategy"].as_array().unwrap()[0]
+            .as_table()
+            .unwrap();
+        assert_eq!(keys(strategy), field_set(SETTINGS_BUNDLE_STRATEGY_FIELDS));
+        let text = view.to_toml_string().unwrap();
+        for sentinel in [
+            "settings-session-secret-sentinel",
+            "settings-oauth-secret-sentinel",
+            "settings-webhook-secret-sentinel",
+            "settings-broker-secret-sentinel",
+        ] {
+            assert!(
+                !text.contains(sentinel),
+                "effective projection leaked {sentinel}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_config_projection_keeps_diagnostics_without_secret_values() {
+        let mut cfg = Config::default();
+        cfg.store.bucket = "diagnostic-bucket".into();
+        cfg.server.auth.tokens = vec![StaticToken {
+            principal: "deploy-bot".into(),
+            token: "safe-view-static-token-sentinel".into(),
+            token_env: Some("DEPLOY_BOT_TOKEN".into()),
+            write: true,
+        }];
+        cfg.server.auth.session_secret = Some("safe-view-session-secret-sentinel".repeat(2));
+        cfg.server.auth.oauth_client_secret = Some("safe-view-oauth-secret-sentinel".into());
+        cfg.wal.push_broker_token = Some("safe-view-broker-token-sentinel".into());
+        cfg.events.webhook_secret = Some("safe-view-webhook-secret-sentinel".into());
+        cfg.server.public_url = Some(
+            "https://public-user:public-pass@public.example/public-path?public-query#public-fragment"
+                .into(),
+        );
+        cfg.server.auth.issuer =
+            "https://issuer-user:issuer-pass@issuer.example/issuer-path?issuer-query#issuer-fragment"
+                .into();
+        cfg.server.cors_origins = vec![
+            "https://cors-user:cors-pass@cors.example/cors-path?cors-query#cors-fragment".into(),
+        ];
+        cfg.store.gcs.endpoint =
+            "https://gcs-user:gcs-pass@gcs.example/gcs-path?gcs-query#gcs-fragment".into();
+        cfg.store.s3.endpoint =
+            "https://s3-user:s3-pass@s3.example/s3-path?s3-query#s3-fragment".into();
+        cfg.wal.push_broker_url = Some(
+            "https://broker-user:broker-pass@broker.example/broker-path?broker-query#broker-fragment"
+                .into(),
+        );
+        cfg.upstream.git =
+            Some("https://git-user:git-pass@git.example/git-path?git-query#git-fragment".into());
+        cfg.upstream.lfs =
+            Some("https://lfs-user:lfs-pass@lfs.example/lfs-path?lfs-query#lfs-fragment".into());
+        cfg.events.webhook_url = Some(
+            "https://webhook-user:webhook-pass@hooks.example/webhook-path-sentinel?webhook-query#webhook-fragment"
+                .into(),
+        );
+
+        let text = cfg.safe_view().to_toml_string().unwrap();
+        assert!(text.contains("diagnostic-bucket"), "{text}");
+        assert!(text.contains("deploy-bot"), "{text}");
+        assert!(text.contains("DEPLOY_BOT_TOKEN"), "{text}");
+        assert!(text.contains("session_secret_configured = true"), "{text}");
+        assert!(
+            text.contains("push_broker_token_configured = true"),
+            "{text}"
+        );
+        assert!(text.contains("webhook_secret_configured = true"), "{text}");
+        assert!(text.contains("webhook_url_configured = true"), "{text}");
+        for diagnostic in [
+            "public.example/_path_redacted_",
+            "issuer.example/_path_redacted_",
+            "cors.example/_path_redacted_",
+            "gcs.example/_path_redacted_",
+            "s3.example/_path_redacted_",
+            "broker.example/_path_redacted_",
+            "git.example/_path_redacted_",
+            "lfs.example/_path_redacted_",
+        ] {
+            assert!(
+                text.contains(diagnostic),
+                "missing sanitized URL {diagnostic}: {text}"
+            );
+        }
+        for sentinel in [
+            "safe-view-static-token-sentinel",
+            "safe-view-session-secret-sentinel",
+            "safe-view-oauth-secret-sentinel",
+            "safe-view-broker-token-sentinel",
+            "safe-view-webhook-secret-sentinel",
+            "public-user",
+            "public-pass",
+            "public-path",
+            "public-query",
+            "public-fragment",
+            "issuer-user",
+            "issuer-pass",
+            "issuer-path",
+            "issuer-query",
+            "issuer-fragment",
+            "cors-user",
+            "cors-pass",
+            "cors-path",
+            "cors-query",
+            "cors-fragment",
+            "gcs-user",
+            "gcs-pass",
+            "gcs-path",
+            "gcs-query",
+            "gcs-fragment",
+            "s3-user",
+            "s3-pass",
+            "s3-path",
+            "s3-query",
+            "s3-fragment",
+            "broker-user",
+            "broker-pass",
+            "broker-path",
+            "broker-query",
+            "broker-fragment",
+            "git-user",
+            "git-pass",
+            "git-path",
+            "git-query",
+            "git-fragment",
+            "lfs-user",
+            "lfs-pass",
+            "lfs-path",
+            "lfs-query",
+            "lfs-fragment",
+            "webhook-user",
+            "webhook-pass",
+            "webhook-path-sentinel",
+            "webhook-query",
+            "webhook-fragment",
+        ] {
+            assert!(
+                !text.contains(sentinel),
+                "safe config projection leaked {sentinel}"
+            );
+        }
+        cfg.events.webhook_url = None;
+        let without_webhook = cfg.safe_view().to_toml_string().unwrap();
+        assert!(
+            without_webhook.contains("webhook_url_configured = false"),
+            "{without_webhook}"
+        );
+    }
+
+    #[test]
+    fn safe_config_projection_redacts_paths_from_valid_urls_exactly() {
+        let mut cfg = Config::default();
+        cfg.store.bucket = "diagnostic-bucket".into();
+        cfg.server.public_url =
+            Some("https://public.example:8443/public-capability-sentinel".into());
+        cfg.server.auth.issuer = "https://issuer.example:9443/issuer-capability-sentinel".into();
+        cfg.server.cors_origins = vec!["https://cors.example:9444".into()];
+        cfg.store.gcs.endpoint = "https://gcs.example:4443/gcs-capability-sentinel".into();
+        cfg.store.s3.endpoint = "https://s3.example:5443/s3-capability-sentinel".into();
+        cfg.wal.push_broker_url =
+            Some("https://broker.example:6443/broker-capability-sentinel".into());
+        cfg.upstream.git = Some("https://git.example:7443/git-capability-sentinel".into());
+        cfg.upstream.lfs = Some("https://lfs.example:8444/lfs-capability-sentinel".into());
+        cfg.events.webhook_url =
+            Some("https://hooks.example/webhook-capability-sentinel?webhook-query-sentinel".into());
+        cfg.validate().expect("valid path-bearing URLs");
+
+        let text = cfg.safe_view().to_toml_string().unwrap();
+        let table: toml::Table = toml::from_str(&text).unwrap();
+        for (actual, expected) in [
+            (
+                table["server"]["public_url"].as_str(),
+                "https://public.example:8443/_path_redacted_",
+            ),
+            (
+                table["server"]["auth"]["issuer"].as_str(),
+                "https://issuer.example:9443/_path_redacted_",
+            ),
+            (
+                table["store"]["gcs"]["endpoint"].as_str(),
+                "https://gcs.example:4443/_path_redacted_",
+            ),
+            (
+                table["store"]["s3"]["endpoint"].as_str(),
+                "https://s3.example:5443/_path_redacted_",
+            ),
+            (
+                table["wal"]["push_broker_url"].as_str(),
+                "https://broker.example:6443/_path_redacted_",
+            ),
+            (
+                table["upstream"]["git"].as_str(),
+                "https://git.example:7443/_path_redacted_",
+            ),
+            (
+                table["upstream"]["lfs"].as_str(),
+                "https://lfs.example:8444/_path_redacted_",
+            ),
+        ] {
+            assert_eq!(actual, Some(expected), "{text}");
+        }
+        assert_eq!(
+            table["server"]["cors_origins"][0].as_str(),
+            Some("https://cors.example:9444/")
+        );
+        assert_eq!(
+            table["events"]["webhook_url_configured"].as_bool(),
+            Some(true)
+        );
+        for sentinel in [
+            "public-capability-sentinel",
+            "issuer-capability-sentinel",
+            "gcs-capability-sentinel",
+            "s3-capability-sentinel",
+            "broker-capability-sentinel",
+            "git-capability-sentinel",
+            "lfs-capability-sentinel",
+            "webhook-capability-sentinel",
+            "webhook-query-sentinel",
+        ] {
+            assert!(!text.contains(sentinel), "safe dump leaked {sentinel}");
+        }
     }
 
     #[test]

@@ -714,7 +714,7 @@ export class RepoClient {
       }),
   };
 
-  /** D24: WAL-backed TOML overrides of [bundles], [maintenance], [compaction], [upstream], and [integrations]. */
+  /** D24: WAL-backed TOML overrides of [bundles], [maintenance], [compaction], and [upstream]. */
   readonly settings = {
     /** The settings document (`revision: 0` = none). */
     get: (opts?: CallOptions) => this.client.json<RepoSettings>(`${this.p}/settings`, opts),
@@ -727,13 +727,13 @@ export class RepoClient {
       }),
     /** Back to the host config. */
     delete: (opts?: CallOptions) => this.client.json<{ revision: number }>(`${this.p}/settings`, opts, { method: "DELETE" }),
-    /** Effective config (host ⊕ settings) as TOML text. */
+    /** Four-section effective settings projection (host ⊕ settings) as TOML text. */
     effective: (opts?: CallOptions) => this.client.text(`${this.p}/settings/effective`, opts),
     /** SETTINGS entries in the live log, oldest first. */
     history: (opts?: CallOptions) => this.client.json<SettingsHistory>(`${this.p}/settings/history`, opts),
     /** Everything the Settings tab shows: strategies with next fire, placement, fields with sources. */
     describe: (opts?: CallOptions) => this.client.json<SettingsDescribe>(`${this.p}/settings/describe`, opts),
-    /** Validate a document and preview the resulting effective config, without publishing. */
+    /** Validate a document and preview the resulting effective settings projection, without publishing. */
     validate: (toml: string, opts?: CallOptions) =>
       this.client.json<SettingsValidation>(`${this.p}/settings/validate`, opts, {
         method: "POST",
