@@ -10,6 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.boxed(".walgit.v2.WalTailEntry.ref_representation.ref_delta_catalog");
     cfg.boxed(".walgit.v2.RepoControl.pack_representation.pack_catalog");
     cfg.boxed(".walgit.v2.RepoControl.grant_representation.grant_catalog");
+    cfg.boxed(".walgit.v2.AbortedCapacityReservation.proof.conflicting_commit");
+    cfg.boxed(".walgit.v2.CapacityControl.state_payload.redistribution");
     let descriptor_path =
         std::path::PathBuf::from(std::env::var("OUT_DIR")?).join("walgit-descriptor.bin");
     cfg.file_descriptor_set_path(&descriptor_path);

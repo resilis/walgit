@@ -119,6 +119,24 @@ pub fn repo_control_key(
     ))
 }
 
+pub fn capacity_control_key(prefix: &DeploymentPrefix) -> Result<String, KeyError> {
+    prefix.apply("v2/capacity/capacity_control.pb")
+}
+
+pub fn tenant_capacity_catalog_key(
+    prefix: &DeploymentPrefix,
+    digest: ContentAddressDigest,
+) -> Result<String, KeyError> {
+    prefix.apply(&format!(
+        "v2/capacity/catalogs/tenant/{}.pb",
+        digest.lower_hex()
+    ))
+}
+
+pub fn capacity_shard_key(prefix: &DeploymentPrefix, shard: u8) -> Result<String, KeyError> {
+    prefix.apply(&format!("v2/capacity/shards/{shard:02x}/capacity_shard.pb"))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum V2KeyKind {
     RepoControl,

@@ -1,17 +1,27 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use prost::Message;
 use sha2::{Digest, Sha256};
 
 use super::{
-    BucketSafetyBinding, CREDENTIAL_CONTROL_SCHEMA_VERSION, CapacityBinding, CatalogKind,
-    CatalogRoot, CredentialControl, GrantRole, Lifecycle, MAX_MUTATION_RESULT_BYTES, MutationKind,
-    MutationReceipt, MutationResult, ObjectFormat, PackRoot, RECEIPT_SCHEMA_VERSION,
-    REPO_CONTROL_SCHEMA_VERSION, ReceiptCatalog, ReceiptCatalogRow, ReceiptState, ReclamationPhase,
-    RepoControl, RepositoryGrant, RepositoryIdentity, TargetObjectRef, VerificationRingRoot,
-    Visibility, WalEntryKind, WalState,
+    BucketSafetyBinding, CAPACITY_SCHEMA_VERSION, CREDENTIAL_CONTROL_SCHEMA_VERSION,
+    CapacityBinding, CapacityCommitBinding, CapacityControl, CapacityControlState,
+    CapacityObjectRef, CapacityRedistribution, CapacityReservation, CapacityReservationState,
+    CapacityShard, CapacityShardBaseline, CapacityShardBudget, CapacityShardBudgetProposal,
+    CapacityTenantAccount, CatalogKind, CatalogRoot, CredentialControl, GrantRole,
+    LandedControlRef, Lifecycle, MAX_CAPACITY_SHARD_BYTES, MAX_MUTATION_RESULT_BYTES,
+    MAX_RESERVED_TTL_SECONDS, MAX_TENANT_CAPACITY_CATALOG_BYTES, MutationKind, MutationReceipt,
+    MutationResult, ObjectFormat, PackRoot, RECEIPT_SCHEMA_VERSION, REPO_CONTROL_SCHEMA_VERSION,
+    ReceiptCatalog, ReceiptCatalogRow, ReceiptState, ReclamationPhase, RedistributionPhase,
+    RepoControl, RepositoryGrant, RepositoryIdentity, TargetObjectRef, TenantCapacityAllocation,
+    TenantCapacityCatalogPage, VerificationRingRoot, Visibility, WalEntryKind, WalState,
+    aborted_capacity_reservation::Proof as AbortedProof,
+    capacity_commit_binding::Predecessor as CapacityCommitPredecessor,
+    capacity_control::StatePayload as CapacityControlPayload,
+    capacity_reservation::StatePayload as CapacityReservationPayload,
     keys::{
         CanonicalPathDigest, DeploymentPrefix, ParsedV2Key, RepositoryKeyIdentity, RoutingDigest,
-        V2KeyKind, parse_key, repo_control_key,
+        V2KeyKind, capacity_shard_key, parse_key, repo_control_key,
     },
     mutation_receipt::{
         CapacityObligation as CapacityObligationChoice, EventObligation as EventObligationChoice,
@@ -35,6 +45,1137 @@ pub enum CredentialTransitionKind {
     RevokeKid,
     VerifierSetUpdate,
     AcknowledgementUpdate,
+}
+
+pub fn validate_tenant_capacity_catalog_page(
+    page: &TenantCapacityCatalogPage,
+) -> Result<(), ControlValidationError> {
+    if page.schema_version != CAPACITY_SCHEMA_VERSION {
+        return Err(invalid(
+            "tenant_capacity_catalog.schema_version",
+            "must be exactly 1",
+        ));
+    }
+    if page.allocations.len() > 4_096 {
+        return Err(invalid(
+            "tenant_capacity_catalog.allocations",
+            "exceeds 4096 entries",
+        ));
+    }
+    if page
+        .allocations
+        .windows(2)
+        .any(|pair| pair[0].tenant_id.as_ref() >= pair[1].tenant_id.as_ref())
+    {
+        return Err(invalid(
+            "tenant_capacity_catalog.allocations",
+            "must be binary-sorted and unique by tenant ID",
+        ));
+    }
+    for allocation in &page.allocations {
+        validate_tenant_capacity_allocation(allocation)?;
+    }
+    Ok(())
+}
+
+pub fn validate_tenant_capacity_catalog_object(
+    page: &TenantCapacityCatalogPage,
+    object: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_tenant_capacity_catalog_page(page)?;
+    validate_global_capacity_ref(
+        object,
+        prefix,
+        V2KeyKind::TenantCapacityCatalog,
+        None,
+        MAX_TENANT_CAPACITY_CATALOG_BYTES,
+        "tenant_capacity_catalog.object",
+    )?;
+    validate_exact_protobuf_object(
+        object,
+        &page.encode_to_vec(),
+        "tenant_capacity_catalog.object",
+    )
+}
+
+pub fn validate_capacity_shard(
+    shard: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    if shard.schema_version != CAPACITY_SCHEMA_VERSION {
+        return Err(invalid(
+            "capacity_shard.schema_version",
+            "must be exactly 1",
+        ));
+    }
+    nonzero("capacity_shard.control_revision", shard.control_revision)?;
+    let shard_number = u8::try_from(shard.shard)
+        .map_err(|_| invalid("capacity_shard.shard", "must be in 0..=255"))?;
+    nonzero("capacity_shard.allocation_epoch", shard.allocation_epoch)?;
+    nonzero("capacity_shard.budget_bytes", shard.budget_bytes)?;
+    validate_capacity_tenant_accounts(&shard.tenant_accounts, shard.budget_bytes)?;
+    if shard.reservations.len() > 4_096 {
+        return Err(invalid(
+            "capacity_shard.reservations",
+            "exceeds 4096 entries",
+        ));
+    }
+    if shard
+        .reservations
+        .windows(2)
+        .any(|pair| pair[0].reservation_id.as_ref() >= pair[1].reservation_id.as_ref())
+    {
+        return Err(invalid(
+            "capacity_shard.reservations",
+            "must be binary-sorted and unique by reservation ID",
+        ));
+    }
+
+    let mut total_charged = 0u64;
+    let mut tenant_totals = HashMap::<Vec<u8>, u64>::new();
+    let mut active_repositories = HashSet::<(Vec<u8>, u64)>::new();
+    let mut repository_mutations = HashSet::<(Vec<u8>, u64, Vec<u8>)>::new();
+    for reservation in &shard.reservations {
+        let state = validate_capacity_reservation(
+            reservation,
+            shard_number,
+            shard.allocation_epoch,
+            prefix,
+        )?;
+        let identity = reservation
+            .identity
+            .as_ref()
+            .ok_or_else(|| missing("capacity_reservation.identity"))?;
+        if matches!(
+            state,
+            CapacityReservationState::Reserved | CapacityReservationState::Committing
+        ) && !active_repositories
+            .insert((identity.repository_uuid.to_vec(), identity.generation))
+        {
+            return Err(invalid(
+                "capacity_shard.reservations",
+                "contains more than one nonterminal reservation for a repository",
+            ));
+        }
+        if let Some(mutation_id) = capacity_reservation_commit_mutation_id(reservation)
+            && !repository_mutations.insert((
+                identity.repository_uuid.to_vec(),
+                identity.generation,
+                mutation_id.to_vec(),
+            ))
+        {
+            return Err(invalid(
+                "capacity_shard.reservations",
+                "reuses one repository mutation across reservation rows",
+            ));
+        }
+        if !matches!(state, CapacityReservationState::Aborted) {
+            total_charged = total_charged
+                .checked_add(reservation.byte_count)
+                .ok_or_else(|| invalid("capacity_shard.reservations", "byte total overflows"))?;
+            if total_charged > shard.budget_bytes {
+                return Err(invalid(
+                    "capacity_shard.reservations",
+                    "charged bytes exceed the shard budget",
+                ));
+            }
+            let entry = tenant_totals
+                .entry(reservation.tenant_id.to_vec())
+                .or_default();
+            *entry = entry
+                .checked_add(reservation.byte_count)
+                .ok_or_else(|| invalid("capacity_shard.reservations", "tenant total overflows"))?;
+        }
+    }
+    if tenant_totals.len() != shard.tenant_accounts.len() {
+        return Err(invalid(
+            "capacity_shard.tenant_accounts",
+            "must contain exactly the tenants with nonzero retained usage",
+        ));
+    }
+    for account in &shard.tenant_accounts {
+        let used = tenant_totals
+            .get(account.tenant_id.as_ref())
+            .ok_or_else(|| {
+                invalid(
+                    "capacity_shard.tenant_accounts",
+                    "contains an extraneous tenant account",
+                )
+            })?;
+        if *used > account.current_slice_bytes {
+            return Err(invalid(
+                "capacity_shard.tenant_accounts",
+                "retained usage exceeds the current tenant slice",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn capacity_reservation_commit_mutation_id(reservation: &CapacityReservation) -> Option<&[u8]> {
+    match reservation.state_payload.as_ref()? {
+        CapacityReservationPayload::Committing(value) => value
+            .commit
+            .as_ref()
+            .map(|commit| commit.mutation_id.as_ref()),
+        CapacityReservationPayload::Charged(value) => value
+            .commit
+            .as_ref()
+            .map(|commit| commit.mutation_id.as_ref()),
+        CapacityReservationPayload::Aborted(value) => match value.proof.as_ref()? {
+            AbortedProof::ConflictingCommit(conflict) => conflict
+                .commit
+                .as_ref()
+                .map(|commit| commit.mutation_id.as_ref()),
+            AbortedProof::Expired(_) => None,
+        },
+        CapacityReservationPayload::Reserved(_) => None,
+    }
+}
+
+pub fn validate_capacity_shard_object(
+    shard: &CapacityShard,
+    object: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_shard(shard, prefix)?;
+    let shard_number = u8::try_from(shard.shard)
+        .map_err(|_| invalid("capacity_shard.shard", "must be in 0..=255"))?;
+    let expected = capacity_shard_key(prefix, shard_number)
+        .map_err(|_| invalid("capacity_shard.object.key", "cannot be derived"))?;
+    validate_global_capacity_ref(
+        object,
+        prefix,
+        V2KeyKind::CapacityShard,
+        Some(expected.as_bytes()),
+        MAX_CAPACITY_SHARD_BYTES,
+        "capacity_shard.object",
+    )?;
+    validate_exact_protobuf_object(object, &shard.encode_to_vec(), "capacity_shard.object")
+}
+
+/// Cross-check current shard tenant accounts against one exact-loaded tenant
+/// catalog page. The page's exact root binding is validated separately by
+/// [`validate_capacity_control_catalogs`].
+pub fn validate_capacity_shard_catalog(
+    shard: &CapacityShard,
+    page: &TenantCapacityCatalogPage,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_shard(shard, prefix)?;
+    validate_tenant_capacity_catalog_page(page)?;
+    let shard_index = usize::try_from(shard.shard)
+        .ok()
+        .filter(|index| *index < 256)
+        .ok_or_else(|| invalid("capacity_shard.shard", "must be in 0..=255"))?;
+    for account in &shard.tenant_accounts {
+        let allocation_index = page
+            .allocations
+            .binary_search_by(|allocation| allocation.tenant_id.cmp(&account.tenant_id))
+            .map_err(|_| {
+                invalid(
+                    "capacity_shard.tenant_accounts",
+                    "tenant is absent from the current allocation page",
+                )
+            })?;
+        if page.allocations[allocation_index].slices[shard_index].byte_count
+            != account.current_slice_bytes
+        {
+            return Err(invalid(
+                "capacity_shard.tenant_account.current_slice_bytes",
+                "does not equal the exact current catalog slice",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_capacity_control(
+    control: &CapacityControl,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    if control.schema_version != CAPACITY_SCHEMA_VERSION {
+        return Err(invalid(
+            "capacity_control.schema_version",
+            "must be exactly 1",
+        ));
+    }
+    nonzero(
+        "capacity_control.control_revision",
+        control.control_revision,
+    )?;
+    let state = CapacityControlState::try_from(control.state)
+        .map_err(|_| invalid("capacity_control.state", "is unknown"))?;
+    if state == CapacityControlState::Unspecified {
+        return Err(invalid(
+            "capacity_control.state",
+            "must be a known nonzero state",
+        ));
+    }
+    let writer = control
+        .writer
+        .as_ref()
+        .ok_or_else(|| missing("capacity_control.writer"))?;
+    bounded_bytes("capacity_control.writer.holder", &writer.holder, 1, 256)?;
+    nonzero("capacity_control.writer.epoch", writer.epoch)?;
+    nonzero(
+        "capacity_control.allocation_epoch",
+        control.allocation_epoch,
+    )?;
+    nonzero(
+        "capacity_control.global_allocatable_bytes",
+        control.global_allocatable_bytes,
+    )?;
+    validate_global_capacity_ref(
+        control
+            .tenant_catalog
+            .as_ref()
+            .ok_or_else(|| missing("capacity_control.tenant_catalog"))?,
+        prefix,
+        V2KeyKind::TenantCapacityCatalog,
+        None,
+        MAX_TENANT_CAPACITY_CATALOG_BYTES,
+        "capacity_control.tenant_catalog",
+    )?;
+    validate_shard_budgets(
+        &control.shard_budgets,
+        control.global_allocatable_bytes,
+        prefix,
+    )?;
+
+    match (state, control.state_payload.as_ref()) {
+        (CapacityControlState::Stable, Some(CapacityControlPayload::Stable(_))) => {}
+        (
+            CapacityControlState::Preparing,
+            Some(CapacityControlPayload::Redistribution(redistribution)),
+        ) => validate_capacity_redistribution(control, redistribution, prefix)?,
+        (CapacityControlState::Stable, _) => {
+            return Err(invalid(
+                "capacity_control.state_payload",
+                "STABLE requires the stable payload",
+            ));
+        }
+        (CapacityControlState::Preparing, _) => {
+            return Err(invalid(
+                "capacity_control.state_payload",
+                "PREPARING requires the redistribution payload",
+            ));
+        }
+        (CapacityControlState::Unspecified, _) => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Validate one capacity control together with the exact immutable tenant
+/// catalog bodies that its current and optional target plans root.
+///
+/// Local control validation cannot prove referenced page contents. A future
+/// controller must call this helper after exact strict loads and before
+/// publishing a plan or admitting a reservation.
+pub fn validate_capacity_control_catalogs(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    target_page: Option<&TenantCapacityCatalogPage>,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_current_catalog(control, current_page, prefix)?;
+
+    match (CapacityControlState::try_from(control.state), target_page) {
+        (Ok(CapacityControlState::Stable), None) => Ok(()),
+        (Ok(CapacityControlState::Stable), Some(_)) => Err(invalid(
+            "capacity_control.target_tenant_catalog",
+            "STABLE must not supply a target tenant page",
+        )),
+        (Ok(CapacityControlState::Preparing), Some(target_page)) => {
+            let Some(CapacityControlPayload::Redistribution(redistribution)) =
+                control.state_payload.as_ref()
+            else {
+                return Err(invalid(
+                    "capacity_control.state_payload",
+                    "PREPARING requires redistribution",
+                ));
+            };
+            validate_tenant_capacity_catalog_object(
+                target_page,
+                redistribution
+                    .target_tenant_catalog
+                    .as_ref()
+                    .ok_or_else(|| {
+                        missing("capacity_control.redistribution.target_tenant_catalog")
+                    })?,
+                prefix,
+            )?;
+            validate_capacity_catalog_columns(
+                target_page,
+                redistribution
+                    .target_shard_budgets
+                    .iter()
+                    .map(|budget| budget.budget_bytes),
+                redistribution.target_global_allocatable_bytes,
+                "capacity_control.redistribution.target_tenant_catalog",
+            )
+        }
+        (Ok(CapacityControlState::Preparing), None) => Err(missing(
+            "capacity_control.redistribution.target_tenant_catalog_body",
+        )),
+        _ => Err(invalid("capacity_control.state", "is unknown")),
+    }
+}
+
+/// Validate the complete current capacity view used by future admission or a
+/// terminal transition: retained control plan, exact tenant page, current
+/// mutable shard, and every current tenant account.
+///
+/// Admission additionally requires `control.state == STABLE`. PREPARING uses
+/// this same gate only for terminal drainage. The shard provider version is
+/// deliberately not compared with the historical STABLE epoch-start proof.
+pub fn validate_capacity_current_shard_view(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    shard: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_current_catalog(control, current_page, prefix)?;
+    validate_capacity_shard_catalog(shard, current_page, prefix)?;
+    let shard_index = usize::try_from(shard.shard)
+        .ok()
+        .filter(|index| *index < 256)
+        .ok_or_else(|| invalid("capacity_shard.shard", "must be in 0..=255"))?;
+    if shard.allocation_epoch != control.allocation_epoch {
+        return Err(invalid(
+            "capacity_shard.allocation_epoch",
+            "does not equal the retained current control epoch",
+        ));
+    }
+    if shard.budget_bytes != control.shard_budgets[shard_index].budget_bytes {
+        return Err(invalid(
+            "capacity_shard.budget_bytes",
+            "does not equal the retained current control shard budget",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the exact current view and require the only state that can admit a
+/// new reservation. PREPARING callers must use the drainage-only helper above.
+pub fn validate_capacity_admission_view(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    shard: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_current_shard_view(control, current_page, shard, prefix)?;
+    if CapacityControlState::try_from(control.state) != Ok(CapacityControlState::Stable) {
+        return Err(invalid(
+            "capacity_control.state",
+            "admission requires STABLE",
+        ));
+    }
+    Ok(())
+}
+
+/// Exact-bind one loaded drained shard to its APPLYING baseline row and prove
+/// that only terminal reservation history remains.
+pub fn validate_capacity_applying_baseline(
+    control: &CapacityControl,
+    shard: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_control(control, prefix)?;
+    let Some(CapacityControlPayload::Redistribution(redistribution)) =
+        control.state_payload.as_ref()
+    else {
+        return Err(invalid(
+            "capacity_control.state_payload",
+            "an APPLYING redistribution is required",
+        ));
+    };
+    if control.state != CapacityControlState::Preparing as i32
+        || redistribution.phase != RedistributionPhase::Applying as i32
+    {
+        return Err(invalid(
+            "capacity_control.redistribution.phase",
+            "an APPLYING redistribution is required",
+        ));
+    }
+    let shard_index = usize::try_from(shard.shard)
+        .ok()
+        .filter(|index| *index < 256)
+        .ok_or_else(|| invalid("capacity_shard.shard", "must be in 0..=255"))?;
+    let baseline = &redistribution.baselines[shard_index];
+    validate_capacity_shard_object(
+        shard,
+        baseline
+            .shard_object
+            .as_ref()
+            .ok_or_else(|| missing("capacity_control.redistribution.baseline.shard_object"))?,
+        prefix,
+    )?;
+    if shard.allocation_epoch != baseline.allocation_epoch
+        || shard.budget_bytes != baseline.budget_bytes
+    {
+        return Err(invalid(
+            "capacity_control.redistribution.baseline",
+            "loaded shard epoch or budget differs from the exact baseline row",
+        ));
+    }
+    if shard.reservations.iter().any(|reservation| {
+        matches!(
+            CapacityReservationState::try_from(reservation.state),
+            Ok(CapacityReservationState::Reserved | CapacityReservationState::Committing)
+        )
+    }) {
+        return Err(invalid(
+            "capacity_control.redistribution.baseline",
+            "drained baseline contains a nonterminal reservation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capacity_current_catalog(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_control(control, prefix)?;
+    validate_tenant_capacity_catalog_object(
+        current_page,
+        control
+            .tenant_catalog
+            .as_ref()
+            .ok_or_else(|| missing("capacity_control.tenant_catalog"))?,
+        prefix,
+    )?;
+    validate_capacity_catalog_columns(
+        current_page,
+        control
+            .shard_budgets
+            .iter()
+            .map(|budget| budget.budget_bytes),
+        control.global_allocatable_bytes,
+        "capacity_control.tenant_catalog",
+    )
+}
+
+fn validate_capacity_catalog_columns(
+    page: &TenantCapacityCatalogPage,
+    budgets: impl Iterator<Item = u64>,
+    global_allocatable_bytes: u64,
+    field: &'static str,
+) -> Result<(), ControlValidationError> {
+    let budgets = budgets.collect::<Vec<_>>();
+    if budgets.len() != 256 {
+        return Err(invalid(field, "must have exactly 256 shard budgets"));
+    }
+    let mut columns = [0u64; 256];
+    for allocation in &page.allocations {
+        for (column, slice) in columns.iter_mut().zip(&allocation.slices) {
+            *column = column
+                .checked_add(slice.byte_count)
+                .ok_or_else(|| invalid(field, "tenant slice column sum overflows"))?;
+        }
+    }
+    let mut aggregate = 0u64;
+    for (column, budget) in columns.into_iter().zip(budgets) {
+        if column > budget {
+            return Err(invalid(
+                field,
+                "tenant slice column exceeds its shard budget",
+            ));
+        }
+        aggregate = aggregate
+            .checked_add(column)
+            .ok_or_else(|| invalid(field, "tenant allocation aggregate overflows"))?;
+    }
+    if aggregate > global_allocatable_bytes {
+        return Err(invalid(
+            field,
+            "tenant allocation aggregate exceeds global allocatable bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tenant_capacity_allocation(
+    allocation: &TenantCapacityAllocation,
+) -> Result<(), ControlValidationError> {
+    bounded_bytes(
+        "tenant_capacity_allocation.tenant_id",
+        &allocation.tenant_id,
+        1,
+        256,
+    )?;
+    nonzero(
+        "tenant_capacity_allocation.total_bytes",
+        allocation.total_bytes,
+    )?;
+    if allocation.slices.len() != 256 {
+        return Err(invalid(
+            "tenant_capacity_allocation.slices",
+            "must contain exactly 256 entries",
+        ));
+    }
+    let mut total = 0u64;
+    for (index, slice) in allocation.slices.iter().enumerate() {
+        if slice.shard as usize != index {
+            return Err(invalid(
+                "tenant_capacity_allocation.slices",
+                "must be ordered by every shard 0 through 255",
+            ));
+        }
+        nonzero(
+            "tenant_capacity_allocation.slice.byte_count",
+            slice.byte_count,
+        )?;
+        total = total
+            .checked_add(slice.byte_count)
+            .ok_or_else(|| invalid("tenant_capacity_allocation.slices", "slice total overflows"))?;
+    }
+    if total != allocation.total_bytes {
+        return Err(invalid(
+            "tenant_capacity_allocation.total_bytes",
+            "must equal the checked sum of all 256 slices",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capacity_tenant_accounts(
+    accounts: &[CapacityTenantAccount],
+    shard_budget_bytes: u64,
+) -> Result<(), ControlValidationError> {
+    if accounts.len() > 4_096 {
+        return Err(invalid(
+            "capacity_shard.tenant_accounts",
+            "exceeds 4096 entries",
+        ));
+    }
+    if accounts
+        .windows(2)
+        .any(|pair| pair[0].tenant_id.as_ref() >= pair[1].tenant_id.as_ref())
+    {
+        return Err(invalid(
+            "capacity_shard.tenant_accounts",
+            "must be binary-sorted and unique by tenant ID",
+        ));
+    }
+    for account in accounts {
+        bounded_bytes(
+            "capacity_shard.tenant_account.tenant_id",
+            &account.tenant_id,
+            1,
+            256,
+        )?;
+        nonzero(
+            "capacity_shard.tenant_account.current_slice_bytes",
+            account.current_slice_bytes,
+        )?;
+        if account.current_slice_bytes > shard_budget_bytes {
+            return Err(invalid(
+                "capacity_shard.tenant_account.current_slice_bytes",
+                "cannot exceed the immutable shard budget",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capacity_reservation(
+    reservation: &CapacityReservation,
+    owning_shard: u8,
+    allocation_epoch: u64,
+    prefix: &DeploymentPrefix,
+) -> Result<CapacityReservationState, ControlValidationError> {
+    validate_uuid_v7(
+        "capacity_reservation.reservation_id",
+        &reservation.reservation_id,
+    )?;
+    let identity = reservation
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("capacity_reservation.identity"))?;
+    validate_identity(identity)?;
+    bounded_bytes(
+        "capacity_reservation.tenant_id",
+        &reservation.tenant_id,
+        1,
+        256,
+    )?;
+    if reservation.tenant_id != identity.tenant_id {
+        return Err(invalid(
+            "capacity_reservation.tenant_id",
+            "must equal the repository identity tenant",
+        ));
+    }
+    nonzero(
+        "capacity_reservation.allocation_epoch",
+        reservation.allocation_epoch,
+    )?;
+    if reservation.allocation_epoch > allocation_epoch {
+        return Err(invalid(
+            "capacity_reservation.allocation_epoch",
+            "cannot be newer than the owning shard epoch",
+        ));
+    }
+    nonzero("capacity_reservation.byte_count", reservation.byte_count)?;
+    nonzero(
+        "capacity_reservation.tenant_slice_bytes",
+        reservation.tenant_slice_bytes,
+    )?;
+    if reservation.byte_count > reservation.tenant_slice_bytes {
+        return Err(invalid(
+            "capacity_reservation.byte_count",
+            "exceeds the exact tenant shard slice",
+        ));
+    }
+    if Sha256::digest(&identity.repository_uuid)[0] != owning_shard {
+        return Err(invalid(
+            "capacity_reservation.identity.repository_uuid",
+            "does not hash to the owning shard",
+        ));
+    }
+    let state = CapacityReservationState::try_from(reservation.state)
+        .map_err(|_| invalid("capacity_reservation.state", "is unknown"))?;
+    if matches!(
+        state,
+        CapacityReservationState::Reserved | CapacityReservationState::Committing
+    ) && reservation.allocation_epoch != allocation_epoch
+    {
+        return Err(invalid(
+            "capacity_reservation.allocation_epoch",
+            "nonterminal reservations must equal the current shard epoch",
+        ));
+    }
+    match (state, reservation.state_payload.as_ref()) {
+        (
+            CapacityReservationState::Reserved,
+            Some(CapacityReservationPayload::Reserved(reserved)),
+        ) => validate_reservation_window(
+            reserved.created_at_unix_seconds,
+            reserved.expires_at_unix_seconds,
+            "capacity_reservation.reserved",
+        )?,
+        (
+            CapacityReservationState::Committing,
+            Some(CapacityReservationPayload::Committing(committing)),
+        ) => validate_capacity_commit(
+            committing
+                .commit
+                .as_ref()
+                .ok_or_else(|| missing("capacity_reservation.committing.commit"))?,
+        )?,
+        (CapacityReservationState::Charged, Some(CapacityReservationPayload::Charged(charged))) => {
+            validate_capacity_commit(
+                charged
+                    .commit
+                    .as_ref()
+                    .ok_or_else(|| missing("capacity_reservation.charged.commit"))?,
+            )?;
+            validate_capacity_landed_control(
+                charged
+                    .landed_control
+                    .as_ref()
+                    .ok_or_else(|| missing("capacity_reservation.charged.landed_control"))?,
+                identity,
+                prefix,
+                "capacity_reservation.charged.landed_control",
+            )?;
+        }
+        (CapacityReservationState::Aborted, Some(CapacityReservationPayload::Aborted(aborted))) => {
+            match aborted.proof.as_ref() {
+                Some(AbortedProof::Expired(expired)) => {
+                    validate_reservation_window(
+                        expired.created_at_unix_seconds,
+                        expired.expires_at_unix_seconds,
+                        "capacity_reservation.aborted.expired",
+                    )?;
+                    if expired.observed_now_unix_seconds < expired.expires_at_unix_seconds {
+                        return Err(invalid(
+                            "capacity_reservation.aborted.expired.observed_now_unix_seconds",
+                            "must be at or after expiry",
+                        ));
+                    }
+                }
+                Some(AbortedProof::ConflictingCommit(conflict)) => {
+                    let commit = conflict.commit.as_ref().ok_or_else(|| {
+                        missing("capacity_reservation.aborted.conflicting_commit.commit")
+                    })?;
+                    validate_capacity_commit(commit)?;
+                    validate_capacity_landed_control(
+                    conflict.conflicting_control.as_ref().ok_or_else(|| {
+                        missing(
+                            "capacity_reservation.aborted.conflicting_commit.conflicting_control",
+                        )
+                    })?,
+                    identity,
+                    prefix,
+                    "capacity_reservation.aborted.conflicting_commit.conflicting_control",
+                )?;
+                    validate_uuid_v7(
+                        "capacity_reservation.aborted.conflicting_commit.conflicting_mutation_id",
+                        &conflict.conflicting_mutation_id,
+                    )?;
+                    if conflict.conflicting_mutation_id == commit.mutation_id {
+                        return Err(invalid(
+                            "capacity_reservation.aborted.conflicting_commit.conflicting_mutation_id",
+                            "must differ from the expected commit mutation",
+                        ));
+                    }
+                }
+                None => return Err(missing("capacity_reservation.aborted.proof")),
+            }
+        }
+        (CapacityReservationState::Unspecified, _) => {
+            return Err(invalid(
+                "capacity_reservation.state",
+                "must be a known nonzero state",
+            ));
+        }
+        _ => {
+            return Err(invalid(
+                "capacity_reservation.state_payload",
+                "does not match the selected state",
+            ));
+        }
+    }
+    Ok(state)
+}
+
+fn validate_reservation_window(
+    created: u64,
+    expires: u64,
+    field: &'static str,
+) -> Result<(), ControlValidationError> {
+    nonzero(field, created)?;
+    let ttl = expires
+        .checked_sub(created)
+        .ok_or_else(|| invalid(field, "expiry must be after creation"))?;
+    if !(1..=MAX_RESERVED_TTL_SECONDS).contains(&ttl) {
+        return Err(invalid(field, "TTL must be in 1..=900 seconds"));
+    }
+    Ok(())
+}
+
+fn validate_capacity_commit(commit: &CapacityCommitBinding) -> Result<(), ControlValidationError> {
+    nonzero("capacity_commit.writer_epoch", commit.writer_epoch)?;
+    validate_uuid_v7("capacity_commit.mutation_id", &commit.mutation_id)?;
+    let kind = MutationKind::try_from(commit.kind)
+        .map_err(|_| invalid("capacity_commit.kind", "is unknown"))?;
+    if matches!(
+        kind,
+        MutationKind::Unspecified | MutationKind::InternalSettlement
+    ) {
+        return Err(invalid(
+            "capacity_commit.kind",
+            "must be a non-settlement mutation",
+        ));
+    }
+    match (&commit.predecessor, kind) {
+        (Some(CapacityCommitPredecessor::NoPriorControl(_)), MutationKind::Create) => {}
+        (Some(CapacityCommitPredecessor::PriorControl(_)), MutationKind::Create) => {
+            return Err(invalid(
+                "capacity_commit.predecessor",
+                "Create requires explicit NONE",
+            ));
+        }
+        (Some(CapacityCommitPredecessor::PriorControl(prior)), _) => {
+            bounded_bytes(
+                "capacity_commit.prior_control.cas_token",
+                &prior.cas_token,
+                1,
+                256,
+            )?;
+            bounded_bytes(
+                "capacity_commit.prior_control.object_version_id",
+                &prior.object_version_id,
+                1,
+                1024,
+            )?;
+        }
+        (Some(CapacityCommitPredecessor::NoPriorControl(_)), _) => {
+            return Err(invalid(
+                "capacity_commit.predecessor",
+                "non-Create requires an exact prior binding",
+            ));
+        }
+        (None, _) => return Err(missing("capacity_commit.predecessor")),
+    }
+    Ok(())
+}
+
+fn validate_capacity_landed_control(
+    target: &LandedControlRef,
+    identity: &RepositoryIdentity,
+    prefix: &DeploymentPrefix,
+    field: &'static str,
+) -> Result<(), ControlValidationError> {
+    validate_repo_control_target(target, identity)?;
+    if target.size > super::MAX_REPO_CONTROL_BYTES as u64 {
+        return Err(invalid(
+            field,
+            "size exceeds the repo_control object maximum",
+        ));
+    }
+    let parsed = parse_key(prefix, &target.repo_control_key)
+        .map_err(|_| invalid(field, "key is outside the selected deployment prefix"))?;
+    if parsed.kind != V2KeyKind::RepoControl {
+        return Err(invalid(field, "key is not a repo_control key"));
+    }
+    let expected = repo_control_key(
+        prefix,
+        RoutingDigest::of(&identity.canonical_path)
+            .map_err(|_| invalid(field, "repo_control key cannot be derived"))?,
+    )
+    .map_err(|_| invalid(field, "repo_control key cannot be derived"))?;
+    if target.repo_control_key.as_ref() != expected.as_bytes() {
+        return Err(invalid(field, "key does not match the repository identity"));
+    }
+    Ok(())
+}
+
+fn validate_shard_budgets(
+    budgets: &[CapacityShardBudget],
+    global_allocatable_bytes: u64,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    if budgets.len() != 256 {
+        return Err(invalid(
+            "capacity_control.shard_budgets",
+            "must contain exactly 256 entries",
+        ));
+    }
+    let mut sum = 0u64;
+    for (index, budget) in budgets.iter().enumerate() {
+        if budget.shard as usize != index {
+            return Err(invalid(
+                "capacity_control.shard_budgets",
+                "must be ordered by every shard 0 through 255",
+            ));
+        }
+        nonzero(
+            "capacity_control.shard_budget.budget_bytes",
+            budget.budget_bytes,
+        )?;
+        let expected = capacity_shard_key(prefix, index as u8)
+            .map_err(|_| invalid("capacity_control.shard_budget", "key cannot be derived"))?;
+        validate_global_capacity_ref(
+            budget
+                .shard_object
+                .as_ref()
+                .ok_or_else(|| missing("capacity_control.shard_budget.shard_object"))?,
+            prefix,
+            V2KeyKind::CapacityShard,
+            Some(expected.as_bytes()),
+            MAX_CAPACITY_SHARD_BYTES,
+            "capacity_control.shard_budget.shard_object",
+        )?;
+        sum = sum
+            .checked_add(budget.budget_bytes)
+            .ok_or_else(|| invalid("capacity_control.shard_budgets", "budget sum overflows"))?;
+    }
+    if sum > global_allocatable_bytes {
+        return Err(invalid(
+            "capacity_control.shard_budgets",
+            "budget sum exceeds global allocatable bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capacity_redistribution(
+    control: &CapacityControl,
+    redistribution: &CapacityRedistribution,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    let phase = RedistributionPhase::try_from(redistribution.phase)
+        .map_err(|_| invalid("capacity_control.redistribution.phase", "is unknown"))?;
+    if phase == RedistributionPhase::Unspecified {
+        return Err(invalid(
+            "capacity_control.redistribution.phase",
+            "must be a known nonzero phase",
+        ));
+    }
+    if control.allocation_epoch.checked_add(1) != Some(redistribution.target_epoch) {
+        return Err(invalid(
+            "capacity_control.redistribution.target_epoch",
+            "must be exactly the next allocation epoch",
+        ));
+    }
+    nonzero(
+        "capacity_control.redistribution.target_global_allocatable_bytes",
+        redistribution.target_global_allocatable_bytes,
+    )?;
+    validate_global_capacity_ref(
+        redistribution
+            .target_tenant_catalog
+            .as_ref()
+            .ok_or_else(|| missing("capacity_control.redistribution.target_tenant_catalog"))?,
+        prefix,
+        V2KeyKind::TenantCapacityCatalog,
+        None,
+        MAX_TENANT_CAPACITY_CATALOG_BYTES,
+        "capacity_control.redistribution.target_tenant_catalog",
+    )?;
+    validate_shard_budget_proposals(
+        &redistribution.target_shard_budgets,
+        redistribution.target_global_allocatable_bytes,
+    )?;
+    validate_uuid_v7(
+        "capacity_control.redistribution.admission_fence_id",
+        &redistribution.admission_fence_id,
+    )?;
+    match phase {
+        RedistributionPhase::Draining if redistribution.baselines.is_empty() => Ok(()),
+        RedistributionPhase::Draining => Err(invalid(
+            "capacity_control.redistribution.baselines",
+            "must be empty while DRAINING",
+        )),
+        RedistributionPhase::Applying => {
+            validate_shard_baselines(control, &redistribution.baselines, prefix)
+        }
+        RedistributionPhase::Unspecified => unreachable!(),
+    }
+}
+
+fn validate_shard_budget_proposals(
+    budgets: &[CapacityShardBudgetProposal],
+    global_allocatable_bytes: u64,
+) -> Result<(), ControlValidationError> {
+    if budgets.len() != 256 {
+        return Err(invalid(
+            "capacity_control.redistribution.target_shard_budgets",
+            "must contain exactly 256 entries",
+        ));
+    }
+    let mut sum = 0u64;
+    for (index, budget) in budgets.iter().enumerate() {
+        if budget.shard as usize != index {
+            return Err(invalid(
+                "capacity_control.redistribution.target_shard_budgets",
+                "must be ordered by every shard 0 through 255",
+            ));
+        }
+        nonzero(
+            "capacity_control.redistribution.target_shard_budget.budget_bytes",
+            budget.budget_bytes,
+        )?;
+        sum = sum.checked_add(budget.budget_bytes).ok_or_else(|| {
+            invalid(
+                "capacity_control.redistribution.target_shard_budgets",
+                "budget sum overflows",
+            )
+        })?;
+    }
+    if sum > global_allocatable_bytes {
+        return Err(invalid(
+            "capacity_control.redistribution.target_shard_budgets",
+            "budget sum exceeds target global allocatable bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shard_baselines(
+    control: &CapacityControl,
+    baselines: &[CapacityShardBaseline],
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    if baselines.len() != 256 {
+        return Err(invalid(
+            "capacity_control.redistribution.baselines",
+            "must contain exactly 256 entries while APPLYING",
+        ));
+    }
+    for (index, baseline) in baselines.iter().enumerate() {
+        if baseline.shard as usize != index {
+            return Err(invalid(
+                "capacity_control.redistribution.baselines",
+                "must be ordered by every shard 0 through 255",
+            ));
+        }
+        if baseline.allocation_epoch != control.allocation_epoch {
+            return Err(invalid(
+                "capacity_control.redistribution.baseline.allocation_epoch",
+                "must equal the retained prior stable epoch",
+            ));
+        }
+        if baseline.budget_bytes != control.shard_budgets[index].budget_bytes {
+            return Err(invalid(
+                "capacity_control.redistribution.baseline.budget_bytes",
+                "must equal the retained prior stable shard budget",
+            ));
+        }
+        let expected = capacity_shard_key(prefix, index as u8).map_err(|_| {
+            invalid(
+                "capacity_control.redistribution.baseline",
+                "key cannot be derived",
+            )
+        })?;
+        validate_global_capacity_ref(
+            baseline
+                .shard_object
+                .as_ref()
+                .ok_or_else(|| missing("capacity_control.redistribution.baseline.shard_object"))?,
+            prefix,
+            V2KeyKind::CapacityShard,
+            Some(expected.as_bytes()),
+            MAX_CAPACITY_SHARD_BYTES,
+            "capacity_control.redistribution.baseline.shard_object",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_global_capacity_ref(
+    object: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+    expected_kind: V2KeyKind,
+    expected_key: Option<&[u8]>,
+    maximum_object_bytes: usize,
+    field: &'static str,
+) -> Result<ParsedV2Key, ControlValidationError> {
+    bounded_ascii(field, &object.key, 1, 1024)?;
+    bounded_bytes(field, &object.object_version_id, 1, 1024)?;
+    exact_len(field, &object.digest, 32)?;
+    if object.size == 0 || object.size > maximum_object_bytes as u64 {
+        return Err(invalid(field, "size is outside the typed object maximum"));
+    }
+    let parsed = parse_key(prefix, &object.key)
+        .map_err(|_| invalid(field, "key is outside the selected deployment prefix"))?;
+    if parsed.kind != expected_kind {
+        return Err(invalid(field, "key does not match the typed capacity slot"));
+    }
+    if let Some(expected_key) = expected_key
+        && object.key.as_ref() != expected_key
+    {
+        return Err(invalid(field, "key does not match the selected shard"));
+    }
+    if let Some(content_digest) = parsed.content_digest
+        && object.digest.as_ref() != content_digest.as_bytes()
+    {
+        return Err(invalid(
+            field,
+            "digest does not equal the content-addressed key leaf",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_exact_protobuf_object(
+    object: &CapacityObjectRef,
+    encoded: &[u8],
+    field: &'static str,
+) -> Result<(), ControlValidationError> {
+    let digest: [u8; 32] = Sha256::digest(encoded).into();
+    if object.size != encoded.len() as u64 || object.digest.as_ref() != digest {
+        return Err(invalid(
+            field,
+            "metadata does not bind the exact canonical protobuf bytes",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_mutation_receipt(receipt: &MutationReceipt) -> Result<(), ControlValidationError> {
