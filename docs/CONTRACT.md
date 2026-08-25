@@ -26,7 +26,7 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   distinct canonical-path, routing, protobuf-object, raw-payload,
   signed-envelope, and verification-ring digest types; and the exhaustive
   `v2::keys` grammar with a closed key-kind-to-digest mapping from the frozen
-  V5.8 production architecture. The raw
+  V5.9 production architecture. The raw
   preflight runs before generated decode and rejects non-canonical or unbounded
   protobuf input. V2 is not read or written by the V1 registry, WAL, server,
   CLI, bundle, policy, or coordination paths. Creating these types does not
