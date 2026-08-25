@@ -37,6 +37,30 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `list_versions` pagination over objects and provider delete markers. `ComposeSource` pins each input by key,
   size, CAS token, and object-version ID. `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, and
   `util::{collect,once,file_stream,backoff,retry}` preserve the shared implementation surface.
+- `walgit-store::v2_control`: dormant strict persistence for the V2 repository
+  authority. `ControlStore` receives a store that is already scoped to the
+  configured `DeploymentPrefix`. It validates the full persisted
+  `repo_control_key`, removes that prefix exactly once for store calls, and
+  returns an opaque `StoredRepoControl` with a `ControlBinding` containing the
+  full key, distinct `CasToken` and `ObjectVersionId`, exact protobuf digest,
+  and size. `load` performs one strict GET. `create` permits only ACTIVE
+  revision one and uses `PutMode::Create`. `compare_and_swap` accepts one
+  exact stored snapshot, validates the exact successor, and uses only that
+  snapshot's `CasToken`. The successor freezes identity, create binding, key,
+  object format, and cutover generation; advances the revision by one; uses a
+  new mutation ID; and follows `ACTIVE -> DELETING -> TOMBSTONED`.
+
+  A successful write returns its provider binding without another read. A 412
+  or ambiguous response permits exactly one fresh strict GET and returns a
+  typed committed, exact-replay, conflict, not-committed, or indeterminate
+  outcome. After a 412 update, an exact current successor is committed and any
+  other strict current value is a conflict. Only an ambiguous update that still
+  observes its exact prior CAS/version binding can be not-committed; an absent
+  key after an ambiguous Create stays indeterminate. The adapter never retries,
+  rebases, calls `coord::cas_update`, or uses LIST. An indeterminate outcome
+  fences the caller from another CAS until later receipt settlement resolves
+  it. No V1 registry, WAL, server, CLI, route, or runtime path constructs this
+  adapter yet.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
   only `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]` in repo-scoped settings.
 

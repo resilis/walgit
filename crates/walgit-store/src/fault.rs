@@ -402,6 +402,9 @@ impl ObjectStore for FaultStore {
         // Hide from the Prefixed span logic: we are transparent.
         self.inner.is_prefixed()
     }
+    fn applied_prefix(&self) -> &str {
+        self.inner.applied_prefix()
+    }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         let conditional = opts.if_none_match.is_some();

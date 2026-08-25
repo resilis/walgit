@@ -3,14 +3,62 @@ mod support;
 use bytes::Bytes;
 use prost::Message;
 use walgit_proto::v2::{
-    CatalogKind, CatalogRoot, InlinePackRoots, InlineRefChanges, PackRoot, RefChange, RepoControl,
-    TargetObjectRef, WalEntryKind, WalState, WalTailEntry,
+    CatalogKind, CatalogRoot, InlinePackRoots, InlineRefChanges, Lifecycle, PackRoot, RefChange,
+    RepoControl, TargetObjectRef, WalEntryKind, WalState, WalTailEntry,
     codec::{ControlCodecError, preflight_repo_control},
     decode_repo_control, encode_repo_control,
     keys::{DeploymentPrefix, RoutingDigest, repo_control_key},
     repo_control::PackRepresentation,
+    validate_repo_control_successor,
     wal_tail_entry::RefRepresentation,
 };
+
+#[test]
+fn exact_successor_freezes_create_binding_and_advances_one_revision() {
+    let previous = support::sample_control();
+    let mut successor = previous.clone();
+    successor.control_revision = 2;
+    successor.last_internal_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210abf").unwrap());
+    validate_repo_control_successor(&previous, &successor).unwrap();
+
+    let mut revision_gap = successor.clone();
+    revision_gap.control_revision = 3;
+    assert!(validate_repo_control_successor(&previous, &revision_gap).is_err());
+
+    let mut changed_identity = successor.clone();
+    changed_identity.identity.as_mut().unwrap().project_id = Bytes::from_static(b"other-project");
+    assert!(validate_repo_control_successor(&previous, &changed_identity).is_err());
+
+    let mut reused_mutation = successor;
+    reused_mutation.last_internal_mutation_id = previous.last_internal_mutation_id.clone();
+    assert!(validate_repo_control_successor(&previous, &reused_mutation).is_err());
+}
+
+#[test]
+fn exact_successor_enforces_terminal_lifecycle_and_revision_overflow() {
+    let mut deleting = support::sample_control();
+    deleting.lifecycle = Lifecycle::Deleting as i32;
+    let mut tombstoned = deleting.clone();
+    tombstoned.lifecycle = Lifecycle::Tombstoned as i32;
+    tombstoned.control_revision = 2;
+    tombstoned.last_internal_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210abf").unwrap());
+    validate_repo_control_successor(&deleting, &tombstoned).unwrap();
+
+    let mut after_tombstone = tombstoned.clone();
+    after_tombstone.control_revision = 3;
+    after_tombstone.last_internal_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210ac0").unwrap());
+    assert!(validate_repo_control_successor(&tombstoned, &after_tombstone).is_err());
+
+    let mut maximum = support::sample_control();
+    maximum.control_revision = u64::MAX;
+    let mut overflow = maximum.clone();
+    overflow.last_internal_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210abf").unwrap());
+    assert!(validate_repo_control_successor(&maximum, &overflow).is_err());
+}
 
 #[test]
 fn exact_canonical_roundtrip() {
