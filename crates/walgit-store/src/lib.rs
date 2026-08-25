@@ -26,6 +26,7 @@ pub mod memory;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod util;
+pub mod v2_control;
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;
 pub type ByteStream = BoxStream<'static, Result<Bytes, StoreError>>;
@@ -323,6 +324,11 @@ pub trait ObjectStore: Send + Sync + 'static {
     fn is_prefixed(&self) -> bool {
         false
     }
+    /// Complete physical prefix already applied by store wrappers. Transparent
+    /// wrappers must delegate this value. An unscoped provider returns `""`.
+    fn applied_prefix(&self) -> &str {
+        ""
+    }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult>;
 
@@ -508,13 +514,19 @@ pub type DynStore = Arc<dyn ObjectStore>;
 pub struct Prefixed {
     inner: DynStore,
     prefix: Arc<str>,
+    applied_prefix: Arc<str>,
 }
 
 impl Prefixed {
     pub fn new(inner: DynStore, prefix: impl Into<Arc<str>>) -> Self {
         let prefix: Arc<str> = prefix.into();
         debug_assert!(prefix.is_empty() || prefix.ends_with('/'));
-        Prefixed { inner, prefix }
+        let applied_prefix = format!("{}{}", inner.applied_prefix(), prefix);
+        Prefixed {
+            inner,
+            prefix,
+            applied_prefix: applied_prefix.into(),
+        }
     }
     pub fn prefix(&self) -> &str {
         &self.prefix
@@ -543,6 +555,9 @@ impl ObjectStore for Prefixed {
     }
     fn is_prefixed(&self) -> bool {
         true
+    }
+    fn applied_prefix(&self) -> &str {
+        &self.applied_prefix
     }
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         let instrument = !self.inner.is_prefixed();

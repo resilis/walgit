@@ -19,7 +19,9 @@ pub use codec::{
     ControlCodecError, decode_repo_control, encode_repo_control, lint_v2_descriptors,
     preflight_repo_control,
 };
-pub use validate::{ControlValidationError, validate_repo_control};
+pub use validate::{
+    ControlValidationError, validate_repo_control, validate_repo_control_successor,
+};
 
 /// Frozen V2 repository-control schema version.
 pub const REPO_CONTROL_SCHEMA_VERSION: u32 = 2;
