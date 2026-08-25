@@ -1520,6 +1520,81 @@ fn applying_baseline_exact_binds_the_loaded_terminal_only_shard() {
 }
 
 #[test]
+fn applying_current_shard_is_the_exact_baseline_or_deterministic_target_successor() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    let baseline = shard_with(vec![charged_reservation(&prefix)]);
+    let index = baseline.shard as usize;
+    let current_page = tenant_page_with_slice(index, 1_000);
+    let target_page = tenant_page_with_slice(index, 900);
+    let baseline_object = exact_shard_ref(&baseline, &prefix);
+    let mut applying = preparing_control(&prefix, RedistributionPhase::Applying);
+    applying.tenant_catalog = Some(tenant_page_ref(&prefix, &current_page));
+    let Some(CapacityControlPayload::Redistribution(plan)) = applying.state_payload.as_mut() else {
+        panic!("redistribution payload")
+    };
+    plan.target_tenant_catalog = Some(tenant_page_ref(&prefix, &target_page));
+    plan.baselines[index].shard_object = Some(baseline_object.clone());
+
+    validate_capacity_applying_current_shard(
+        &applying,
+        &current_page,
+        &target_page,
+        &baseline,
+        &baseline,
+        &baseline_object,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut successor = baseline.clone();
+    successor.control_revision += 1;
+    successor.allocation_epoch = 2;
+    successor.tenant_accounts[0].current_slice_bytes = 900;
+    let successor_object = exact_shard_ref(&successor, &prefix);
+    validate_capacity_applying_current_shard(
+        &applying,
+        &current_page,
+        &target_page,
+        &baseline,
+        &successor,
+        &successor_object,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut rewritten_baseline_object = baseline_object.clone();
+    rewritten_baseline_object.object_version_id = Bytes::from_static(b"rewritten-baseline");
+    assert!(
+        validate_capacity_applying_current_shard(
+            &applying,
+            &current_page,
+            &target_page,
+            &baseline,
+            &baseline,
+            &rewritten_baseline_object,
+            &prefix,
+        )
+        .is_err()
+    );
+
+    let mut unrelated = successor.clone();
+    unrelated.control_revision += 1;
+    let unrelated_object = exact_shard_ref(&unrelated, &prefix);
+    assert!(
+        validate_capacity_applying_current_shard(
+            &applying,
+            &current_page,
+            &target_page,
+            &baseline,
+            &unrelated,
+            &unrelated_object,
+            &prefix,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn control_budget_rows_are_exact_complete_and_checked() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
     let valid = stable_control(&prefix);

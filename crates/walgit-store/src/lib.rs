@@ -26,6 +26,7 @@ pub mod memory;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod util;
+pub mod v2_capacity;
 pub mod v2_control;
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + 'a>>;

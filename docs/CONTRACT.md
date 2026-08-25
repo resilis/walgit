@@ -118,14 +118,18 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   binds the target plan plus writer/admission fence. APPLYING additionally
   binds all 256 exact current drained baselines. Their provider metadata can be
   newer than the historical epoch-start proofs, but shard, prior epoch, budget,
-  and key stay fixed. The future controller must load those exact objects,
-  use the exact-baseline validator to prove terminal-only drainage, run the
-  exported cross-object gates, and
-  derive deterministic advance or revert successors that preserve terminal
-  reservation bytes and replace only current accounts from the target page.
-  This slice adds no controller, store adapter, provider, V1 compatibility, route, config,
-  migration, or runtime activation. It is a greenfield hard-cut contract; the
-  deferred multilevel 65,536-row topology requires a later explicit phase.
+  and key stay fixed. The exported APPLYING current-shard gate exact-loads the
+  current and target pages plus the rooted drained baseline. It accepts only
+  that exact baseline object or its deterministic target successor, which
+  preserves terminal reservation bytes and replaces only current accounts
+  from the target page. The future global controller must use this gate for
+  advance and recovery across all 256 shards.
+  The dormant store and domain controller below implement only RESERVED
+  admission and RESERVED expiry. Provider-specific operations, V1
+  compatibility, routes, configuration, migration, runtime activation, and
+  the global redistribution controller remain absent. This is a greenfield
+  hard-cut contract; the deferred multilevel 65,536-row topology requires a
+  later explicit phase.
 - `walgit-identity`: dormant pure V2 credential verification. It depends only
   on `walgit-proto` plus bounded hash, Ed25519, and error utilities. Its strict
   cursor rejects unknown, duplicate, reordered, non-minimal, indefinite,
@@ -171,6 +175,18 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   fences the caller from another CAS until later receipt settlement resolves
   it. No V1 registry, WAL, server, CLI, route, or runtime path constructs this
   adapter yet.
+- `walgit-store::v2_capacity`: dormant strict persistence for exact capacity
+  reads and transition-specific shard writes. It loads current
+  `CapacityControl`, exact rooted tenant pages by `ObjectVersionId`, and
+  current or exact `CapacityShard` bodies. Each load checks the configured
+  prefix exactly once, strict canonical bytes, provider key, separate bounded
+  `CasToken` and `ObjectVersionId`, digest, and size. The public write surface
+  contains only RESERVED admission and RESERVED expiry CAS methods. Each uses
+  one conditional PUT against the exact loaded shard and at most one strict
+  current GET after a 412, ambiguous error, or unusable success response. It
+  returns committed, conflict, not-committed, or indeterminate and never
+  retries, rebases, uses HEAD/LIST, or falls back from an exact catalog version
+  to current state.
 - `walgit-control`: dormant V2 repository authorization and mutation domain.
   Authorization consumes only an `AuthenticatedCapability`, compares every
   sealed repository/control binding including the current stored-control
@@ -188,6 +204,28 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   maximum valid settled-result space before publish. The crate uses the
   real `walgit-store::v2_control` adapter and remains disconnected from V1,
   server routes, providers, credentials, and deployment.
+  Its separate dormant `capacity` module implements only new `RESERVED`
+  admission and `RESERVED -> ABORTED(expired)`. Both start from an exact strict
+  `StoredRepoControl`; callers cannot supply tenant, repository identity,
+  shard, epoch, budget, slice, or key. Admission derives them from the exact
+  ACTIVE repository identity, current STABLE capacity control, exact rooted
+  tenant page, and current hashed shard. Expiry accepts an exact strict ACTIVE,
+  DELETING, or TOMBSTONED repository-control snapshot so retained RESERVED rows
+  cannot block repository reclamation or capacity drainage. The request supplies a UUIDv7 reservation
+  ID, positive bytes, explicit creation, expiry, and observed time. Their
+  checked lifetime must be `1..=900` seconds. The request also supplies the
+  closed domain-only purpose `GitWrite | LfsFinalize`. Purpose is not persisted in
+  RESERVED and does not authorize work; the future runtime/COMMITTING slice
+  must bind it to capability purpose and `MutationKind`. Expiry receives
+  explicit `now` and repeats the exact stored window. A new expiry transition
+  runs only in STABLE or PREPARING/DRAINING. After a valid current-view load,
+  an exact already-expired replay returns the rooted shard without a PUT in
+  APPLYING or a later STABLE epoch. APPLYING replay exact-loads the rooted
+  drained baseline and target page when they differ from the already-loaded
+  current objects, then accepts only the baseline or its deterministic target
+  successor. This slice does not implement CREATE admission,
+  COMMITTING, CHARGED, conflict abort, capacity-control/catalog writes, or the
+  cross-key global admission fence.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
   only `[bundles]`, `[maintenance]`, `[compaction]`, and `[upstream]` in repo-scoped settings. Public settings
   serialization uses the closed `EffectiveSettingsView`; diagnostic config dumps use the separate
