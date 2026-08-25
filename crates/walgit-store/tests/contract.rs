@@ -1055,7 +1055,7 @@ async fn s3_test_client(cfg: &walgit_config::StoreConfig) -> aws_sdk_s3::Client 
         .region(region)
         .force_path_style(cfg.s3.force_path_style)
         .behavior_version_latest();
-    if !cfg.s3.access_key_env.is_empty() {
+    if cfg.s3.credential_mode == walgit_config::S3CredentialMode::ExplicitEnv {
         let access = std::env::var(&cfg.s3.access_key_env)
             .expect("configured S3 contract access-key variable");
         let secret = std::env::var(&cfg.s3.secret_key_env)
@@ -1103,24 +1103,33 @@ async fn s3_contract() {
         .unwrap_or(true);
     let credential_mode =
         std::env::var("WALGIT_TEST_S3_CREDENTIAL_MODE").unwrap_or_else(|_| "default".into());
-    let (access_key_env, secret_key_env, session_token_env) = match credential_mode.as_str() {
-        "default" => (String::new(), String::new(), String::new()),
-        "explicit" => (
-            std::env::var("WALGIT_TEST_S3_ACCESS_KEY_ENV")
-                .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".into()),
-            std::env::var("WALGIT_TEST_S3_SECRET_KEY_ENV")
-                .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".into()),
-            std::env::var("WALGIT_TEST_S3_SESSION_TOKEN_ENV").unwrap_or_default(),
-        ),
-        other => panic!("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit, got {other}"),
-    };
+    let (credential_mode_config, access_key_env, secret_key_env, session_token_env) =
+        match credential_mode.as_str() {
+            "default" => (
+                walgit_config::S3CredentialMode::DefaultChain,
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+            "explicit" => (
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                std::env::var("WALGIT_TEST_S3_ACCESS_KEY_ENV")
+                    .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".into()),
+                std::env::var("WALGIT_TEST_S3_SECRET_KEY_ENV")
+                    .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".into()),
+                std::env::var("WALGIT_TEST_S3_SESSION_TOKEN_ENV").unwrap_or_default(),
+            ),
+            other => {
+                panic!("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit, got {other}")
+            }
+        };
 
     // Unique prefix per run.
     let prefix_base =
         std::env::var("WALGIT_TEST_S3_PREFIX").unwrap_or_else(|_| "contract-test".into());
     let prefix = format!("{prefix_base}-{}", uuid::Uuid::new_v4().simple());
     eprintln!(
-        "[s3_contract] endpoint={endpoint} region={region} path_style={force_path_style} bucket={bucket} prefix={prefix} credentials={credential_mode}"
+        "[s3_contract] provider parameters loaded: path_style={force_path_style} credentials={credential_mode}"
     );
 
     let cfg = walgit_config::StoreConfig {
@@ -1130,6 +1139,7 @@ async fn s3_contract() {
         s3: walgit_config::S3Config {
             endpoint: endpoint.clone(),
             region,
+            credential_mode: credential_mode_config,
             access_key_env,
             secret_key_env,
             session_token_env,

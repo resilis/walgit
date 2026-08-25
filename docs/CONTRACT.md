@@ -371,9 +371,23 @@ also requires soft-delete retention to be absent or exactly zero so an exact
 generation delete is permanent. WalGit verifies these prerequisites but never
 changes bucket policy.
 
+S3 credential selection is closed before any credential or network access.
+`default_chain` requires empty custom variable names and delegates only to the
+refreshable AWS SDK chain. `explicit_env` requires bounded portable access and
+secret variable names plus an optional session-token name; every named value
+must resolve non-empty or construction fails without falling back or exposing
+the value. The same static validator also closes region, DNS-compatible bucket,
+deployment-prefix, multipart-part-size, and endpoint syntax. Custom endpoints
+are origin-only and non-loopback endpoints require HTTPS. `Config::validate`
+and `S3Store::new` call this validator before credential or network access.
+S3 SDK diagnostics retain only the internal operation, transport category,
+numeric status, and an allowlisted service code. Raw SDK/provider messages,
+request URLs, credential values, bucket names, prefixes, and unknown service
+codes are not included in errors or provider-contract banners.
+
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for S3 when `WALGIT_TEST_S3_ENDPOINT` is set (endpoint, region, bucket, prefix, addressing mode,
-and default-chain/explicit credentials are parameterized with `WALGIT_TEST_S3_*`; every run adds a unique suffix),
+and closed default-chain/explicit-env credentials are parameterized with `WALGIT_TEST_S3_*`; every run adds a unique suffix),
 for gcs when `WALGIT_TEST_GCS_BUCKET` set.
 
 S3 large writes and compose use multipart completion as the destination's

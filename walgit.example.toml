@@ -74,12 +74,17 @@ multipart_part_size = "32MiB"     # S3: 5MiB..5GiB; raised automatically when ne
 
 [store.s3]
 endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
-region = "us-east-1"
-access_key_env = ""              # empty names use the refreshable AWS SDK default chain, including standard AWS env,
-secret_key_env = ""              # web-identity, shared config, ECS, and EC2 credentials. For a deliberate custom static
-session_token_env = ""           # override, name both access/secret vars and optionally a temporary session-token var.
+region = "us-east-1"              # 1-64 ASCII letters, digits, '.', '_', or '-'
+credential_mode = "default_chain" # refreshable AWS SDK chain: standard AWS env, web identity, shared config, ECS, or EC2.
+access_key_env = ""              # default_chain requires all three names empty. For a deliberate Kubernetes Secret,
+secret_key_env = ""              # use credential_mode = "explicit_env" and name both access/secret variables.
+session_token_env = ""           # explicit_env may also require one named temporary session-token variable.
 force_path_style = false          # true for most self-hosted S3 implementations
-# Bucket versioning is mandatory. WalGit verifies it during startup.
+# explicit_env never falls back to ambient AWS identity when a named variable is absent, empty, or non-Unicode.
+# Custom endpoints are origin-only. Non-loopback endpoints require HTTPS. Bucket names use the DNS-compatible
+# 3-63 byte S3 form. Prefixes are empty or 1-4 canonical lowercase key segments with no leading/trailing slash.
+# Bucket versioning is mandatory. WalGit verifies it during startup but does not change bucket configuration.
+# Run `just test-s3-provider` against an approved disposable bucket before selecting a production provider.
 
 [store.gcs]
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials

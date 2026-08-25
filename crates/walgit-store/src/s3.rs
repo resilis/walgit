@@ -74,6 +74,7 @@ impl S3Store {
     /// override it only when both resolve to non-empty values. A configured
     /// `session_token_env` is included for temporary explicit credentials.
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
+        cfg.validate_s3()?;
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
         let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .region(region.clone())
@@ -85,10 +86,11 @@ impl S3Store {
             .behavior_version_latest();
 
         if let Some((access_key, secret_key, session_token)) = explicit_credentials(
+            cfg.s3.credential_mode,
             &cfg.s3.access_key_env,
             &cfg.s3.secret_key_env,
             &cfg.s3.session_token_env,
-            |name| std::env::var(name).ok(),
+            |name| std::env::var(name),
         )? {
             s3_config = s3_config.credentials_provider(Credentials::new(
                 access_key,
@@ -379,54 +381,30 @@ fn sanitized_reqwest_error(op: &str, error: reqwest::Error) -> StoreError {
 }
 
 fn explicit_credentials(
+    mode: walgit_config::S3CredentialMode,
     access_name: &str,
     secret_name: &str,
     session_token_name: &str,
-    read: impl Fn(&str) -> Option<String>,
+    read: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
 ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
-    if access_name.is_empty() != secret_name.is_empty() {
-        anyhow::bail!(
-            "s3: explicit credential override is partial; access_key_env and secret_key_env must both be configured or both be empty"
-        );
-    }
-    if access_name.is_empty() {
-        if !session_token_name.is_empty() {
-            anyhow::bail!(
-                "s3: session_token_env requires configured access_key_env and secret_key_env"
-            );
-        }
+    if mode == walgit_config::S3CredentialMode::DefaultChain {
         return Ok(None);
     }
 
-    let access = (!access_name.is_empty())
-        .then(|| read(access_name))
-        .flatten()
-        .filter(|value| !value.is_empty());
-    let secret = (!secret_name.is_empty())
-        .then(|| read(secret_name))
-        .flatten()
-        .filter(|value| !value.is_empty());
-    let session_token = (!session_token_name.is_empty())
-        .then(|| read(session_token_name))
-        .flatten()
-        .filter(|value| !value.is_empty());
-    match (access, secret, session_token) {
-        (None, None, None) => Ok(None),
-        (Some(access), Some(secret), session_token)
-            if session_token_name.is_empty() || session_token.is_some() =>
-        {
-            Ok(Some((access, secret, session_token)))
-        }
-        (Some(_), Some(_), None) => anyhow::bail!(
-            "s3: configured session token variable {} must resolve to a non-empty value",
-            session_token_name
-        ),
-        _ => anyhow::bail!(
-            "s3: explicit credential override is partial; {} and {} must both resolve to non-empty values",
-            access_name,
-            secret_name
-        ),
-    }
+    let required = |name: &str, kind: &str| {
+        read(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("s3: explicit {kind} credential is missing or invalid"))
+    };
+    let access = required(access_name, "access-key")?;
+    let secret = required(secret_name, "secret-key")?;
+    let session_token = if session_token_name.is_empty() {
+        None
+    } else {
+        Some(required(session_token_name, "session-token")?)
+    };
+    Ok(Some((access, secret, session_token)))
 }
 
 fn multipart_part_size(len: u64, configured: u64) -> Result<u64> {
@@ -585,6 +563,40 @@ fn retryable_status(status: u16) -> bool {
     status == 429 || status >= 500
 }
 
+fn diagnostic_service_code(code: &str) -> Option<&str> {
+    matches!(
+        code,
+        "AccessDenied"
+            | "AuthorizationHeaderMalformed"
+            | "ConditionalRequestConflict"
+            | "InternalError"
+            | "InvalidArgument"
+            | "InvalidRequest"
+            | "NoSuchBucket"
+            | "RequestTimeout"
+            | "RequestTimeoutException"
+            | "ServiceUnavailable"
+            | "SlowDown"
+            | "Throttling"
+            | "ThrottlingException"
+            | "TooManyRequestsException"
+    )
+    .then_some(code)
+}
+
+fn sdk_error_diagnostic(
+    op: &str,
+    category: &str,
+    status: Option<u16>,
+    code: &str,
+) -> anyhow::Error {
+    let status = status
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".into());
+    let code = diagnostic_service_code(code).unwrap_or("unrecognized");
+    anyhow::anyhow!("s3 {op} {category}: status={status} code={code}")
+}
+
 fn classify_sdk_error<E>(op: &str, key: &str, err: aws_sdk_s3::error::SdkError<E>) -> StoreError
 where
     E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
@@ -609,10 +621,19 @@ where
         err,
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
     );
+    let category = match &err {
+        SdkError::ConstructionFailure(_) => "construction",
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "response",
+        SdkError::ServiceError(_) => "service",
+        _ => "other",
+    };
+    let diagnostic = sdk_error_diagnostic(op, category, status, code);
     if retryable_transport || retryable_status || retryable_service_code(code) {
-        StoreError::retryable(anyhow::anyhow!("s3 {op} error for {key}: {err}"))
+        StoreError::retryable(diagnostic)
     } else {
-        StoreError::other(anyhow::anyhow!("s3 {op} error for {key}: {err}"))
+        StoreError::other(diagnostic)
     }
 }
 
@@ -1613,21 +1634,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn explicit_credentials_fall_back_only_when_both_are_absent() {
+    fn explicit_credentials_never_fall_back_when_selected() {
         let empty = HashMap::<&str, &str>::new();
         assert!(
-            explicit_credentials("ACCESS", "SECRET", "", |name| empty
-                .get(name)
-                .map(ToString::to_string))
-            .expect("absent credentials use default chain")
-            .is_none()
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "ACCESS",
+                "SECRET",
+                "",
+                |name| empty
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
+            .is_err()
         );
 
         let both = HashMap::from([("ACCESS", "access-value"), ("SECRET", "secret-value")]);
         assert_eq!(
-            explicit_credentials("ACCESS", "SECRET", "", |name| both
-                .get(name)
-                .map(ToString::to_string))
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "ACCESS",
+                "SECRET",
+                "",
+                |name| both
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .expect("complete explicit credentials"),
             Some(("access-value".into(), "secret-value".into(), None))
         );
@@ -1641,9 +1675,16 @@ mod tests {
             ("AWS_SESSION_TOKEN", "token-value"),
         ]);
         assert!(
-            explicit_credentials("", "", "", |name| standard
-                .get(name)
-                .map(ToString::to_string))
+            explicit_credentials(
+                walgit_config::S3CredentialMode::DefaultChain,
+                "",
+                "",
+                "",
+                |name| standard
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .expect("empty override names select the SDK default chain")
             .is_none()
         );
@@ -1663,6 +1704,26 @@ mod tests {
         );
         require_enabled_versioning(Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_construction_cannot_bypass_static_s3_validation() {
+        let mut cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            ..Default::default()
+        };
+        cfg.s3.credential_mode = walgit_config::S3CredentialMode::DefaultChain;
+        cfg.s3.access_key_env = "SHOULD_NOT_BE_READ".into();
+        cfg.s3.secret_key_env = "ALSO_SHOULD_NOT_BE_READ".into();
+
+        let error = S3Store::new(&cfg)
+            .await
+            .err()
+            .expect("invalid static config must fail before opening S3")
+            .to_string();
+        assert!(error.contains("default_chain"), "{error}");
+        assert!(!error.contains("SHOULD_NOT_BE_READ"), "{error}");
+        assert!(!error.contains("ALSO_SHOULD_NOT_BE_READ"), "{error}");
     }
 
     #[test]
@@ -1825,9 +1886,16 @@ mod tests {
             ("CUSTOM_TOKEN", "token-value"),
         ]);
         assert_eq!(
-            explicit_credentials("CUSTOM_ACCESS", "CUSTOM_SECRET", "CUSTOM_TOKEN", |name| {
-                values.get(name).map(ToString::to_string)
-            },)
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "CUSTOM_ACCESS",
+                "CUSTOM_SECRET",
+                "CUSTOM_TOKEN",
+                |name| values
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .expect("complete temporary credentials"),
             Some((
                 "access-value".into(),
@@ -1840,20 +1908,35 @@ mod tests {
     #[test]
     fn partial_explicit_credentials_fail_without_exposing_values() {
         let values = HashMap::from([("ACCESS", "must-not-appear")]);
-        let error = explicit_credentials("ACCESS", "SECRET", "", |name| {
-            values.get(name).map(ToString::to_string)
-        })
+        let error = explicit_credentials(
+            walgit_config::S3CredentialMode::ExplicitEnv,
+            "ACCESS",
+            "SECRET",
+            "",
+            |name| {
+                values
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent)
+            },
+        )
         .expect_err("partial override must fail")
         .to_string();
-        assert!(error.contains("ACCESS"));
-        assert!(error.contains("SECRET"));
+        assert!(error.contains("secret-key"));
         assert!(!error.contains("must-not-appear"));
 
         let empty_secret = HashMap::from([("ACCESS", "must-not-appear"), ("SECRET", "")]);
         assert!(
-            explicit_credentials("ACCESS", "SECRET", "", |name| empty_secret
-                .get(name)
-                .map(ToString::to_string))
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "ACCESS",
+                "SECRET",
+                "",
+                |name| empty_secret
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .is_err()
         );
 
@@ -1861,15 +1944,50 @@ mod tests {
             ("ACCESS", "must-not-appear"),
             ("SECRET", "also-must-not-appear"),
         ]);
-        let error = explicit_credentials("ACCESS", "SECRET", "TOKEN", |name| {
-            missing_token.get(name).map(ToString::to_string)
-        })
+        let error = explicit_credentials(
+            walgit_config::S3CredentialMode::ExplicitEnv,
+            "ACCESS",
+            "SECRET",
+            "TOKEN",
+            |name| {
+                missing_token
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent)
+            },
+        )
         .expect_err("a configured session-token variable must resolve")
         .to_string();
         assert!(!error.contains("must-not-appear"));
         assert!(!error.contains("also-must-not-appear"));
-        assert!(explicit_credentials("ACCESS", "", "", |_| None).is_err());
-        assert!(explicit_credentials("", "", "TOKEN", |_| None).is_err());
+        assert!(error.contains("session-token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_explicit_credentials_fail_without_exposing_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = explicit_credentials(
+            walgit_config::S3CredentialMode::ExplicitEnv,
+            "ACCESS",
+            "SECRET",
+            "",
+            |name| {
+                if name == "ACCESS" {
+                    Err(std::env::VarError::NotUnicode(
+                        std::ffi::OsString::from_vec(b"secret-sentinel-\xff".to_vec()),
+                    ))
+                } else {
+                    Ok("other-secret-sentinel".into())
+                }
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("access-key"), "{error}");
+        assert!(!error.contains("secret-sentinel"), "{error}");
+        assert!(!error.contains("other-secret-sentinel"), "{error}");
     }
 
     #[tokio::test]
@@ -2144,5 +2262,17 @@ mod tests {
         }
         assert!(!retryable_status(409));
         assert!(!retryable_status(412));
+    }
+
+    #[test]
+    fn sdk_diagnostics_allowlist_provider_fields() {
+        const SENTINEL: &str = "provider-error-secret-sentinel";
+        let unknown = sdk_error_diagnostic("get", "service", Some(400), SENTINEL).to_string();
+        assert!(unknown.contains("status=400"), "{unknown}");
+        assert!(unknown.contains("code=unrecognized"), "{unknown}");
+        assert!(!unknown.contains(SENTINEL), "{unknown}");
+
+        let allowed = sdk_error_diagnostic("get", "service", Some(403), "AccessDenied").to_string();
+        assert!(allowed.contains("code=AccessDenied"), "{allowed}");
     }
 }

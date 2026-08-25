@@ -267,16 +267,28 @@ fn default_bulk_concurrency() -> usize {
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
+    /// Selects exactly one credential source. `default_chain` delegates to
+    /// the refreshable AWS SDK chain. `explicit_env` requires every named
+    /// credential variable to be present and never falls back.
+    pub credential_mode: S3CredentialMode,
     /// Custom environment-variable name for an explicit access key. Empty
-    /// leaves credentials under the refreshable AWS SDK default chain.
+    /// unless `credential_mode = "explicit_env"`.
     pub access_key_env: String,
     /// Custom environment-variable name for an explicit secret key. This and
-    /// `access_key_env` must both be empty or both resolve to non-empty values.
+    /// `access_key_env` are both required in `explicit_env` mode.
     pub secret_key_env: String,
     /// Optional custom environment-variable name for the session token that
     /// accompanies deliberately configured temporary explicit credentials.
     pub session_token_env: String,
     pub force_path_style: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum S3CredentialMode {
+    #[default]
+    DefaultChain,
+    ExplicitEnv,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1212,6 +1224,7 @@ impl Default for S3Config {
         S3Config {
             endpoint: "http://127.0.0.1:9000".into(),
             region: "us-east-1".into(),
+            credential_mode: S3CredentialMode::DefaultChain,
             access_key_env: String::new(),
             secret_key_env: String::new(),
             session_token_env: String::new(),
@@ -1603,6 +1616,13 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(!self.store.bucket.is_empty(), "store.bucket must be set");
+        // Validate inactive credential selectors too: the safe diagnostic
+        // view includes them, so arbitrary strings must not become an output
+        // channel merely because another backend is selected.
+        self.store.validate_s3_credential_selector()?;
+        if self.store.backend == StoreBackend::S3 {
+            self.store.validate_s3()?;
+        }
         let t = &self.server.tls;
         match t.mode {
             TlsMode::Files => anyhow::ensure!(
@@ -1880,6 +1900,139 @@ impl Config {
     }
 }
 
+impl StoreConfig {
+    /// Validate the complete static S3 selector before credential or network
+    /// access. `S3Store::new` also calls this so direct construction cannot
+    /// bypass the same fail-closed contract as `Config::validate`.
+    pub fn validate_s3(&self) -> Result<()> {
+        self.validate_s3_credential_selector()?;
+        let valid_bucket = self.bucket.len() >= 3
+            && self.bucket.len() <= 63
+            && self.bucket.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            })
+            && self
+                .bucket
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            && self
+                .bucket
+                .bytes()
+                .last()
+                .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            && !self.bucket.contains("..")
+            && self.bucket.split('.').all(|label| {
+                label
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                    && label
+                        .bytes()
+                        .last()
+                        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            })
+            && self.bucket.parse::<std::net::Ipv4Addr>().is_err();
+        anyhow::ensure!(
+            valid_bucket,
+            "store.bucket must be a 3-63 byte DNS-compatible S3 bucket name"
+        );
+        let prefix_segments: Vec<&str> = if self.prefix.is_empty() {
+            Vec::new()
+        } else {
+            self.prefix.split('/').collect()
+        };
+        let valid_prefix = self.prefix.len() <= 256
+            && prefix_segments.len() <= 4
+            && prefix_segments.iter().all(|segment| {
+                segment.len() <= 63
+                    && segment
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                    && !matches!(*segment, "." | "..")
+            });
+        anyhow::ensure!(
+            valid_prefix,
+            "store.prefix must be empty or 1-4 canonical S3 key segments totaling at most 256 bytes"
+        );
+        if !self.s3.endpoint.is_empty() {
+            let endpoint = validated_http_url("store.s3.endpoint", &self.s3.endpoint, false)?;
+            anyhow::ensure!(
+                endpoint.path() == "/",
+                "store.s3.endpoint must be an origin without a path"
+            );
+            let loopback = endpoint.host().is_some_and(|host| match host {
+                url::Host::Domain(domain) => domain == "localhost",
+                url::Host::Ipv4(address) => address.is_loopback(),
+                url::Host::Ipv6(address) => address.is_loopback(),
+            });
+            anyhow::ensure!(
+                endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback),
+                "store.s3.endpoint must use https (http is allowed only for a loopback development store)"
+            );
+        }
+
+        const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+        const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+        anyhow::ensure!(
+            (S3_MIN_PART_SIZE..=S3_MAX_PART_SIZE).contains(&self.multipart_part_size.as_u64()),
+            "store.multipart_part_size must be between 5MiB and 5GiB for S3"
+        );
+
+        Ok(())
+    }
+
+    fn validate_s3_credential_selector(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.s3.region.is_empty()
+                && self.s3.region.len() <= 64
+                && self
+                    .s3
+                    .region
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "store.s3.region must be 1-64 ASCII letters, digits, '.', '_', or '-'"
+        );
+        let valid_env_name = |name: &str| {
+            name.len() <= 128
+                && name
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_uppercase() || byte == b'_')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        };
+        match self.s3.credential_mode {
+            S3CredentialMode::DefaultChain => anyhow::ensure!(
+                self.s3.access_key_env.is_empty()
+                    && self.s3.secret_key_env.is_empty()
+                    && self.s3.session_token_env.is_empty(),
+                "store.s3 default_chain credential mode does not accept explicit environment-variable names"
+            ),
+            S3CredentialMode::ExplicitEnv => {
+                anyhow::ensure!(
+                    valid_env_name(&self.s3.access_key_env)
+                        && valid_env_name(&self.s3.secret_key_env),
+                    "store.s3 explicit_env credential mode requires valid access_key_env and secret_key_env names"
+                );
+                anyhow::ensure!(
+                    self.s3.session_token_env.is_empty()
+                        || valid_env_name(&self.s3.session_token_env),
+                    "store.s3.session_token_env is not a valid environment-variable name"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 fn origin_host(origin: &str) -> &str {
     let rest = origin
         .trim_end_matches('/')
@@ -2000,6 +2153,148 @@ mod tests {
         let text = toml::to_string(&c).unwrap();
         let back = Config::parse(&text).unwrap();
         assert_eq!(back.store.bucket, c.store.bucket);
+    }
+
+    #[test]
+    fn s3_default_chain_rejects_explicit_variable_names() {
+        let mut cfg = Config::default();
+        cfg.store.s3.access_key_env = "CUSTOM_ACCESS".into();
+        cfg.store.s3.secret_key_env = "CUSTOM_SECRET".into();
+
+        for backend in [StoreBackend::Gcs, StoreBackend::S3] {
+            cfg.store.backend = backend;
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("default_chain"), "{error}");
+            assert!(!error.contains("CUSTOM_ACCESS"), "{error}");
+            assert!(!error.contains("CUSTOM_SECRET"), "{error}");
+        }
+    }
+
+    #[test]
+    fn s3_explicit_env_requires_closed_portable_selectors() {
+        let mut cfg = Config::default();
+        cfg.store.backend = StoreBackend::S3;
+        cfg.store.s3.credential_mode = S3CredentialMode::ExplicitEnv;
+
+        for (access, secret, token) in [
+            ("", "CUSTOM_SECRET", ""),
+            ("CUSTOM_ACCESS", "", ""),
+            ("lowercase", "CUSTOM_SECRET", ""),
+            ("CUSTOM=ACCESS", "CUSTOM_SECRET", ""),
+            ("CUSTOM_ACCESS", "CUSTOM_SECRET", "TOKEN-NAME"),
+        ] {
+            cfg.store.s3.access_key_env = access.into();
+            cfg.store.s3.secret_key_env = secret.into();
+            cfg.store.s3.session_token_env = token.into();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.s3"), "{error}");
+            for selector in [access, secret, token] {
+                if !selector.is_empty() {
+                    assert!(!error.contains(selector), "selector leaked: {error}");
+                }
+            }
+        }
+
+        cfg.store.s3.access_key_env = "CUSTOM_ACCESS".into();
+        cfg.store.s3.secret_key_env = "CUSTOM_SECRET".into();
+        cfg.store.s3.session_token_env = "CUSTOM_SESSION_TOKEN".into();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn s3_region_is_nonempty_bounded_ascii() {
+        let mut cfg = Config::default();
+        cfg.store.backend = StoreBackend::S3;
+        for region in [
+            String::new(),
+            "eu west 1".into(),
+            "région".into(),
+            "x".repeat(65),
+        ] {
+            cfg.store.s3.region = region.clone();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.s3.region"), "{error}");
+            if !region.is_empty() {
+                assert!(!error.contains(&region), "region leaked: {error}");
+            }
+        }
+        cfg.store.s3.region = "eu-west-par".into();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn s3_static_location_and_multipart_contract_is_closed() {
+        let mut cfg = Config::default();
+        cfg.store.backend = StoreBackend::S3;
+
+        for bucket in [
+            "ab",
+            "UPPERCASE",
+            "192.0.2.1",
+            "starts-.bad",
+            "bad.-ends",
+            "bad..dots",
+        ] {
+            cfg.store.bucket = bucket.into();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.bucket"), "{error}");
+            assert!(!error.contains(bucket), "bucket leaked: {error}");
+        }
+        cfg.store.bucket = "walgit-production".into();
+
+        for prefix in [
+            "/leading",
+            "trailing/",
+            "too/many/prefix/segments/here",
+            "UPPERCASE",
+            ".",
+            "valid/../invalid",
+        ] {
+            cfg.store.prefix = prefix.into();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.prefix"), "{error}");
+            if prefix.len() > 3 {
+                assert!(!error.contains(prefix), "prefix leaked: {error}");
+            }
+        }
+        cfg.store.prefix = "production/walgit".into();
+
+        for endpoint in [
+            "http://s3.example.com",
+            "https://s3.example.com/provider-path",
+            "https://s3.example.com?query=sentinel",
+        ] {
+            cfg.store.s3.endpoint = endpoint.into();
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("store.s3.endpoint"), "{error}");
+            assert!(!error.contains("sentinel"), "endpoint leaked: {error}");
+        }
+        for endpoint in [
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+            "https://s3.eu-west-par.io.cloud.ovh.net",
+        ] {
+            cfg.store.s3.endpoint = endpoint.into();
+            cfg.validate().unwrap();
+        }
+
+        cfg.store.multipart_part_size = ByteSize::mib(4);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("multipart_part_size")
+        );
+        cfg.store.multipart_part_size = ByteSize::gib(6);
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("multipart_part_size")
+        );
+        cfg.store.multipart_part_size = ByteSize::mib(32);
+        cfg.validate().unwrap();
     }
 
     #[test]
