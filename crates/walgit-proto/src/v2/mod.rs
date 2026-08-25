@@ -27,17 +27,19 @@ pub use codec::{
     preflight_tenant_capacity_catalog_page,
 };
 pub use validate::{
-    ControlValidationError, CredentialTransitionKind, validate_capacity_admission_view,
+    ControlValidationError, CredentialTransitionKind, LoadedCommittingCapacityView,
+    LoadedRepoControlReceiptView, validate_capacity_admission_view,
     validate_capacity_applying_baseline, validate_capacity_charged_repo_control,
     validate_capacity_conflicting_repo_control, validate_capacity_control,
     validate_capacity_control_catalogs, validate_capacity_current_shard_object,
-    validate_capacity_current_shard_view, validate_capacity_retained_shard_budget_object,
+    validate_capacity_current_shard_view, validate_capacity_preparing_drainage_successor,
+    validate_capacity_receipt_obligation, validate_capacity_retained_shard_budget_object,
     validate_capacity_shard, validate_capacity_shard_catalog, validate_capacity_shard_object,
-    validate_capacity_shard_successor, validate_credential_control,
-    validate_credential_control_transition_structure, validate_mutation_receipt,
-    validate_mutation_result, validate_receipt_catalog, validate_repo_control,
-    validate_repo_control_successor, validate_tenant_capacity_catalog_object,
-    validate_tenant_capacity_catalog_page,
+    validate_capacity_shard_successor, validate_capacity_stable_admission_successor,
+    validate_credential_control, validate_credential_control_transition_structure,
+    validate_mutation_receipt, validate_mutation_result, validate_receipt_catalog,
+    validate_repo_control, validate_repo_control_receipt_catalog, validate_repo_control_successor,
+    validate_tenant_capacity_catalog_object, validate_tenant_capacity_catalog_page,
 };
 
 /// Frozen V2 repository-control schema version.

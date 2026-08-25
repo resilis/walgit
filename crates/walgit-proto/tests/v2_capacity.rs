@@ -21,6 +21,7 @@ const RESERVATION_ID: &str = "01890f4776447b8b9d7a876543210abd";
 const MUTATION_ID: &str = "01890f4776447b8b9d7a876543210abe";
 const CONFLICTING_MUTATION_ID: &str = "01890f4776447b8b9d7a876543210abf";
 const ADMISSION_FENCE_ID: &str = "01890f4776447b8b9d7a876543210ac0";
+const SETTLEMENT_ID: &str = "01890f4776447b8b9d7a876543210ac1";
 
 #[test]
 fn capacity_enum_numbers_and_wire_bytes_are_frozen() {
@@ -35,6 +36,10 @@ fn capacity_enum_numbers_and_wire_bytes_are_frozen() {
     assert_eq!(CapacityReservationState::Committing as i32, 2);
     assert_eq!(CapacityReservationState::Charged as i32, 3);
     assert_eq!(CapacityReservationState::Aborted as i32, 4);
+    assert_eq!(CapacityConflictClass::Unspecified as i32, 0);
+    assert_eq!(CapacityConflictClass::CreateControlExists as i32, 1);
+    assert_eq!(CapacityConflictClass::SameWriterVersionAdvanced as i32, 2);
+    assert_eq!(CapacityConflictClass::WriterEpochAdvanced as i32, 3);
 
     for (value, expected) in [(1, "1801"), (2, "1802")] {
         let control = CapacityControl {
@@ -56,6 +61,13 @@ fn capacity_enum_numbers_and_wire_bytes_are_frozen() {
             ..Default::default()
         };
         assert_eq!(hex::encode(reservation.encode_to_vec()), expected);
+    }
+    for (value, expected) in [(1, "2001"), (2, "2002"), (3, "2003")] {
+        let conflict = ConflictingCapacityCommit {
+            conflict_class: value,
+            ..Default::default()
+        };
+        assert_eq!(hex::encode(conflict.encode_to_vec()), expected);
     }
 
     let object = CapacityObjectRef {
@@ -172,8 +184,8 @@ fn persisted_capacity_roots_have_stable_exact_digests() {
             ),
             (
                 "conflicting",
-                410,
-                "ad418e0b33cf2cff783727befc134040bdd9a65c6b99cbed30d8ed7e6338e02e".to_owned(),
+                412,
+                "ea40f7df40cf1536761d094c7de8b74da145524cac25b687ade8ff33328bd1ab".to_owned(),
             ),
             (
                 "stable",
@@ -356,6 +368,10 @@ fn all_reservation_state_cells_are_exact_and_ttl_is_explicit() {
         panic!("conflict proof")
     };
     conflict.conflicting_mutation_id = conflict.commit.as_ref().unwrap().mutation_id.clone();
+    assert!(validate_capacity_shard(&shard_with(vec![value]), &prefix).is_err());
+
+    let mut value = conflicting_reservation(&prefix);
+    set_conflicting_class_raw(&mut value, 99);
     assert!(validate_capacity_shard(&shard_with(vec![value]), &prefix).is_err());
 
     let mut mismatch = reserved_reservation();
@@ -693,6 +709,122 @@ fn current_epoch_reservations_must_repeat_the_exact_account_and_page_slice() {
 }
 
 #[test]
+fn composed_pre_cas_gates_close_admission_and_preparing_drainage() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    let previous = shard_at_epoch(Vec::new(), 1);
+    let previous_object = exact_shard_ref(&previous, &prefix);
+    let page = tenant_page_with_slice(previous.shard as usize, 1_000);
+    let mut stable = stable_control(&prefix);
+    stable.tenant_catalog = Some(tenant_page_ref(&prefix, &page));
+    let mut reserved = shard_with(vec![reserved_reservation()]);
+    reserved.control_revision = previous.control_revision + 1;
+    validate_capacity_stable_admission_successor(
+        &stable,
+        &page,
+        &previous,
+        &previous_object,
+        &reserved,
+        1_000,
+        &prefix,
+    )
+    .unwrap();
+
+    let empty_page = TenantCapacityCatalogPage {
+        schema_version: 1,
+        allocations: Vec::new(),
+    };
+    let mut absent_tenant = stable.clone();
+    absent_tenant.tenant_catalog = Some(tenant_page_ref(&prefix, &empty_page));
+    assert!(
+        validate_capacity_stable_admission_successor(
+            &absent_tenant,
+            &empty_page,
+            &previous,
+            &previous_object,
+            &reserved,
+            1_000,
+            &prefix,
+        )
+        .is_err()
+    );
+    for slice in [999, 1_001] {
+        let wrong_page = tenant_page_with_slice(previous.shard as usize, slice);
+        let mut wrong_control = stable.clone();
+        wrong_control.tenant_catalog = Some(tenant_page_ref(&prefix, &wrong_page));
+        assert!(
+            validate_capacity_stable_admission_successor(
+                &wrong_control,
+                &wrong_page,
+                &previous,
+                &previous_object,
+                &reserved,
+                1_000,
+                &prefix,
+            )
+            .is_err()
+        );
+    }
+
+    let mut preparing = preparing_control(&prefix, RedistributionPhase::Draining);
+    preparing.tenant_catalog = Some(tenant_page_ref(&prefix, &page));
+    let reserved_object = exact_shard_ref(&reserved, &prefix);
+    let mut expired = shard_with(vec![expired_reservation()]);
+    expired.control_revision = reserved.control_revision + 1;
+    validate_capacity_preparing_drainage_successor(
+        &preparing,
+        &page,
+        &reserved,
+        &reserved_object,
+        &expired,
+        1_900,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut committing = reserved.clone();
+    committing.control_revision += 1;
+    committing.reservations[0] = committing_reservation();
+    assert!(
+        validate_capacity_preparing_drainage_successor(
+            &preparing,
+            &page,
+            &reserved,
+            &reserved_object,
+            &committing,
+            1_100,
+            &prefix,
+        )
+        .is_err()
+    );
+    assert!(
+        validate_capacity_preparing_drainage_successor(
+            &preparing,
+            &page,
+            &previous,
+            &previous_object,
+            &reserved,
+            1_000,
+            &prefix,
+        )
+        .is_err()
+    );
+    let mut applying = preparing_control(&prefix, RedistributionPhase::Applying);
+    applying.tenant_catalog = Some(tenant_page_ref(&prefix, &page));
+    assert!(
+        validate_capacity_preparing_drainage_successor(
+            &applying,
+            &page,
+            &reserved,
+            &reserved_object,
+            &expired,
+            1_900,
+            &prefix,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn shard_successor_closes_time_revision_and_state_transitions() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
     let empty = shard_at_epoch(Vec::new(), 1);
@@ -707,7 +839,12 @@ fn shard_successor_closes_time_revision_and_state_transitions() {
     let mut committing = reserved.clone();
     committing.control_revision = 3;
     committing.reservations[0] = committing_reservation();
-    validate_capacity_shard_successor(&reserved, &committing, 1_100, &prefix).unwrap();
+    for now in [1_000, 1_100, 1_899] {
+        validate_capacity_shard_successor(&reserved, &committing, now, &prefix).unwrap();
+    }
+    for now in [999, 1_900, 1_901] {
+        assert!(validate_capacity_shard_successor(&reserved, &committing, now, &prefix).is_err());
+    }
 
     let mut charged = committing.clone();
     charged.control_revision = 4;
@@ -768,35 +905,90 @@ fn terminal_repo_control_proofs_bind_exact_body_provider_mutation_and_writer() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
 
     let mut charged = charged_reservation(&prefix);
-    let mut landed = repo_control_for_reservation(&charged, MUTATION_ID, 1, &prefix);
-    let observed = exact_landed_control_ref(&landed, b"landed-v1");
-    let Some(CapacityReservationPayload::Charged(payload)) = charged.state_payload.as_mut() else {
-        panic!("charged payload")
-    };
-    payload.landed_control = Some(observed.clone());
-    validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).unwrap();
+    let (mut landed, observed, catalog, committing_shard, committing_object) =
+        charged_proof_inputs(&mut charged, 1, &prefix);
+    validate_capacity_charged_repo_control(
+        &charged,
+        &landed,
+        &observed,
+        &catalog,
+        &committing_shard,
+        &committing_object,
+        &prefix,
+    )
+    .unwrap();
 
     landed.last_internal_mutation_id = uuid(CONFLICTING_MUTATION_ID);
-    assert!(validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).is_err());
+    assert!(
+        validate_capacity_charged_repo_control(
+            &charged,
+            &landed,
+            &observed,
+            &catalog,
+            &committing_shard,
+            &committing_object,
+            &prefix,
+        )
+        .is_err()
+    );
     landed.last_internal_mutation_id = uuid(MUTATION_ID);
     landed.writer.as_mut().unwrap().epoch = 2;
-    assert!(validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).is_err());
+    assert!(
+        validate_capacity_charged_repo_control(
+            &charged,
+            &landed,
+            &observed,
+            &catalog,
+            &committing_shard,
+            &committing_object,
+            &prefix,
+        )
+        .is_err()
+    );
     landed.writer.as_mut().unwrap().epoch = 1;
     landed.inline_settings = Bytes::from_static(b"body-changed");
-    assert!(validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).is_err());
+    assert!(
+        validate_capacity_charged_repo_control(
+            &charged,
+            &landed,
+            &observed,
+            &catalog,
+            &committing_shard,
+            &committing_object,
+            &prefix,
+        )
+        .is_err()
+    );
 
-    let landed = repo_control_for_reservation(&charged, MUTATION_ID, 1, &prefix);
+    let (landed, observed, catalog, committing_shard, committing_object) =
+        charged_proof_inputs(&mut charged, 1, &prefix);
     let mut wrong_identity = landed.clone();
     wrong_identity.identity.as_mut().unwrap().project_id = Bytes::from_static(b"other-project");
     assert!(
-        validate_capacity_charged_repo_control(&charged, &wrong_identity, &observed, &prefix)
-            .is_err()
+        validate_capacity_charged_repo_control(
+            &charged,
+            &wrong_identity,
+            &observed,
+            &catalog,
+            &committing_shard,
+            &committing_object,
+            &prefix,
+        )
+        .is_err()
     );
     let mut wrong_provider = observed.clone();
     wrong_provider.object_version_id = Bytes::from_static(b"wrong-provider-version");
     assert!(
-        validate_capacity_charged_repo_control(&charged, &landed, &wrong_provider, &prefix)
-            .is_err()
+        validate_capacity_charged_repo_control(
+            &charged,
+            &landed,
+            &wrong_provider,
+            &catalog,
+            &committing_shard,
+            &committing_object,
+            &prefix,
+        )
+        .is_err()
     );
     let mut wrong_digest = observed.clone();
     let mut digest = wrong_digest.digest.to_vec();
@@ -814,6 +1006,9 @@ fn terminal_repo_control_proofs_bind_exact_body_provider_mutation_and_writer() {
             &wrong_digest_reservation,
             &landed,
             &wrong_digest,
+            &catalog,
+            &committing_shard,
+            &committing_object,
             &prefix,
         )
         .is_err()
@@ -832,6 +1027,9 @@ fn terminal_repo_control_proofs_bind_exact_body_provider_mutation_and_writer() {
             &wrong_size_reservation,
             &landed,
             &wrong_size,
+            &catalog,
+            &committing_shard,
+            &committing_object,
             &prefix,
         )
         .is_err()
@@ -845,40 +1043,322 @@ fn terminal_repo_control_proofs_bind_exact_body_provider_mutation_and_writer() {
         };
         payload.commit.as_mut().unwrap().kind = MutationKind::WriterTakeover as i32;
     }
-    let takeover_control = repo_control_for_reservation(&takeover, MUTATION_ID, 2, &prefix);
-    let takeover_ref = exact_landed_control_ref(&takeover_control, b"takeover-v1");
-    let Some(CapacityReservationPayload::Charged(payload)) = takeover.state_payload.as_mut() else {
-        panic!("charged payload")
-    };
-    payload.landed_control = Some(takeover_ref.clone());
-    validate_capacity_charged_repo_control(&takeover, &takeover_control, &takeover_ref, &prefix)
-        .unwrap();
-
-    let mut conflict = conflicting_reservation(&prefix);
-    let conflicting_control =
-        repo_control_for_reservation(&conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
-    let conflicting_ref = exact_landed_control_ref(&conflicting_control, b"conflict-v1");
-    set_conflicting_control(&mut conflict, conflicting_ref.clone());
-    validate_capacity_conflicting_repo_control(
-        &conflict,
-        &conflicting_control,
-        &conflicting_ref,
+    let (takeover_control, takeover_ref, takeover_catalog, takeover_shard, takeover_shard_ref) =
+        charged_proof_inputs(&mut takeover, 2, &prefix);
+    validate_capacity_charged_repo_control(
+        &takeover,
+        &takeover_control,
+        &takeover_ref,
+        &takeover_catalog,
+        &takeover_shard,
+        &takeover_shard_ref,
         &prefix,
     )
     .unwrap();
 
-    let wrong_epoch = repo_control_for_reservation(&conflict, CONFLICTING_MUTATION_ID, 2, &prefix);
-    let wrong_epoch_ref = exact_landed_control_ref(&wrong_epoch, b"conflict-v2");
-    set_conflicting_control(&mut conflict, wrong_epoch_ref.clone());
+    let mut conflict = conflicting_reservation(&prefix);
+    let raw = repo_control_for_reservation(&conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let (
+        conflicting_control,
+        conflicting_ref,
+        conflicting_catalog,
+        expected_receipt,
+        conflict_shard,
+        conflict_shard_ref,
+    ) = conflict_proof_inputs(&mut conflict, raw, b"conflict-v1", &prefix);
+    validate_capacity_conflicting_repo_control(
+        &conflict,
+        &conflicting_control,
+        &conflicting_ref,
+        &conflicting_catalog,
+        &expected_receipt,
+        &conflict_shard,
+        &conflict_shard_ref,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut same_prior_conflict = conflicting_reservation(&prefix);
+    let raw =
+        repo_control_for_reservation(&same_prior_conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let (same_prior_control, same_prior_ref, same_prior_catalog, expected, shard, shard_ref) =
+        conflict_proof_inputs(&mut same_prior_conflict, raw, b"repo-v1", &prefix);
     assert!(
         validate_capacity_conflicting_repo_control(
-            &conflict,
-            &wrong_epoch,
-            &wrong_epoch_ref,
+            &same_prior_conflict,
+            &same_prior_control,
+            &same_prior_ref,
+            &same_prior_catalog,
+            &expected,
+            &shard,
+            &shard_ref,
             &prefix,
         )
         .is_err()
     );
+
+    let mut create_conflict = conflict.clone();
+    set_conflicting_predecessor(
+        &mut create_conflict,
+        MutationKind::Create,
+        CapacityCommitPredecessor::NoPriorControl(NoPriorControl {}),
+        CapacityConflictClass::CreateControlExists,
+    );
+    let raw = repo_control_for_reservation(&create_conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let (create_control, create_ref, create_catalog, expected, shard, shard_ref) =
+        conflict_proof_inputs(&mut create_conflict, raw, b"create-conflict-v1", &prefix);
+    validate_capacity_conflicting_repo_control(
+        &create_conflict,
+        &create_control,
+        &create_ref,
+        &create_catalog,
+        &expected,
+        &shard,
+        &shard_ref,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut create_collision = conflicting_reservation(&prefix);
+    set_conflicting_predecessor(
+        &mut create_collision,
+        MutationKind::Create,
+        CapacityCommitPredecessor::NoPriorControl(NoPriorControl {}),
+        CapacityConflictClass::CreateControlExists,
+    );
+    let raw = repo_control_for_reservation(&create_collision, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let raw = different_identity_control_same_path(&raw, &prefix);
+    let (
+        different_identity_control,
+        different_identity_ref,
+        collision_catalog,
+        collision_expected,
+        collision_shard,
+        collision_shard_ref,
+    ) = conflict_proof_inputs(&mut create_collision, raw, b"create-collision-v1", &prefix);
+    validate_capacity_conflicting_repo_control(
+        &create_collision,
+        &different_identity_control,
+        &different_identity_ref,
+        &collision_catalog,
+        &collision_expected,
+        &collision_shard,
+        &collision_shard_ref,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut wrong_epoch_conflict = conflicting_reservation(&prefix);
+    let raw =
+        repo_control_for_reservation(&wrong_epoch_conflict, CONFLICTING_MUTATION_ID, 2, &prefix);
+    let (wrong_epoch, wrong_epoch_ref, wrong_catalog, expected, shard, shard_ref) =
+        conflict_proof_inputs(&mut wrong_epoch_conflict, raw, b"conflict-v2", &prefix);
+    assert!(
+        validate_capacity_conflicting_repo_control(
+            &wrong_epoch_conflict,
+            &wrong_epoch,
+            &wrong_epoch_ref,
+            &wrong_catalog,
+            &expected,
+            &shard,
+            &shard_ref,
+            &prefix,
+        )
+        .is_err()
+    );
+
+    let mut writer_advanced = conflicting_reservation(&prefix);
+    set_conflicting_class(
+        &mut writer_advanced,
+        CapacityConflictClass::WriterEpochAdvanced,
+    );
+    let raw = repo_control_for_reservation(&writer_advanced, CONFLICTING_MUTATION_ID, 2, &prefix);
+    let (writer_advanced_control, writer_advanced_ref, writer_catalog, expected, shard, shard_ref) =
+        conflict_proof_inputs(&mut writer_advanced, raw, b"writer-advanced-v1", &prefix);
+    validate_capacity_conflicting_repo_control(
+        &writer_advanced,
+        &writer_advanced_control,
+        &writer_advanced_ref,
+        &writer_catalog,
+        &expected,
+        &shard,
+        &shard_ref,
+        &prefix,
+    )
+    .unwrap();
+    let mut wrong_writer_advanced = conflicting_reservation(&prefix);
+    set_conflicting_class(
+        &mut wrong_writer_advanced,
+        CapacityConflictClass::WriterEpochAdvanced,
+    );
+    let raw =
+        repo_control_for_reservation(&wrong_writer_advanced, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let (same_writer_control, same_writer_ref, catalog, expected, shard, shard_ref) =
+        conflict_proof_inputs(&mut wrong_writer_advanced, raw, b"same-writer-v1", &prefix);
+    assert!(
+        validate_capacity_conflicting_repo_control(
+            &wrong_writer_advanced,
+            &same_writer_control,
+            &same_writer_ref,
+            &catalog,
+            &expected,
+            &shard,
+            &shard_ref,
+            &prefix,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn receipt_catalog_and_capacity_obligation_are_exact_composition_gates() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    let mut charged = charged_reservation(&prefix);
+    let (landed, observed, catalog, committing_shard, committing_object) =
+        charged_proof_inputs(&mut charged, 1, &prefix);
+    validate_repo_control_receipt_catalog(&landed, &catalog, &prefix).unwrap();
+    let committing = &committing_shard.reservations[0];
+    let receipt = catalog.rows[0].receipt.as_ref().unwrap();
+    validate_capacity_receipt_obligation(
+        committing,
+        &committing_shard,
+        &committing_object,
+        receipt,
+        &prefix,
+    )
+    .unwrap();
+
+    let mut wrong_count = landed.clone();
+    wrong_count.receipt_catalog.as_mut().unwrap().item_count += 1;
+    assert!(validate_repo_control_receipt_catalog(&wrong_count, &catalog, &prefix).is_err());
+    let mut wrong_body = catalog.clone();
+    wrong_body.rows[0].receipt.as_mut().unwrap().request_digest = Bytes::from(vec![0x45; 32]);
+    assert!(validate_repo_control_receipt_catalog(&landed, &wrong_body, &prefix).is_err());
+    let mut two_unresolved = catalog.clone();
+    let mut second_receipt = no_capacity_receipt(&landed);
+    second_receipt.mutation_id = uuid(CONFLICTING_MUTATION_ID);
+    two_unresolved.rows.push(ReceiptCatalogRow {
+        mutation_id: second_receipt.mutation_id.clone(),
+        state: ReceiptState::Unresolved as i32,
+        receipt: Some(second_receipt),
+        result: None,
+        settlement_mutation_id: Bytes::new(),
+    });
+    let mut two_unresolved_control = landed.clone();
+    attach_receipt_catalog(&mut two_unresolved_control, &two_unresolved, &prefix);
+    assert!(
+        validate_repo_control_receipt_catalog(&two_unresolved_control, &two_unresolved, &prefix,)
+            .is_err()
+    );
+
+    let mut settled_catalog = catalog.clone();
+    settle_catalog_row(&mut settled_catalog.rows[0], &prefix);
+    let mut settled_control = landed.clone();
+    settled_control.last_internal_mutation_id = uuid(SETTLEMENT_ID);
+    attach_receipt_catalog(&mut settled_control, &settled_catalog, &prefix);
+    validate_repo_control_receipt_catalog(&settled_control, &settled_catalog, &prefix).unwrap();
+    let mut wrong_obligation = receipt.clone();
+    let Some(mutation_receipt::CapacityObligation::Capacity(value)) =
+        wrong_obligation.capacity_obligation.as_mut()
+    else {
+        panic!("capacity obligation")
+    };
+    value.shard_object_version_id = Bytes::from_static(b"another-shard-version");
+    assert!(
+        validate_capacity_receipt_obligation(
+            committing,
+            &committing_shard,
+            &committing_object,
+            &wrong_obligation,
+            &prefix,
+        )
+        .is_err()
+    );
+
+    let mut conflict = conflicting_reservation(&prefix);
+    let prior_committing = prior_committing_reservation(&conflict);
+    let prior_shard = shard_with(vec![prior_committing.clone()]);
+    let prior_shard_object =
+        exact_capacity_shard_ref(&prior_shard, b"capacity-committing-v1", &prefix);
+    let expected_receipt = capacity_receipt_for(&prior_committing, &prior_shard_object);
+    let mut current = repo_control_for_reservation(&conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let conflicting_receipt = no_capacity_receipt(&current);
+    let mut current_catalog = unresolved_catalog(expected_receipt.clone());
+    settle_catalog_row(&mut current_catalog.rows[0], &prefix);
+    current_catalog.rows.push(ReceiptCatalogRow {
+        mutation_id: conflicting_receipt.mutation_id.clone(),
+        state: ReceiptState::Unresolved as i32,
+        receipt: Some(conflicting_receipt),
+        result: None,
+        settlement_mutation_id: Bytes::new(),
+    });
+    current_catalog
+        .rows
+        .sort_by(|left, right| left.mutation_id.cmp(&right.mutation_id));
+    attach_receipt_catalog(&mut current, &current_catalog, &prefix);
+    let current_object = exact_landed_control_ref(&current, b"conflict-after-success-v1");
+    set_conflicting_control(&mut conflict, current_object.clone());
+    assert!(
+        validate_capacity_conflicting_repo_control(
+            &conflict,
+            &current,
+            &current_object,
+            &current_catalog,
+            &expected_receipt,
+            &prior_shard,
+            &prior_shard_object,
+            &prefix,
+        )
+        .is_err(),
+        "a later current version cannot conceal an already-rooted expected mutation"
+    );
+
+    let mut unrepresented = current.clone();
+    unrepresented.last_internal_mutation_id = uuid(ADMISSION_FENCE_ID);
+    let unrepresented_object = exact_landed_control_ref(&unrepresented, b"unrepresented-v1");
+    set_conflicting_control(&mut conflict, unrepresented_object.clone());
+    assert!(
+        validate_capacity_conflicting_repo_control(
+            &conflict,
+            &unrepresented,
+            &unrepresented_object,
+            &current_catalog,
+            &expected_receipt,
+            &prior_shard,
+            &prior_shard_object,
+            &prefix,
+        )
+        .is_err()
+    );
+
+    let mut settlement_conflict = conflicting_reservation(&prefix);
+    set_conflicting_mutation_id(&mut settlement_conflict, SETTLEMENT_ID);
+    let committing = prior_committing_reservation(&settlement_conflict);
+    let committing_shard = shard_with(vec![committing.clone()]);
+    let committing_object =
+        exact_capacity_shard_ref(&committing_shard, b"settled-conflict-shard-v1", &prefix);
+    let expected_receipt = capacity_receipt_for(&committing, &committing_object);
+    let mut settled_current =
+        repo_control_for_reservation(&settlement_conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let mut settled_current_catalog = unresolved_catalog(no_capacity_receipt(&settled_current));
+    settle_catalog_row(&mut settled_current_catalog.rows[0], &prefix);
+    settled_current.last_internal_mutation_id = uuid(SETTLEMENT_ID);
+    attach_receipt_catalog(&mut settled_current, &settled_current_catalog, &prefix);
+    let settled_current_object = exact_landed_control_ref(&settled_current, b"settled-current-v1");
+    set_conflicting_control(&mut settlement_conflict, settled_current_object.clone());
+    validate_capacity_conflicting_repo_control(
+        &settlement_conflict,
+        &settled_current,
+        &settled_current_object,
+        &settled_current_catalog,
+        &expected_receipt,
+        &committing_shard,
+        &committing_object,
+        &prefix,
+    )
+    .unwrap();
+
+    let _ = observed;
 }
 
 #[test]
@@ -1513,6 +1993,7 @@ fn conflicting_reservation(prefix: &DeploymentPrefix) -> CapacityReservation {
                     commit: Some(commit_binding()),
                     conflicting_control: Some(landed_control(prefix)),
                     conflicting_mutation_id: uuid(CONFLICTING_MUTATION_ID),
+                    conflict_class: CapacityConflictClass::SameWriterVersionAdvanced as i32,
                 }),
             )),
         }),
@@ -1530,6 +2011,69 @@ fn set_conflicting_control(reservation: &mut CapacityReservation, control: Lande
         panic!("conflict proof")
     };
     proof.conflicting_control = Some(control);
+}
+
+fn set_conflicting_predecessor(
+    reservation: &mut CapacityReservation,
+    kind: MutationKind,
+    predecessor: CapacityCommitPredecessor,
+    conflict_class: CapacityConflictClass,
+) {
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::ConflictingCommit(proof)) =
+        aborted.proof.as_mut()
+    else {
+        panic!("conflict proof")
+    };
+    let commit = proof.commit.as_mut().unwrap();
+    commit.kind = kind as i32;
+    commit.predecessor = Some(predecessor);
+    proof.conflict_class = conflict_class as i32;
+}
+
+fn set_conflicting_class(
+    reservation: &mut CapacityReservation,
+    conflict_class: CapacityConflictClass,
+) {
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::ConflictingCommit(proof)) =
+        aborted.proof.as_mut()
+    else {
+        panic!("conflict proof")
+    };
+    proof.conflict_class = conflict_class as i32;
+}
+
+fn set_conflicting_class_raw(reservation: &mut CapacityReservation, conflict_class: i32) {
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::ConflictingCommit(proof)) =
+        aborted.proof.as_mut()
+    else {
+        panic!("conflict proof")
+    };
+    proof.conflict_class = conflict_class;
+}
+
+fn set_conflicting_mutation_id(reservation: &mut CapacityReservation, mutation_id: &str) {
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::ConflictingCommit(proof)) =
+        aborted.proof.as_mut()
+    else {
+        panic!("conflict proof")
+    };
+    proof.conflicting_mutation_id = uuid(mutation_id);
 }
 
 fn reservation(
@@ -1622,6 +2166,297 @@ fn exact_landed_control_ref(control: &RepoControl, object_version_id: &[u8]) -> 
         digest: Bytes::copy_from_slice(&Sha256::digest(&encoded)),
         size: encoded.len() as u64,
     }
+}
+
+fn validate_capacity_charged_repo_control(
+    reservation: &CapacityReservation,
+    control: &RepoControl,
+    observed_control: &LandedControlRef,
+    catalog: &ReceiptCatalog,
+    committing_shard: &CapacityShard,
+    observed_shard: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    walgit_proto::v2::validate_capacity_charged_repo_control(
+        reservation,
+        LoadedRepoControlReceiptView {
+            control,
+            observed_object: observed_control,
+            receipt_catalog: catalog,
+        },
+        LoadedCommittingCapacityView {
+            shard: committing_shard,
+            observed_object: observed_shard,
+        },
+        prefix,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Keeps each proof component explicit in the negative matrix.
+fn validate_capacity_conflicting_repo_control(
+    reservation: &CapacityReservation,
+    control: &RepoControl,
+    observed_control: &LandedControlRef,
+    catalog: &ReceiptCatalog,
+    expected_receipt: &MutationReceipt,
+    committing_shard: &CapacityShard,
+    observed_shard: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    walgit_proto::v2::validate_capacity_conflicting_repo_control(
+        reservation,
+        LoadedRepoControlReceiptView {
+            control,
+            observed_object: observed_control,
+            receipt_catalog: catalog,
+        },
+        expected_receipt,
+        LoadedCommittingCapacityView {
+            shard: committing_shard,
+            observed_object: observed_shard,
+        },
+        prefix,
+    )
+}
+
+fn prior_committing_reservation(terminal: &CapacityReservation) -> CapacityReservation {
+    let commit = match terminal.state_payload.as_ref().unwrap() {
+        CapacityReservationPayload::Charged(value) => value.commit.clone(),
+        CapacityReservationPayload::Aborted(value) => match value.proof.as_ref().unwrap() {
+            aborted_capacity_reservation::Proof::ConflictingCommit(value) => value.commit.clone(),
+            aborted_capacity_reservation::Proof::Expired(_) => panic!("expiry has no commit"),
+        },
+        _ => panic!("terminal reservation required"),
+    };
+    let mut reservation = terminal.clone();
+    reservation.state = CapacityReservationState::Committing as i32;
+    reservation.state_payload = Some(CapacityReservationPayload::Committing(
+        CommittingCapacityReservation { commit },
+    ));
+    reservation
+}
+
+fn exact_capacity_shard_ref(
+    shard: &CapacityShard,
+    object_version_id: &[u8],
+    prefix: &DeploymentPrefix,
+) -> CapacityObjectRef {
+    let encoded = encode_capacity_shard(shard, prefix).unwrap();
+    CapacityObjectRef {
+        key: Bytes::from(capacity_shard_key(prefix, shard.shard as u8).unwrap()),
+        object_version_id: Bytes::copy_from_slice(object_version_id),
+        digest: Bytes::copy_from_slice(&Sha256::digest(&encoded)),
+        size: encoded.len() as u64,
+    }
+}
+
+fn capacity_receipt_for(
+    reservation: &CapacityReservation,
+    shard_object: &CapacityObjectRef,
+) -> MutationReceipt {
+    let Some(CapacityReservationPayload::Committing(value)) = reservation.state_payload.as_ref()
+    else {
+        panic!("committing reservation")
+    };
+    let commit = value.commit.as_ref().unwrap();
+    let predecessor = match commit.predecessor.as_ref().unwrap() {
+        CapacityCommitPredecessor::NoPriorControl(_) => {
+            mutation_receipt::Predecessor::NoPriorControl(NoPriorControl {})
+        }
+        CapacityCommitPredecessor::PriorControl(value) => {
+            mutation_receipt::Predecessor::PriorControl(value.clone())
+        }
+    };
+    MutationReceipt {
+        schema_version: 1,
+        identity: reservation.identity.clone(),
+        mutation_id: commit.mutation_id.clone(),
+        kind: commit.kind,
+        writer_epoch: commit.writer_epoch,
+        wal_sequence: 0,
+        request_digest: Bytes::from(vec![0x44; 32]),
+        immutable_dependency_digests: Vec::new(),
+        predecessor: Some(predecessor),
+        capacity_obligation: Some(mutation_receipt::CapacityObligation::Capacity(
+            CapacityObligation {
+                allocation_epoch: reservation.allocation_epoch,
+                shard_key: shard_object.key.clone(),
+                shard_object_version_id: shard_object.object_version_id.clone(),
+                reservation_id: reservation.reservation_id.clone(),
+                tenant_slice_bytes: reservation.tenant_slice_bytes,
+                mutation_id: commit.mutation_id.clone(),
+                byte_count: reservation.byte_count,
+            },
+        )),
+        event_obligation: Some(mutation_receipt::EventObligation::NoEvent(
+            NoEventObligation {},
+        )),
+    }
+}
+
+fn no_capacity_receipt(control: &RepoControl) -> MutationReceipt {
+    MutationReceipt {
+        schema_version: 1,
+        identity: control.identity.clone(),
+        mutation_id: control.last_internal_mutation_id.clone(),
+        kind: MutationKind::Settings as i32,
+        writer_epoch: control.writer.as_ref().unwrap().epoch,
+        wal_sequence: 0,
+        request_digest: Bytes::from(vec![0x66; 32]),
+        immutable_dependency_digests: Vec::new(),
+        predecessor: Some(mutation_receipt::Predecessor::PriorControl(
+            PriorControlBinding {
+                cas_token: Bytes::from_static(b"other-cas"),
+                object_version_id: Bytes::from_static(b"other-prior"),
+            },
+        )),
+        capacity_obligation: Some(mutation_receipt::CapacityObligation::NoCapacity(
+            NoCapacityObligation {},
+        )),
+        event_obligation: Some(mutation_receipt::EventObligation::NoEvent(
+            NoEventObligation {},
+        )),
+    }
+}
+
+fn unresolved_catalog(receipt: MutationReceipt) -> ReceiptCatalog {
+    ReceiptCatalog {
+        schema_version: 1,
+        identity: receipt.identity.clone(),
+        rows: vec![ReceiptCatalogRow {
+            mutation_id: receipt.mutation_id.clone(),
+            state: ReceiptState::Unresolved as i32,
+            receipt: Some(receipt),
+            result: None,
+            settlement_mutation_id: Bytes::new(),
+        }],
+    }
+}
+
+fn settle_catalog_row(row: &mut ReceiptCatalogRow, prefix: &DeploymentPrefix) {
+    let receipt = row.receipt.as_ref().unwrap();
+    let identity = receipt.identity.clone().unwrap();
+    row.state = ReceiptState::Settled as i32;
+    row.settlement_mutation_id = uuid(SETTLEMENT_ID);
+    row.result = Some(TargetObjectRef {
+        identity: Some(identity.clone()),
+        key: Bytes::from(format!(
+            "{}v2/repositories/by-id/{}/g{:016x}/receipts/results/{}.pb",
+            prefix.as_str(),
+            hex::encode(&identity.repository_uuid),
+            identity.generation,
+            hex::encode(&receipt.mutation_id)
+        )),
+        object_version_id: Bytes::from_static(b"result-v1"),
+        digest: Bytes::from(vec![0x77; 32]),
+        size: 1,
+    });
+}
+
+fn receipt_catalog_root(catalog: &ReceiptCatalog, prefix: &DeploymentPrefix) -> CatalogRoot {
+    let encoded = encode_receipt_catalog(catalog).unwrap();
+    let digest: [u8; 32] = Sha256::digest(&encoded).into();
+    let identity = catalog.identity.clone().unwrap();
+    CatalogRoot {
+        kind: CatalogKind::Receipt as i32,
+        object: Some(TargetObjectRef {
+            identity: Some(identity.clone()),
+            key: Bytes::from(format!(
+                "{}v2/repositories/by-id/{}/g{:016x}/catalogs/receipt/{}.pb",
+                prefix.as_str(),
+                hex::encode(&identity.repository_uuid),
+                identity.generation,
+                hex::encode(digest)
+            )),
+            object_version_id: Bytes::from_static(b"receipt-catalog-v1"),
+            digest: Bytes::copy_from_slice(&digest),
+            size: encoded.len() as u64,
+        }),
+        depth: 1,
+        node_count: 1,
+        item_count: catalog.rows.len() as u64,
+        total_encoded_bytes: encoded.len() as u64,
+    }
+}
+
+fn attach_receipt_catalog(
+    control: &mut RepoControl,
+    catalog: &ReceiptCatalog,
+    prefix: &DeploymentPrefix,
+) {
+    control.receipt_catalog = Some(receipt_catalog_root(catalog, prefix));
+}
+
+fn charged_proof_inputs(
+    charged: &mut CapacityReservation,
+    writer_epoch: u64,
+    prefix: &DeploymentPrefix,
+) -> (
+    RepoControl,
+    LandedControlRef,
+    ReceiptCatalog,
+    CapacityShard,
+    CapacityObjectRef,
+) {
+    let committing = prior_committing_reservation(charged);
+    let shard = shard_with(vec![committing.clone()]);
+    let shard_object = exact_capacity_shard_ref(&shard, b"capacity-committing-v1", prefix);
+    let catalog = unresolved_catalog(capacity_receipt_for(&committing, &shard_object));
+    let mut control = repo_control_for_reservation(charged, MUTATION_ID, writer_epoch, prefix);
+    attach_receipt_catalog(&mut control, &catalog, prefix);
+    let control_object = exact_landed_control_ref(&control, b"landed-v1");
+    let Some(CapacityReservationPayload::Charged(payload)) = charged.state_payload.as_mut() else {
+        panic!("charged payload")
+    };
+    payload.landed_control = Some(control_object.clone());
+    (control, control_object, catalog, shard, shard_object)
+}
+
+fn conflict_proof_inputs(
+    conflict: &mut CapacityReservation,
+    mut control: RepoControl,
+    provider_version: &[u8],
+    prefix: &DeploymentPrefix,
+) -> (
+    RepoControl,
+    LandedControlRef,
+    ReceiptCatalog,
+    MutationReceipt,
+    CapacityShard,
+    CapacityObjectRef,
+) {
+    let committing = prior_committing_reservation(conflict);
+    let shard = shard_with(vec![committing.clone()]);
+    let shard_object = exact_capacity_shard_ref(&shard, b"capacity-committing-v1", prefix);
+    let expected_receipt = capacity_receipt_for(&committing, &shard_object);
+    let catalog = unresolved_catalog(no_capacity_receipt(&control));
+    attach_receipt_catalog(&mut control, &catalog, prefix);
+    let control_object = exact_landed_control_ref(&control, provider_version);
+    set_conflicting_control(conflict, control_object.clone());
+    (
+        control,
+        control_object,
+        catalog,
+        expected_receipt,
+        shard,
+        shard_object,
+    )
+}
+
+fn different_identity_control_same_path(
+    control: &RepoControl,
+    prefix: &DeploymentPrefix,
+) -> RepoControl {
+    let mut control = control.clone();
+    let identity = control.identity.as_mut().unwrap();
+    identity.tenant_id = Bytes::from_static(b"different-tenant");
+    identity.project_id = Bytes::from_static(b"different-project");
+    identity.repository_uuid = uuid("01890f4776447b8b9d7a876543210ad0");
+    let shard = Sha256::digest(&identity.repository_uuid)[0];
+    let capacity = control.capacity.as_mut().unwrap();
+    capacity.shard = u32::from(shard);
+    capacity.shard_key = Bytes::from(capacity_shard_key(prefix, shard).unwrap());
+    control
 }
 
 fn different_identity_same_shard() -> RepositoryIdentity {

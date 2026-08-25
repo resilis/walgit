@@ -389,6 +389,16 @@ fn capacity_schema_has_the_frozen_numeric_tags_types_and_bounds() {
             ("CAPACITY_RESERVATION_STATE_ABORTED", 4),
         ],
     );
+    assert_enum(
+        &pool,
+        "CapacityConflictClass",
+        &[
+            ("CAPACITY_CONFLICT_CLASS_UNSPECIFIED", 0),
+            ("CAPACITY_CONFLICT_CLASS_CREATE_CONTROL_EXISTS", 1),
+            ("CAPACITY_CONFLICT_CLASS_SAME_WRITER_VERSION_ADVANCED", 2),
+            ("CAPACITY_CONFLICT_CLASS_WRITER_EPOCH_ADVANCED", 3),
+        ],
+    );
 
     let fields = [
         (
@@ -470,6 +480,7 @@ fn capacity_schema_has_the_frozen_numeric_tags_types_and_bounds() {
                 ("commit", 1, "message"),
                 ("conflicting_control", 2, "message"),
                 ("conflicting_mutation_id", 3, "bytes"),
+                ("conflict_class", 4, "enum"),
             ],
         ),
         (

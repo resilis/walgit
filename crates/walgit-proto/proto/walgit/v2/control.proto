@@ -124,6 +124,15 @@ enum CapacityReservationState {
   CAPACITY_RESERVATION_STATE_ABORTED = 4;
 }
 
+// Closed evidence classification for a commit whose expected repository CAS
+// cannot land. The exact-loaded RepoControl must corroborate the selected cell.
+enum CapacityConflictClass {
+  CAPACITY_CONFLICT_CLASS_UNSPECIFIED = 0;
+  CAPACITY_CONFLICT_CLASS_CREATE_CONTROL_EXISTS = 1;
+  CAPACITY_CONFLICT_CLASS_SAME_WRITER_VERSION_ADVANCED = 2;
+  CAPACITY_CONFLICT_CLASS_WRITER_EPOCH_ADVANCED = 3;
+}
+
 message RepositoryIdentity {
   option (max_encoded_bytes) = 2048;
 
@@ -503,6 +512,7 @@ message ConflictingCapacityCommit {
   CapacityCommitBinding commit = 1;
   LandedControlRef conflicting_control = 2;
   bytes conflicting_mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  CapacityConflictClass conflict_class = 4;
 }
 
 message AbortedCapacityReservation {

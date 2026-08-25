@@ -5,15 +5,16 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BucketSafetyBinding, CAPACITY_SCHEMA_VERSION, CREDENTIAL_CONTROL_SCHEMA_VERSION,
-    CapacityBinding, CapacityCommitBinding, CapacityControl, CapacityControlState,
-    CapacityObjectRef, CapacityRedistribution, CapacityReservation, CapacityReservationState,
-    CapacityShard, CapacityShardBaseline, CapacityShardBudget, CapacityShardBudgetProposal,
-    CapacityTenantAccount, CatalogKind, CatalogRoot, CredentialControl, GrantRole,
-    LandedControlRef, Lifecycle, MAX_CAPACITY_SHARD_BYTES, MAX_MUTATION_RESULT_BYTES,
-    MAX_RESERVED_TTL_SECONDS, MAX_TENANT_CAPACITY_CATALOG_BYTES, MutationKind, MutationReceipt,
-    MutationResult, ObjectFormat, PackRoot, RECEIPT_SCHEMA_VERSION, REPO_CONTROL_SCHEMA_VERSION,
-    ReceiptCatalog, ReceiptCatalogRow, ReceiptState, ReclamationPhase, RedistributionPhase,
-    RepoControl, RepositoryGrant, RepositoryIdentity, TargetObjectRef, TenantCapacityAllocation,
+    CapacityBinding, CapacityCommitBinding, CapacityConflictClass, CapacityControl,
+    CapacityControlState, CapacityObjectRef, CapacityRedistribution, CapacityReservation,
+    CapacityReservationState, CapacityShard, CapacityShardBaseline, CapacityShardBudget,
+    CapacityShardBudgetProposal, CapacityTenantAccount, CatalogKind, CatalogRoot,
+    CredentialControl, GrantRole, LandedControlRef, Lifecycle, MAX_CAPACITY_SHARD_BYTES,
+    MAX_MUTATION_RESULT_BYTES, MAX_RECEIPT_CATALOG_BYTES, MAX_RESERVED_TTL_SECONDS,
+    MAX_TENANT_CAPACITY_CATALOG_BYTES, MutationKind, MutationReceipt, MutationResult, ObjectFormat,
+    PackRoot, RECEIPT_SCHEMA_VERSION, REPO_CONTROL_SCHEMA_VERSION, ReceiptCatalog,
+    ReceiptCatalogRow, ReceiptState, ReclamationPhase, RedistributionPhase, RepoControl,
+    RepositoryGrant, RepositoryIdentity, TargetObjectRef, TenantCapacityAllocation,
     TenantCapacityCatalogPage, VerificationRingRoot, Visibility, WalEntryKind, WalState,
     aborted_capacity_reservation::Proof as AbortedProof,
     capacity_commit_binding::Predecessor as CapacityCommitPredecessor,
@@ -45,6 +46,19 @@ pub enum CredentialTransitionKind {
     RevokeKid,
     VerifierSetUpdate,
     AcknowledgementUpdate,
+}
+
+/// Exact-loaded repository authority inputs for a capacity terminal proof.
+pub struct LoadedRepoControlReceiptView<'a> {
+    pub control: &'a RepoControl,
+    pub observed_object: &'a LandedControlRef,
+    pub receipt_catalog: &'a ReceiptCatalog,
+}
+
+/// Exact-loaded COMMITTING capacity-shard inputs for a terminal proof.
+pub struct LoadedCommittingCapacityView<'a> {
+    pub shard: &'a CapacityShard,
+    pub observed_object: &'a CapacityObjectRef,
 }
 
 pub fn validate_tenant_capacity_catalog_page(
@@ -559,6 +573,143 @@ pub fn validate_capacity_admission_view(
     Ok(())
 }
 
+/// Compose the complete pre-CAS gate for one STABLE shard successor.
+///
+/// Lower-level object, catalog, and transition validators are insufficient on
+/// their own: publication must bind the exact current view and prove the
+/// candidate against the same control plan and tenant page.
+pub fn validate_capacity_stable_admission_successor(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    previous: &CapacityShard,
+    observed_previous_object: &CapacityObjectRef,
+    successor: &CapacityShard,
+    observed_now_unix_seconds: u64,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_admission_view(
+        control,
+        current_page,
+        previous,
+        observed_previous_object,
+        prefix,
+    )?;
+    validate_capacity_shard_successor(previous, successor, observed_now_unix_seconds, prefix)?;
+    if previous == successor {
+        return Err(invalid(
+            "capacity_shard.successor",
+            "pre-CAS publication requires a real successor",
+        ));
+    }
+    validate_capacity_candidate_current_plan(control, current_page, successor, prefix)
+}
+
+/// Compose the complete pre-CAS gate for terminal drainage during
+/// PREPARING/DRAINING. It rejects insertions and all nonterminal successors.
+pub fn validate_capacity_preparing_drainage_successor(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    previous: &CapacityShard,
+    observed_previous_object: &CapacityObjectRef,
+    successor: &CapacityShard,
+    observed_now_unix_seconds: u64,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_current_shard_view(
+        control,
+        current_page,
+        previous,
+        observed_previous_object,
+        prefix,
+    )?;
+    let Some(CapacityControlPayload::Redistribution(redistribution)) =
+        control.state_payload.as_ref()
+    else {
+        return Err(invalid(
+            "capacity_control.state_payload",
+            "drainage requires PREPARING/DRAINING",
+        ));
+    };
+    if control.state != CapacityControlState::Preparing as i32
+        || redistribution.phase != RedistributionPhase::Draining as i32
+    {
+        return Err(invalid(
+            "capacity_control.redistribution.phase",
+            "drainage requires PREPARING/DRAINING",
+        ));
+    }
+    validate_capacity_shard_successor(previous, successor, observed_now_unix_seconds, prefix)?;
+    validate_capacity_candidate_current_plan(control, current_page, successor, prefix)?;
+    let (previous_state, successor_state) =
+        changed_capacity_reservation_states(previous, successor)?;
+    if !matches!(
+        (previous_state, successor_state),
+        (
+            CapacityReservationState::Reserved,
+            CapacityReservationState::Aborted,
+        ) | (
+            CapacityReservationState::Committing,
+            CapacityReservationState::Charged | CapacityReservationState::Aborted,
+        )
+    ) {
+        return Err(invalid(
+            "capacity_shard.successor",
+            "PREPARING/DRAINING permits only a terminal reservation transition",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capacity_candidate_current_plan(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    successor: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_shard_catalog(successor, current_page, prefix)?;
+    let shard_index = capacity_shard_index(successor.shard)?;
+    validate_retained_capacity_shard_fields(control, successor, &control.shard_budgets[shard_index])
+}
+
+fn changed_capacity_reservation_states(
+    previous: &CapacityShard,
+    successor: &CapacityShard,
+) -> Result<(CapacityReservationState, CapacityReservationState), ControlValidationError> {
+    let mut changed = None;
+    for candidate in &successor.reservations {
+        let Ok(index) = previous
+            .reservations
+            .binary_search_by(|row| row.reservation_id.cmp(&candidate.reservation_id))
+        else {
+            return Err(invalid(
+                "capacity_shard.successor",
+                "PREPARING/DRAINING cannot insert a reservation",
+            ));
+        };
+        let prior = &previous.reservations[index];
+        if prior != candidate {
+            if changed.is_some() {
+                return Err(invalid(
+                    "capacity_shard.successor",
+                    "must contain exactly one reservation transition",
+                ));
+            }
+            changed = Some((
+                CapacityReservationState::try_from(prior.state)
+                    .map_err(|_| invalid("capacity_reservation.state", "is unknown"))?,
+                CapacityReservationState::try_from(candidate.state)
+                    .map_err(|_| invalid("capacity_reservation.state", "is unknown"))?,
+            ));
+        }
+    }
+    changed.ok_or_else(|| {
+        invalid(
+            "capacity_shard.successor",
+            "pre-CAS publication requires one reservation transition",
+        )
+    })
+}
+
 /// Validate an exact retry or one legal reservation transition between two
 /// exact capacity-shard states. The caller supplies its observed wall-clock
 /// seconds; this validator never reads a clock.
@@ -754,9 +905,19 @@ fn validate_capacity_reservation_successor(
         (
             CapacityReservationState::Reserved,
             CapacityReservationState::Committing,
-            Some(CapacityReservationPayload::Reserved(_)),
+            Some(CapacityReservationPayload::Reserved(reserved)),
             Some(CapacityReservationPayload::Committing(_)),
-        ) => Ok(CapacityTransitionEffect::PreserveAccount { tenant_id }),
+        ) => {
+            if reserved.created_at_unix_seconds > observed_now_unix_seconds
+                || observed_now_unix_seconds >= reserved.expires_at_unix_seconds
+            {
+                return Err(invalid(
+                    "capacity_reservation.committing",
+                    "requires reserved.created_at <= observed now < reserved.expires_at",
+                ));
+            }
+            Ok(CapacityTransitionEffect::PreserveAccount { tenant_id })
+        }
         (
             CapacityReservationState::Reserved,
             CapacityReservationState::Aborted,
@@ -888,12 +1049,120 @@ fn validate_capacity_successor_accounts(
     Ok(())
 }
 
-/// Exact-bind one CHARGED reservation proof to a strict-loaded landed
-/// `RepoControl` body and the provider metadata observed for that exact load.
+/// Bind a prepared capacity receipt to the exact COMMITTING shard body that
+/// it names. The shard body must be strict-loaded with the supplied provider
+/// metadata, and it must contain the exact reservation row.
+pub fn validate_capacity_receipt_obligation(
+    committing_reservation: &CapacityReservation,
+    committing_shard: &CapacityShard,
+    observed_shard_object: &CapacityObjectRef,
+    receipt: &MutationReceipt,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_shard_object(committing_shard, observed_shard_object, prefix)?;
+    if committing_reservation.state != CapacityReservationState::Committing as i32 {
+        return Err(invalid(
+            "capacity_reservation.state",
+            "receipt obligation requires a COMMITTING reservation",
+        ));
+    }
+    let Some(CapacityReservationPayload::Committing(committing)) =
+        committing_reservation.state_payload.as_ref()
+    else {
+        return Err(invalid(
+            "capacity_reservation.state_payload",
+            "receipt obligation requires the COMMITTING payload",
+        ));
+    };
+    let rooted_reservation = committing_shard
+        .reservations
+        .binary_search_by(|candidate| {
+            candidate
+                .reservation_id
+                .cmp(&committing_reservation.reservation_id)
+        })
+        .ok()
+        .and_then(|index| committing_shard.reservations.get(index))
+        .ok_or_else(|| {
+            invalid(
+                "capacity_shard.reservations",
+                "does not contain the receipt reservation",
+            )
+        })?;
+    if rooted_reservation != committing_reservation {
+        return Err(invalid(
+            "capacity_shard.reservations",
+            "does not contain the exact COMMITTING reservation",
+        ));
+    }
+    validate_mutation_receipt(receipt)?;
+    if receipt.identity != committing_reservation.identity {
+        return Err(invalid(
+            "receipt.identity",
+            "does not equal the capacity reservation identity",
+        ));
+    }
+    let commit = committing
+        .commit
+        .as_ref()
+        .ok_or_else(|| missing("capacity_reservation.committing.commit"))?;
+    if receipt.mutation_id != commit.mutation_id
+        || receipt.kind != commit.kind
+        || receipt.writer_epoch != commit.writer_epoch
+        || !capacity_commit_predecessor_matches_receipt(commit, receipt)
+    {
+        return Err(invalid(
+            "receipt",
+            "does not equal the prepared capacity commit binding",
+        ));
+    }
+    let Some(CapacityObligationChoice::Capacity(obligation)) = receipt.capacity_obligation.as_ref()
+    else {
+        return Err(invalid(
+            "receipt.capacity_obligation",
+            "must carry the exact capacity obligation",
+        ));
+    };
+    if obligation.allocation_epoch != committing_reservation.allocation_epoch
+        || obligation.shard_key != observed_shard_object.key
+        || obligation.shard_object_version_id != observed_shard_object.object_version_id
+        || obligation.reservation_id != committing_reservation.reservation_id
+        || obligation.tenant_slice_bytes != committing_reservation.tenant_slice_bytes
+        || obligation.mutation_id != commit.mutation_id
+        || obligation.byte_count != committing_reservation.byte_count
+    {
+        return Err(invalid(
+            "receipt.capacity",
+            "does not equal the exact COMMITTING shard reservation and object",
+        ));
+    }
+    Ok(())
+}
+
+fn capacity_commit_predecessor_matches_receipt(
+    commit: &CapacityCommitBinding,
+    receipt: &MutationReceipt,
+) -> bool {
+    match (&commit.predecessor, &receipt.predecessor) {
+        (
+            Some(CapacityCommitPredecessor::NoPriorControl(_)),
+            Some(Predecessor::NoPriorControl(_)),
+        ) => true,
+        (
+            Some(CapacityCommitPredecessor::PriorControl(commit_prior)),
+            Some(Predecessor::PriorControl(receipt_prior)),
+        ) => commit_prior == receipt_prior,
+        _ => false,
+    }
+}
+
+/// Exact-bind one CHARGED reservation proof to the prior COMMITTING shard,
+/// its rooted mutation receipt, the landed `RepoControl` body, and provider
+/// metadata observed for both exact loads.
 pub fn validate_capacity_charged_repo_control(
     reservation: &CapacityReservation,
-    landed: &RepoControl,
-    observed_object: &LandedControlRef,
+    landed: LoadedRepoControlReceiptView<'_>,
+    committing: LoadedCommittingCapacityView<'_>,
     prefix: &DeploymentPrefix,
 ) -> Result<(), ControlValidationError> {
     validate_terminal_capacity_reservation(reservation, prefix)?;
@@ -919,28 +1188,43 @@ pub fn validate_capacity_charged_repo_control(
     };
     validate_exact_landed_capacity_repo_control(
         reservation,
-        landed,
+        landed.control,
         charged
             .landed_control
             .as_ref()
             .ok_or_else(|| missing("capacity_reservation.charged.landed_control"))?,
-        observed_object,
-        &commit.mutation_id,
-        writer_epoch,
+        landed.observed_object,
+        CapacityRepoControlExpectation {
+            mutation_id: &commit.mutation_id,
+            require_reservation_identity: true,
+            writer_epoch: Some(writer_epoch),
+        },
+        prefix,
+    )?;
+    validate_repo_control_receipt_catalog(landed.control, landed.receipt_catalog, prefix)?;
+    let row = receipt_catalog_row(landed.receipt_catalog, &commit.mutation_id)?;
+    let committing_reservation = committing_shard_reservation(committing.shard, reservation)?;
+    validate_capacity_reservation_successor(committing_reservation, reservation, 0)?;
+    validate_capacity_receipt_obligation(
+        committing_reservation,
+        committing.shard,
+        committing.observed_object,
+        row.receipt
+            .as_ref()
+            .ok_or_else(|| missing("receipt_catalog.row.receipt"))?,
         prefix,
     )
 }
 
 /// Exact-bind one conflicting-commit ABORTED proof to the strict-loaded
-/// conflicting `RepoControl` and its observed provider metadata.
-///
-/// The proof schema does not carry the conflicting mutation kind. It therefore
-/// proves only conflicts whose landed control remains at the expected
-/// authorizing writer epoch; a competing writer takeover fails closed.
+/// conflicting `RepoControl`, exact current receipt catalog, prepared receipt,
+/// and prior COMMITTING shard. The closed conflict class is accepted only when
+/// the loaded control corroborates its object-version and writer-epoch cell.
 pub fn validate_capacity_conflicting_repo_control(
     reservation: &CapacityReservation,
-    conflicting: &RepoControl,
-    observed_object: &LandedControlRef,
+    conflicting: LoadedRepoControlReceiptView<'_>,
+    expected_receipt: &MutationReceipt,
+    committing: LoadedCommittingCapacityView<'_>,
     prefix: &DeploymentPrefix,
 ) -> Result<(), ControlValidationError> {
     validate_terminal_capacity_reservation(reservation, prefix)?;
@@ -961,17 +1245,122 @@ pub fn validate_capacity_conflicting_repo_control(
         .commit
         .as_ref()
         .ok_or_else(|| missing("capacity_reservation.aborted.conflicting_commit.commit"))?;
+    let expected_object = conflict.conflicting_control.as_ref().ok_or_else(|| {
+        missing("capacity_reservation.aborted.conflicting_commit.conflicting_control")
+    })?;
+    let class = validate_capacity_conflict_class(commit, conflict.conflict_class)?;
+    let (require_reservation_identity, expected_writer_epoch) = match class {
+        CapacityConflictClass::CreateControlExists => (false, None),
+        CapacityConflictClass::SameWriterVersionAdvanced => {
+            let Some(CapacityCommitPredecessor::PriorControl(prior)) = &commit.predecessor else {
+                return Err(invalid(
+                    "capacity_commit.predecessor",
+                    "same-writer conflict requires an exact prior binding",
+                ));
+            };
+            if expected_object.object_version_id == prior.object_version_id {
+                return Err(invalid(
+                    "capacity_reservation.aborted.conflicting_commit.conflicting_control",
+                    "must differ from the exact expected predecessor version",
+                ));
+            }
+            (true, Some(commit.writer_epoch))
+        }
+        CapacityConflictClass::WriterEpochAdvanced => {
+            let Some(CapacityCommitPredecessor::PriorControl(prior)) = &commit.predecessor else {
+                return Err(invalid(
+                    "capacity_commit.predecessor",
+                    "writer-epoch conflict requires an exact prior binding",
+                ));
+            };
+            if expected_object.object_version_id == prior.object_version_id {
+                return Err(invalid(
+                    "capacity_reservation.aborted.conflicting_commit.conflicting_control",
+                    "must differ from the exact expected predecessor version",
+                ));
+            }
+            let writer_epoch = commit.writer_epoch.checked_add(1).ok_or_else(|| {
+                invalid(
+                    "capacity_commit.writer_epoch",
+                    "cannot advance past u64::MAX",
+                )
+            })?;
+            (true, Some(writer_epoch))
+        }
+        CapacityConflictClass::Unspecified => {
+            return Err(invalid("capacity_conflict.class", "must be nonzero"));
+        }
+    };
     validate_exact_landed_capacity_repo_control(
         reservation,
-        conflicting,
-        conflict.conflicting_control.as_ref().ok_or_else(|| {
-            missing("capacity_reservation.aborted.conflicting_commit.conflicting_control")
-        })?,
-        observed_object,
-        &conflict.conflicting_mutation_id,
-        commit.writer_epoch,
+        conflicting.control,
+        expected_object,
+        conflicting.observed_object,
+        CapacityRepoControlExpectation {
+            mutation_id: &conflict.conflicting_mutation_id,
+            require_reservation_identity,
+            writer_epoch: expected_writer_epoch,
+        },
         prefix,
-    )
+    )?;
+    validate_repo_control_receipt_catalog(
+        conflicting.control,
+        conflicting.receipt_catalog,
+        prefix,
+    )?;
+    let committing_reservation = committing_shard_reservation(committing.shard, reservation)?;
+    validate_capacity_reservation_successor(committing_reservation, reservation, 0)?;
+    validate_capacity_receipt_obligation(
+        committing_reservation,
+        committing.shard,
+        committing.observed_object,
+        expected_receipt,
+        prefix,
+    )?;
+    if conflicting.receipt_catalog.rows.iter().any(|row| {
+        row.mutation_id == expected_receipt.mutation_id
+            || row.settlement_mutation_id == expected_receipt.mutation_id
+    }) {
+        return Err(invalid(
+            "capacity_reservation.aborted.conflicting_commit",
+            "expected mutation is already represented by the current receipt catalog",
+        ));
+    }
+    Ok(())
+}
+
+fn committing_shard_reservation<'a>(
+    shard: &'a CapacityShard,
+    terminal: &CapacityReservation,
+) -> Result<&'a CapacityReservation, ControlValidationError> {
+    shard
+        .reservations
+        .binary_search_by(|candidate| candidate.reservation_id.cmp(&terminal.reservation_id))
+        .ok()
+        .and_then(|index| shard.reservations.get(index))
+        .ok_or_else(|| {
+            invalid(
+                "capacity_shard.reservations",
+                "does not contain the prior COMMITTING reservation",
+            )
+        })
+}
+
+fn receipt_catalog_row<'a>(
+    catalog: &'a ReceiptCatalog,
+    mutation_id: &[u8],
+) -> Result<&'a ReceiptCatalogRow, ControlValidationError> {
+    catalog
+        .rows
+        .binary_search_by(|row| row.mutation_id.as_ref().cmp(mutation_id))
+        .ok()
+        .and_then(|index| catalog.rows.get(index))
+        .ok_or_else(|| {
+            invalid(
+                "receipt_catalog.rows",
+                "does not contain the capacity mutation receipt",
+            )
+        })
 }
 
 fn validate_terminal_capacity_reservation(
@@ -987,13 +1376,18 @@ fn validate_terminal_capacity_reservation(
     Ok(())
 }
 
+struct CapacityRepoControlExpectation<'a> {
+    mutation_id: &'a [u8],
+    require_reservation_identity: bool,
+    writer_epoch: Option<u64>,
+}
+
 fn validate_exact_landed_capacity_repo_control(
     reservation: &CapacityReservation,
     control: &RepoControl,
     expected_object: &LandedControlRef,
     observed_object: &LandedControlRef,
-    expected_mutation_id: &[u8],
-    expected_writer_epoch: u64,
+    expectation: CapacityRepoControlExpectation<'_>,
     prefix: &DeploymentPrefix,
 ) -> Result<(), ControlValidationError> {
     validate_repo_control(control)?;
@@ -1001,7 +1395,7 @@ fn validate_exact_landed_capacity_repo_control(
         .identity
         .as_ref()
         .ok_or_else(|| missing("capacity_reservation.identity"))?;
-    if control.identity.as_ref() != Some(identity) {
+    if expectation.require_reservation_identity && control.identity.as_ref() != Some(identity) {
         return Err(invalid(
             "capacity_repo_control.identity",
             "does not equal the reservation repository identity",
@@ -1031,18 +1425,19 @@ fn validate_exact_landed_capacity_repo_control(
             "does not equal the exact landed-control key",
         ));
     }
-    if control.last_internal_mutation_id.as_ref() != expected_mutation_id {
+    if control.last_internal_mutation_id.as_ref() != expectation.mutation_id {
         return Err(invalid(
             "capacity_repo_control.last_internal_mutation_id",
             "does not equal the proof mutation ID",
         ));
     }
-    if control
-        .writer
-        .as_ref()
-        .ok_or_else(|| missing("capacity_repo_control.writer"))?
-        .epoch
-        != expected_writer_epoch
+    if let Some(expected_writer_epoch) = expectation.writer_epoch
+        && control
+            .writer
+            .as_ref()
+            .ok_or_else(|| missing("capacity_repo_control.writer"))?
+            .epoch
+            != expected_writer_epoch
     {
         return Err(invalid(
             "capacity_repo_control.writer.epoch",
@@ -1414,6 +1809,7 @@ fn validate_capacity_reservation(
                             "must differ from the expected commit mutation",
                         ));
                     }
+                    validate_capacity_conflict_class(commit, conflict.conflict_class)?;
                 }
                 None => return Err(missing("capacity_reservation.aborted.proof")),
             }
@@ -1494,6 +1890,37 @@ fn validate_capacity_commit(commit: &CapacityCommitBinding) -> Result<(), Contro
         (None, _) => return Err(missing("capacity_commit.predecessor")),
     }
     Ok(())
+}
+
+fn validate_capacity_conflict_class(
+    commit: &CapacityCommitBinding,
+    raw_class: i32,
+) -> Result<CapacityConflictClass, ControlValidationError> {
+    let class = CapacityConflictClass::try_from(raw_class)
+        .map_err(|_| invalid("capacity_conflict.class", "is unknown"))?;
+    let kind = MutationKind::try_from(commit.kind)
+        .map_err(|_| invalid("capacity_commit.kind", "is unknown"))?;
+    let valid = match (&commit.predecessor, kind, class) {
+        (
+            Some(CapacityCommitPredecessor::NoPriorControl(_)),
+            MutationKind::Create,
+            CapacityConflictClass::CreateControlExists,
+        ) => true,
+        (
+            Some(CapacityCommitPredecessor::PriorControl(_)),
+            kind,
+            CapacityConflictClass::SameWriterVersionAdvanced
+            | CapacityConflictClass::WriterEpochAdvanced,
+        ) if kind != MutationKind::Create => true,
+        _ => false,
+    };
+    if !valid {
+        return Err(invalid(
+            "capacity_conflict.class",
+            "does not match the expected commit predecessor",
+        ));
+    }
+    Ok(class)
 }
 
 fn validate_capacity_landed_control(
@@ -1975,6 +2402,102 @@ pub fn validate_receipt_catalog(catalog: &ReceiptCatalog) -> Result<(), ControlV
                 "receipt and settlement mutation IDs must be globally unique",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Exact-bind a loaded flat receipt catalog body to its `RepoControl` root.
+///
+/// This gate also proves the serialized one-at-a-time state invariant: at
+/// most one receipt is unresolved, and the control's last internal mutation
+/// is either that unresolved receipt or a retained settlement mutation ID.
+/// A typed current provider GET remains the caller's responsibility.
+pub fn validate_repo_control_receipt_catalog(
+    control: &RepoControl,
+    catalog: &ReceiptCatalog,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_repo_control(control)?;
+    validate_receipt_catalog(catalog)?;
+    let identity = control
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("repo.identity"))?;
+    if catalog.identity.as_ref() != Some(identity) {
+        return Err(invalid(
+            "receipt_catalog.identity",
+            "does not equal the rooted repository identity",
+        ));
+    }
+    let root = control
+        .receipt_catalog
+        .as_ref()
+        .ok_or_else(|| missing("repo.receipt_catalog"))?;
+    validate_catalog_root(root, CatalogKind::Receipt, identity, prefix)?;
+    let encoded_len = catalog.encoded_len();
+    if encoded_len > MAX_RECEIPT_CATALOG_BYTES {
+        return Err(invalid(
+            "receipt_catalog",
+            "encoded body exceeds 524288 bytes",
+        ));
+    }
+    let encoded = catalog.encode_to_vec();
+    let object = root
+        .object
+        .as_ref()
+        .ok_or_else(|| missing("repo.receipt_catalog.object"))?;
+    if object.size != encoded.len() as u64 {
+        return Err(invalid(
+            "repo.receipt_catalog.object.size",
+            "does not equal the canonical receipt catalog body size",
+        ));
+    }
+    let digest: [u8; 32] = Sha256::digest(&encoded).into();
+    if object.digest.as_ref() != digest {
+        return Err(invalid(
+            "repo.receipt_catalog.object.digest",
+            "does not equal the canonical receipt catalog body digest",
+        ));
+    }
+    if root.depth != 1
+        || root.node_count != 1
+        || root.item_count != catalog.rows.len() as u64
+        || root.total_encoded_bytes != encoded.len() as u64
+    {
+        return Err(invalid(
+            "repo.receipt_catalog",
+            "does not describe the exact flat receipt catalog body",
+        ));
+    }
+
+    let mut unresolved = None;
+    for row in &catalog.rows {
+        if row.state == ReceiptState::Unresolved as i32 && unresolved.replace(row).is_some() {
+            return Err(invalid(
+                "receipt_catalog.rows",
+                "contains more than one unresolved receipt",
+            ));
+        }
+    }
+    if let Some(row) = unresolved
+        && row.mutation_id != control.last_internal_mutation_id
+    {
+        return Err(invalid(
+            "receipt_catalog.rows",
+            "unresolved mutation does not equal the control last mutation",
+        ));
+    }
+    let represented = catalog.rows.iter().any(|row| {
+        (row.state == ReceiptState::Unresolved as i32
+            && row.mutation_id == control.last_internal_mutation_id)
+            || (row.state == ReceiptState::Settled as i32
+                && row.settlement_mutation_id == control.last_internal_mutation_id)
+    });
+    if !represented {
+        return Err(invalid(
+            "repo.last_internal_mutation_id",
+            "is not represented by the exact receipt catalog state",
+        ));
     }
     Ok(())
 }

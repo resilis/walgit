@@ -78,8 +78,9 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   reservation transition with shard revision `+1`. It freezes the shard,
   epoch, budget, immutable reservation fields, untouched rows, and unaffected
   accounts. The caller supplies observed `now`: creation requires
-  `created_at <= now < expires_at`, and expiry repeats the original window and
-  records that exact `now >= expires_at`. Terminal rows cannot change.
+  `created_at <= now < expires_at`, `RESERVED -> COMMITTING` requires the same
+  live window, and expiry repeats the original window and records that exact
+  `now >= expires_at`. Terminal rows cannot change.
 
   The retained-shard-budget object validator exact-binds an epoch-start body
   to the matching `CapacityShardBudget.shard_object` for both STABLE and the
@@ -91,13 +92,25 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   every tenant account to equal the exact current page slice. Every current-
   epoch non-`ABORTED` reservation must repeat that exact slice; older terminal
   proof rows keep their historical slice. The admission wrapper requires
-  STABLE; the general view supports only terminal drainage while PREPARING.
+  STABLE. Publication uses the composed STABLE successor gate so a new row
+  cannot bypass the exact current page, account, epoch, budget, object, or
+  caller-observed time checks. PREPARING publication uses the separate
+  DRAINING gate, which permits only an expiry, charge, or conflict abort.
+  Lower-level object and successor helpers are not publication gates.
   Before CHARGED or conflicting-commit ABORTED is accepted, the future
-  controller must run the state-specific loaded-`RepoControl` gate. It matches
-  the persisted and observed provider binding, canonical body key/digest/size,
-  repository identity, proof mutation ID, and applicable writer epoch. The
-  conflicting proof has no conflicting mutation kind, so a competing writer
-  takeover cannot be proven and fails closed in this schema.
+  controller must run the state-specific composition gate. Both gates exact-
+  bind the prior COMMITTING shard and prepared `CapacityObligation`. CHARGED
+  also exact-binds the current `RepoControl` and its rooted receipt catalog;
+  conflict exact-binds a typed current GET and catalog, proves the prepared
+  mutation is absent, and proves the conflicting current mutation is present.
+  `CREATE_CONTROL_EXISTS` accepts any exact control at the by-path key.
+  `SAME_WRITER_VERSION_ADVANCED` requires a different object version at epoch
+  `E`; `WRITER_EPOCH_ADVANCED` requires a different object version at checked
+  epoch `E+1`. All arms match canonical body key/digest/size and the current
+  catalog's represented last mutation. The controller obtains the conflicting
+  proof from a typed current GET at the abort decision; the durable proof can
+  later exact-load that object version. Proto validation cannot prove provider
+  currentness by itself.
 
   Redistribution has only `STABLE`, `PREPARING/DRAINING`, and
   `PREPARING/APPLYING` cells. DRAINING retains the exact prior stable plan and

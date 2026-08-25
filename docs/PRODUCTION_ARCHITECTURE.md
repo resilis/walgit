@@ -1208,8 +1208,13 @@ validator composes the mutable gate, requires every account to equal that
 tenant's exact page slice for the selected shard, and requires every current-
 epoch non-`ABORTED` reservation to repeat the same slice. Historical terminal
 rows keep their earlier proof slice. The admission-specific wrapper
-additionally requires `STABLE`; PREPARING can use the general view only for
-terminal drainage.
+additionally requires `STABLE`. The composed STABLE successor gate binds that
+entire predecessor view, a legal transition at caller-observed `now`, and the
+candidate shard against the same page, epoch, and budget. The composed
+`PREPARING/DRAINING` gate permits only `RESERVED -> ABORTED(expired)`,
+`COMMITTING -> CHARGED`, or `COMMITTING -> ABORTED(conflict)`. It rejects new
+rows and `RESERVED -> COMMITTING`. Lower-level object, account, and successor
+validators are insufficient for publication on their own.
 
 Redistribution uses the closed control states and phases
 `STABLE(e) -> PREPARING/DRAINING(e+1) -> PREPARING/APPLYING(e+1) ->
@@ -1269,18 +1274,37 @@ changes exactly one reservation through `RESERVED -> COMMITTING`,
 `RESERVED -> ABORTED(expired)`, `COMMITTING -> CHARGED`, or
 `COMMITTING -> ABORTED(conflict)`. It preserves the shard, allocation epoch,
 budget, immutable reservation fields, all untouched rows, and all unaffected
-accounts. Expiry repeats the exact reserved window and binds the supplied
-observed `now`. Terminal rows and same-state rows cannot change.
+accounts. `RESERVED -> COMMITTING` requires
+`created_at <= observed_now < expires_at`. Expiry repeats the exact reserved
+window and binds the supplied observed `now`. Terminal rows and same-state rows
+cannot change.
 
-CHARGED and conflicting-commit ABORTED require a second public composition
-gate after an exact strict `RepoControl` load. The caller supplies the observed
-provider binding. The gate requires it to equal the persisted
-`LandedControlRef`, hashes the canonical control body, and binds exact key,
-`ObjectVersionID`, digest, size, repository identity, last internal mutation,
-and writer epoch. CHARGED writer takeover binds landed epoch `E+1`; other
-CHARGED mutations bind `E`. A conflicting proof does not carry the conflicting
-mutation kind, so this schema proves only a landed conflict at the expected
-authorizing epoch `E`; a competing takeover remains fail-closed and deferred.
+CHARGED and conflicting-commit ABORTED require public composition gates. Both
+exact-bind the prior COMMITTING shard body to caller-observed provider metadata,
+locate the exact reservation row, and bind every prepared receipt
+`CapacityObligation` field to that row and shard object. CHARGED additionally
+strict-loads the landed `RepoControl` and its exact flat receipt catalog. The
+catalog gate validates its content-addressed key, canonical body digest and
+size, flat-root counts, identity, one-unresolved maximum, and the exact
+representation of `last_internal_mutation_id`. The CHARGED mutation must be
+the rooted receipt row. Writer takeover binds landed epoch `E+1`; other
+CHARGED mutations bind `E`.
+
+A conflict gate accepts the prepared expected receipt separately because the
+failed candidate control never rooted it. It proves that expected mutation is
+absent as both a receipt and settlement ID in the exact current catalog, while
+the conflicting current ID is represented by that catalog. The durable
+`CapacityConflictClass` is closed and corroborated by the exact current
+control. `CREATE_CONTROL_EXISTS` requires Create with explicit `NONE` and
+accepts any control at the same derived by-path key, including an exact
+same-identity occupancy or a different-identity routing-key collision.
+`SAME_WRITER_VERSION_ADVANCED` requires non-Create with an exact prior,
+different landed `ObjectVersionID`, the same identity, and loaded writer epoch
+`E`. `WRITER_EPOCH_ADVANCED` requires the same facts at checked epoch `E+1`.
+Every arm binds canonical control key/body/digest/size and its current last
+mutation. The conflict proof must originate from a typed current provider GET
+at the abort decision. Its stored object version supports later exact replay,
+but protobuf validation alone cannot prove provider currentness.
 
 A lost result after the control CAS is success. Reconciliation uses the
 control receipt and exact object version to finish `CHARGED`. It resumes a
