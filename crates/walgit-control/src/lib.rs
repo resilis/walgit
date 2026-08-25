@@ -3,6 +3,8 @@
 //! This crate owns repository policy and state-machine rules. It is not wired
 //! into the V1 server. Persistence stays in `walgit-store`.
 
+pub mod capacity;
+
 use std::collections::HashSet;
 
 use bytes::Bytes;
@@ -1156,5 +1158,7 @@ fn has_bounded_object_version_id(meta: &ObjectMeta) -> bool {
     )
 }
 
+#[cfg(test)]
+mod capacity_tests;
 #[cfg(test)]
 mod tests;

@@ -1319,13 +1319,40 @@ epoch, key, budget, and tenant slice. Receipt `CapacityObligation` binds the
 exact `COMMITTING` shard `ObjectVersionID`; settlement advances the repository
 binding to the exact `CHARGED` shard version.
 
-This slice freezes only the dormant protobuf messages, strict canonical codecs,
-semantic validation, keys, and tests. It has no capacity controller, store CAS
-adapter, provider operation, server/CLI/config route, V1 adapter, or runtime
-reader/writer. The boundary is greenfield: no production V2 capacity objects
-exist, no migration or mixed-version behavior is supported, and activation
-requires a later hard cut with all readers and writers on the same contract.
-Recovery for this dormant slice is code revert only.
+The current dormant tracer adds strict typed store loads plus only RESERVED
+admission and expiry. Admission starts from an exact strict
+`StoredRepoControl`; repository identity and tenant are never caller fields.
+Admission requires ACTIVE. Expiry also accepts a strict DELETING or
+TOMBSTONED control so a retained RESERVED row cannot block reclamation or
+capacity drainage.
+It derives the shard as the first byte of `SHA-256(repository_uuid)`, then loads
+current `CapacityControl`, its exact tenant-page `ObjectVersionID`, and the
+mutable current shard. The page and shard GETs run in parallel after the
+control GET. Admission requires STABLE and runs the complete composed gate
+before one conditional shard PUT. A new expiry transition can also run during
+PREPARING/DRAINING, but APPLYING rejects that write. After the complete current
+view validates, an exact already-expired replay remains idempotent during
+APPLYING or a later STABLE epoch and returns without a PUT. During APPLYING,
+the replay exact-loads the rooted drained baseline and target tenant page when
+needed. It accepts only the exact baseline object or the deterministic target
+successor derived from that baseline, target page, target epoch, and target
+budget. Unrelated or unproved target-epoch bodies fail closed. Expiry repeats
+the stored reservation window and records caller-supplied `now`; no code reads
+a clock.
+
+`CapacityReservationPurpose::{GitWrite,LfsFinalize}` is a closed domain-only
+admission discriminator. RESERVED persists fungible bytes, not purpose, and
+does not authorize repository work. A future runtime and COMMITTING slice must
+bind the discriminator to an authenticated capability and `MutationKind`.
+This tracer has no COMMITTING/CHARGED path, receipt integration, capacity-plan
+writer, initialization fallback, provider-specific operation, server/CLI/config
+route, V1 adapter, or runtime reader/writer. It also does not close the
+cross-key race between capacity-control admission fencing and a shard CAS;
+mixed-epoch runtime safety remains a future controller requirement. The
+boundary is greenfield: no production V2 capacity objects exist, no migration
+or mixed-version behavior is supported, and activation requires a later hard
+cut with all readers and writers on the same contract. Recovery for this
+dormant slice is code revert only.
 
 Reclamation is typed, bounded by objects and bytes per pass, and resumable from
 a control-rooted cursor. A pass exact-version-deletes at most 1,000 objects and

@@ -1531,6 +1531,84 @@ pub fn validate_capacity_applying_baseline(
     Ok(())
 }
 
+/// Validate the current shard during PREPARING/APPLYING as the closed union
+/// of its exact drained baseline and the deterministic target-plan successor.
+pub fn validate_capacity_applying_current_shard(
+    control: &CapacityControl,
+    current_page: &TenantCapacityCatalogPage,
+    target_page: &TenantCapacityCatalogPage,
+    baseline: &CapacityShard,
+    current: &CapacityShard,
+    observed_current_object: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_control_catalogs(control, current_page, Some(target_page), prefix)?;
+    validate_capacity_applying_baseline(control, baseline, prefix)?;
+    validate_capacity_shard_catalog(baseline, current_page, prefix)?;
+    validate_capacity_shard_object(current, observed_current_object, prefix)?;
+
+    let Some(CapacityControlPayload::Redistribution(redistribution)) =
+        control.state_payload.as_ref()
+    else {
+        return Err(missing("capacity_control.redistribution"));
+    };
+    let shard_index = capacity_shard_index(baseline.shard)?;
+    let baseline_object = redistribution.baselines[shard_index]
+        .shard_object
+        .as_ref()
+        .ok_or_else(|| missing("capacity_control.redistribution.baseline.shard_object"))?;
+    if current == baseline {
+        if observed_current_object != baseline_object {
+            return Err(invalid(
+                "capacity_shard.object",
+                "baseline body is not at the exact rooted baseline object version",
+            ));
+        }
+        return Ok(());
+    }
+
+    let target_budget = &redistribution.target_shard_budgets[shard_index];
+    let mut expected = baseline.clone();
+    expected.control_revision = expected.control_revision.checked_add(1).ok_or_else(|| {
+        invalid(
+            "capacity_shard.control_revision",
+            "cannot advance past u64::MAX",
+        )
+    })?;
+    expected.allocation_epoch = redistribution.target_epoch;
+    expected.budget_bytes = target_budget.budget_bytes;
+
+    let retained_tenants: HashSet<_> = baseline
+        .reservations
+        .iter()
+        .filter(|reservation| reservation.state != CapacityReservationState::Aborted as i32)
+        .map(|reservation| reservation.tenant_id.clone())
+        .collect();
+    expected.tenant_accounts = target_page
+        .allocations
+        .iter()
+        .filter(|allocation| retained_tenants.contains(&allocation.tenant_id))
+        .map(|allocation| CapacityTenantAccount {
+            tenant_id: allocation.tenant_id.clone(),
+            current_slice_bytes: allocation.slices[shard_index].byte_count,
+        })
+        .collect();
+    if expected.tenant_accounts.len() != retained_tenants.len() {
+        return Err(invalid(
+            "capacity_control.redistribution.target_tenant_catalog",
+            "omits a tenant with retained charged usage",
+        ));
+    }
+    validate_capacity_shard_catalog(&expected, target_page, prefix)?;
+    if current != &expected {
+        return Err(invalid(
+            "capacity_shard",
+            "is neither the exact APPLYING baseline nor its deterministic target successor",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_capacity_current_catalog(
     control: &CapacityControl,
     current_page: &TenantCapacityCatalogPage,
