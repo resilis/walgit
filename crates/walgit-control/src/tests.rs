@@ -20,7 +20,7 @@ use walgit_proto::v2::{
     repo_control::{GrantRepresentation, PackRepresentation},
 };
 use walgit_store::{
-    DynStore, ObjectStoreExt, Prefixed, PutMode,
+    CasToken, DynStore, ObjectMeta, ObjectStoreExt, ObjectVersionId, Prefixed, PutMode,
     fault::{FaultPlan, FaultStore},
     memory::MemoryStore,
     v2_control::{ControlStore, CreateOutcome, StoredRepoControl},
@@ -432,6 +432,52 @@ async fn receipt_result_and_settlement_survive_restart_and_gate_later_cas() {
             .await,
         Err(ControlError::ReplayConflict)
     ));
+    let reused_settlement_successor =
+        ordinary_successor(second_settled.control(), settlement_id).unwrap();
+    assert!(matches!(
+        restarted
+            .publish(
+                &second_settled,
+                reused_settlement_successor,
+                MutationKind::Settings,
+                settlement_id,
+                MutationRequestDigest::of(MutationKind::Settings, b"reuse-s1").unwrap(),
+            )
+            .await,
+        Err(ControlError::ReplayConflict)
+    ));
+
+    let third_id = uuid("01890f4776447b8b9d7a876543210ad4");
+    let mut third_successor = ordinary_successor(second_settled.control(), third_id).unwrap();
+    third_successor.inline_settings = Bytes::from_static(b"third");
+    let third_landed = committed(
+        restarted
+            .publish(
+                &second_settled,
+                third_successor,
+                MutationKind::Settings,
+                third_id,
+                MutationRequestDigest::of(MutationKind::Settings, b"third").unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    restarted
+        .materialize_result(&third_landed, third_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        restarted
+            .settle(&third_landed, &writer, third_id, settlement_id)
+            .await,
+        Err(ControlError::ReplayConflict)
+    ));
+    assert!(matches!(
+        restarted
+            .settle(&third_landed, &writer, third_id, third_id)
+            .await,
+        Err(ControlError::ReplayConflict)
+    ));
 
     assert!(matches!(
         restarted
@@ -777,6 +823,26 @@ fn writer_fences_and_prefix_forms_are_exact() {
 }
 
 #[test]
+fn immutable_provider_version_metadata_has_exact_length_bounds() {
+    let meta = |version: String| ObjectMeta {
+        key: "object.pb".to_owned(),
+        size: 4,
+        version: CasToken::new("cas"),
+        object_version_id: Some(ObjectVersionId::new(version)),
+    };
+    assert!(verify_written_meta("object.pb", b"body", meta("v".to_owned())).is_ok());
+    assert!(verify_written_meta("object.pb", b"body", meta("v".repeat(1_024))).is_ok());
+    assert!(matches!(
+        verify_written_meta("object.pb", b"body", meta(String::new())),
+        Err(ControlError::InvalidObject)
+    ));
+    assert!(matches!(
+        verify_written_meta("object.pb", b"body", meta("v".repeat(1_025))),
+        Err(ControlError::InvalidObject)
+    ));
+}
+
+#[test]
 fn grant_requests_reject_invalid_fields_and_duplicates_but_bind_exact_order() {
     let grant = |issuer: &'static [u8], subject: &'static [u8], role: i32| RepositoryGrant {
         issuer: Bytes::from_static(issuer),
@@ -1033,6 +1099,8 @@ fn receipt_row(
 ) -> ReceiptCatalogRow {
     let mut mutation_id = uuid("01890f4776447b8b9d7a000000000000");
     mutation_id[12..].copy_from_slice(&index.to_be_bytes());
+    let mut settlement_mutation_id = uuid("01890f4776447b8b9d7a100000000000");
+    settlement_mutation_id[12..].copy_from_slice(&index.to_be_bytes());
     let receipt = MutationReceipt {
         schema_version: 1,
         identity: Some(identity.clone()),
@@ -1065,7 +1133,7 @@ fn receipt_row(
             size: 1,
         }),
         settlement_mutation_id: if settled {
-            Bytes::copy_from_slice(&uuid("01890f4776447b8b9d7a876543210aff"))
+            Bytes::copy_from_slice(&settlement_mutation_id)
         } else {
             Bytes::new()
         },

@@ -286,6 +286,35 @@ fn catalog_rows_and_dependencies_require_deterministic_unique_order() {
     second.mutation_id = value.rows[0].mutation_id.clone();
     value.rows.push(second);
     assert!(encode_receipt_catalog(&value).is_err());
+    assert!(decode_receipt_catalog(&value.encode_to_vec()).is_err());
+}
+
+#[test]
+fn strict_catalog_decode_rejects_global_mutation_id_reuse() {
+    let mut same_row = catalog(ReceiptState::Settled, Some(result_target()));
+    same_row.rows[0].settlement_mutation_id = same_row.rows[0].mutation_id.clone();
+    assert!(decode_receipt_catalog(&same_row.encode_to_vec()).is_err());
+
+    let mut settlement_reuse = catalog(ReceiptState::Settled, Some(result_target()));
+    let mut second = settlement_reuse.rows[0].clone();
+    set_row_receipt_id(&mut second, "01890f4776447b8b9d7a876543210ad0");
+    second.settlement_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210afe").unwrap());
+    settlement_reuse.rows.push(second);
+    assert!(encode_receipt_catalog(&settlement_reuse).is_ok());
+    settlement_reuse.rows[1].settlement_mutation_id =
+        settlement_reuse.rows[0].settlement_mutation_id.clone();
+    assert!(decode_receipt_catalog(&settlement_reuse.encode_to_vec()).is_err());
+
+    let mut cross_field = catalog(ReceiptState::Settled, Some(result_target()));
+    let mut second = cross_field.rows[0].clone();
+    set_row_receipt_id(&mut second, "01890f4776447b8b9d7a876543210ad1");
+    second.settlement_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210afe").unwrap());
+    cross_field.rows.push(second);
+    assert!(encode_receipt_catalog(&cross_field).is_ok());
+    set_row_receipt_id(&mut cross_field.rows[1], "01890f4776447b8b9d7a876543210aff");
+    assert!(decode_receipt_catalog(&cross_field.encode_to_vec()).is_err());
 }
 
 #[test]
@@ -509,6 +538,17 @@ fn result_target() -> TargetObjectRef {
         digest: Bytes::from(vec![0x77; 32]),
         size: 512,
     }
+}
+
+fn set_row_receipt_id(row: &mut ReceiptCatalogRow, mutation_id: &str) {
+    row.mutation_id = Bytes::from(hex::decode(mutation_id).unwrap());
+    row.receipt.as_mut().unwrap().mutation_id = row.mutation_id.clone();
+    let identity = row.receipt.as_ref().unwrap().identity.as_ref().unwrap();
+    row.result.as_mut().unwrap().key = Bytes::from(format!(
+        "prod/v2/repositories/by-id/{}/g{:016x}/receipts/results/{mutation_id}.pb",
+        hex::encode(&identity.repository_uuid),
+        identity.generation
+    ));
 }
 
 fn assert_catalog_root(catalog: &ReceiptCatalog, encoded: &[u8]) {

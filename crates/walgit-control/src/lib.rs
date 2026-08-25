@@ -482,6 +482,12 @@ impl RepositoryController {
         {
             return Err(ControlError::OutOfOrder);
         }
+        if catalog.rows.iter().any(|row| {
+            row.mutation_id.as_ref() == settlement_mutation_id
+                || row.settlement_mutation_id.as_ref() == settlement_mutation_id
+        }) {
+            return Err(ControlError::ReplayConflict);
+        }
         let receipt = row.receipt.clone().ok_or(ControlError::InvalidObject)?;
         require_none_obligations(&receipt)?;
         let result_target = self
@@ -538,6 +544,13 @@ impl RepositoryController {
                 }
                 _ => Err(ControlError::InvalidObject),
             };
+        }
+        if catalog
+            .rows
+            .iter()
+            .any(|row| row.settlement_mutation_id.as_ref() == mutation_id)
+        {
+            return Err(ControlError::ReplayConflict);
         }
         if catalog
             .rows
@@ -1108,7 +1121,7 @@ fn verify_written_meta(
 ) -> Result<ObjectMeta, ControlError> {
     if meta.key != relative_key
         || meta.size != encoded.len() as u64
-        || meta.object_version_id.is_none()
+        || !has_bounded_object_version_id(&meta)
     {
         return Err(ControlError::InvalidObject);
     }
@@ -1121,6 +1134,9 @@ fn target_from_meta(
     encoded: &[u8],
     meta: ObjectMeta,
 ) -> Result<TargetObjectRef, ControlError> {
+    if !has_bounded_object_version_id(&meta) {
+        return Err(ControlError::InvalidObject);
+    }
     let version = meta.object_version_id.ok_or(ControlError::InvalidObject)?;
     Ok(TargetObjectRef {
         identity: Some(identity),
@@ -1129,6 +1145,15 @@ fn target_from_meta(
         digest: Bytes::copy_from_slice(ProtobufObjectDigest::of_exact_protobuf(encoded).as_bytes()),
         size: encoded.len() as u64,
     })
+}
+
+fn has_bounded_object_version_id(meta: &ObjectMeta) -> bool {
+    matches!(
+        meta.object_version_id
+            .as_ref()
+            .map(|version| version.as_str().len()),
+        Some(1..=1_024)
+    )
 }
 
 #[cfg(test)]

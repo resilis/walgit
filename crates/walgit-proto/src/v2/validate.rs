@@ -231,8 +231,18 @@ pub fn validate_receipt_catalog(catalog: &ReceiptCatalog) -> Result<(), ControlV
             "must be binary-sorted and unique",
         ));
     }
+    let mut mutation_ids = HashSet::with_capacity(catalog.rows.len().saturating_mul(2));
     for row in &catalog.rows {
         validate_receipt_catalog_row(row, identity)?;
+        if !mutation_ids.insert(row.mutation_id.as_ref())
+            || (!row.settlement_mutation_id.is_empty()
+                && !mutation_ids.insert(row.settlement_mutation_id.as_ref()))
+        {
+            return Err(invalid(
+                "receipt_catalog.rows",
+                "receipt and settlement mutation IDs must be globally unique",
+            ));
+        }
     }
     Ok(())
 }
