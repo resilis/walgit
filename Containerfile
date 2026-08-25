@@ -24,7 +24,9 @@ RUN pnpm run build && test -f dist/index.html && test -f dist/repos.js
 
 # ---- 2. rust build ------------------------------------------------------------------------
 FROM docker.io/library/rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config cmake perl python3 \
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev pkg-config cmake perl python3 \
+    && protoc --version \
+    && test -f /usr/include/google/protobuf/timestamp.proto \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

@@ -110,11 +110,46 @@ jobs:
       - name: Run single-fingerprint Rust gate
         run: bash scripts/ci.sh
 
+  container-image:
+    name: Container image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      IMAGE: walgit:ci-${{ github.sha }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Build the release image locally
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf
+        with:
+          context: .
+          file: Containerfile
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}
+          build-args: WALGIT_BUILD_SHA=${{ github.sha }}
+          sbom: false
+          provenance: false
+
+      - name: Verify runtime tools
+        run: >-
+          docker run --rm --entrypoint /bin/sh "${IMAGE}" -c
+          'command -v walgit && command -v walgit-server && git --version && git-lfs version'
+
   quality:
     name: Format, web, tests, and e2e
     needs:
       - static-web
       - rust-tests
+      - container-image
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 1
@@ -124,9 +159,10 @@ jobs:
         env:
           STATIC_WEB_RESULT: ${{ needs.static-web.result }}
           RUST_TESTS_RESULT: ${{ needs.rust-tests.result }}
+          CONTAINER_IMAGE_RESULT: ${{ needs.container-image.result }}
         run: |
           set -euo pipefail
-          if [ "$STATIC_WEB_RESULT" != success ] || [ "$RUST_TESTS_RESULT" != success ]; then
+          if [ "$STATIC_WEB_RESULT" != success ] || [ "$RUST_TESTS_RESULT" != success ] || [ "$CONTAINER_IMAGE_RESULT" != success ]; then
             echo "::error::Required quality gates did not all succeed"
             exit 1
           fi
