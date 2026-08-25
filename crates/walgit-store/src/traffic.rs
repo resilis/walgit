@@ -110,7 +110,17 @@ fn is_v1_control_key(key: &str) -> bool {
 }
 
 fn repository_parts(owner: &str, repo: &str) -> bool {
-    !owner.is_empty() && !repo.is_empty()
+    repository_part(owner) && repository_part(repo)
+}
+
+fn repository_part(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 100
+        && part != ".."
+        && !part.starts_with('.')
+        && part
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn control_leaf(leaf: &str, suffix: &str) -> bool {
@@ -207,6 +217,34 @@ mod tests {
             classify_data_key("other/repos/o/r/manifest.pb", "prod/"),
             DataTraffic::Bulk
         );
+    }
+
+    #[test]
+    fn malformed_v1_repository_identifiers_default_bulk() {
+        let maximum = "a".repeat(100);
+        let maximum_key = format!("repos/{maximum}/{maximum}/manifest.pb");
+        assert_eq!(classify_data_key(&maximum_key, ""), DataTraffic::Control);
+
+        let oversized = "a".repeat(101);
+        for key in [
+            "repos/../r/manifest.pb".to_owned(),
+            "repos/o/../manifest.pb".to_owned(),
+            "repos/.hidden/r/events/cursor.json".to_owned(),
+            "repos/o/.hidden/events/cursor.json".to_owned(),
+            "repos/mø/r/manifest.pb".to_owned(),
+            "repos/o/rø/manifest.pb".to_owned(),
+            "repos/bad!/r/manifest.pb".to_owned(),
+            "repos/o/bad!/manifest.pb".to_owned(),
+            format!("repos/{oversized}/r/manifest.pb"),
+            format!("repos/o/{oversized}/manifest.pb"),
+        ] {
+            assert_eq!(classify_data_key(&key, ""), DataTraffic::Bulk, "{key}");
+            assert_eq!(
+                classify_data_key(&format!("prod/{key}"), "prod/"),
+                DataTraffic::Bulk,
+                "prefixed {key}"
+            );
+        }
     }
 
     #[test]
