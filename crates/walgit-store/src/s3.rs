@@ -1877,14 +1877,16 @@ mod tests {
             "a second bulk operation must remain queued"
         );
 
-        let control = tokio::time::timeout(
-            Duration::from_millis(50),
-            store.data_lane("repos/o/r/manifest.pb", false, false),
-        )
-        .await
-        .expect("control selection must not wait")
-        .expect("control lane");
-        assert!(control.bulk_permit.is_none());
+        for control_key in ["repos/o/r/manifest.pb", "repos/o/r/events/cursor.json"] {
+            let control = tokio::time::timeout(
+                Duration::from_millis(50),
+                store.data_lane(control_key, false, false),
+            )
+            .await
+            .expect("control selection must not wait")
+            .expect("control lane");
+            assert!(control.bulk_permit.is_none(), "{control_key}");
+        }
 
         drop(held);
         let resumed = tokio::time::timeout(Duration::from_secs(1), waiting)

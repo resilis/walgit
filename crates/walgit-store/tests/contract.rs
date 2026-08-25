@@ -1336,15 +1336,20 @@ async fn s3_contract() {
 
 #[cfg(feature = "s3")]
 async fn test_s3_control_lane_isolation(store: &DynStore, repo_root: &str) {
-    let control_key = format!("{repo_root}/manifest.pb");
+    let control_keys = [
+        format!("{repo_root}/manifest.pb"),
+        format!("{repo_root}/events/cursor.json"),
+    ];
     let bulk_key = format!("{repo_root}/wal/lane-probe.pack");
-    put_bytes(
-        store,
-        &control_key,
-        Bytes::from_static(b"control"),
-        PutMode::Create,
-    )
-    .await;
+    for control_key in &control_keys {
+        put_bytes(
+            store,
+            control_key,
+            Bytes::from_static(b"control"),
+            PutMode::Create,
+        )
+        .await;
+    }
     put_bytes(
         store,
         &bulk_key,
@@ -1374,15 +1379,17 @@ async fn test_s3_control_lane_isolation(store: &DynStore, repo_root: &str) {
         "the second bulk GET must remain queued while the first body is open"
     );
 
-    let control = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        store.get(&control_key, GetOptions::default()),
-    )
-    .await
-    .expect("control GET must not wait behind the held bulk body")
-    .expect("control GET");
-    let (_, bytes) = collect_body(control).await;
-    assert_eq!(bytes, Bytes::from_static(b"control"));
+    for control_key in &control_keys {
+        let control = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.get(control_key, GetOptions::default()),
+        )
+        .await
+        .expect("control GET must not wait behind the held bulk body")
+        .expect("control GET");
+        let (_, bytes) = collect_body(control).await;
+        assert_eq!(bytes, Bytes::from_static(b"control"), "{control_key}");
+    }
 
     drop(held_body);
     let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)

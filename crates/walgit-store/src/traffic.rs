@@ -9,6 +9,7 @@ pub(crate) enum DataTraffic {
 }
 
 pub(crate) fn normalized_store_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {
         String::new()
     } else {
@@ -96,6 +97,7 @@ fn is_v1_control_key(key: &str) -> bool {
         ["repos", owner, repo, "leases", leaf] => {
             repository_parts(owner, repo) && control_leaf(leaf, ".pb")
         }
+        ["repos", owner, repo, "events", "cursor.json"] => repository_parts(owner, repo),
         ["repos", owner, repo, "bundles", "list.pb"] => repository_parts(owner, repo),
         ["repos", owner, repo, "cache", "api", "v1", leaf] => {
             repository_parts(owner, repo)
@@ -137,6 +139,29 @@ mod tests {
     const SEQUENCE: &str = "0000000000000001";
 
     #[test]
+    fn store_prefix_matches_the_canonical_config_form() {
+        for (configured, canonical) in [
+            ("", ""),
+            ("///", ""),
+            ("prod", "prod/"),
+            ("prod/", "prod/"),
+            ("/prod/", "prod/"),
+        ] {
+            assert_eq!(normalized_store_prefix(configured), canonical);
+        }
+
+        let physical_prefix = normalized_store_prefix("/prod/");
+        assert_eq!(
+            classify_data_key("prod/repos/o/r/manifest.pb", &physical_prefix),
+            DataTraffic::Control
+        );
+        assert_eq!(
+            classify_data_key("prod/repos/o/r/wal/abc.pack", &physical_prefix),
+            DataTraffic::Bulk
+        );
+    }
+
+    #[test]
     fn v1_control_grammar_is_closed_and_unknown_defaults_bulk() {
         for key in [
             "meta/repos.pb",
@@ -148,6 +173,7 @@ mod tests {
             "repos/o/r/checkpoints/0000000000000001/checkpoint.pb",
             "repos/o/r/checkpoints/0000000000000001/refs.pb",
             "repos/o/r/leases/compact.pb",
+            "repos/o/r/events/cursor.json",
             "repos/o/r/bundles/list.pb",
             "repos/o/r/cache/api/v1/0123456789abcdef0123456789abcdef01234567.json",
         ] {
@@ -169,6 +195,7 @@ mod tests {
             "repos/o/r/bundles/weekly/abc.bundle",
             "repos/o/r/lfs/objects/ab/cd/abcd",
             "repos/o/r/future.pb",
+            "repos/o/r/events/future.json",
             "repos/o/r/cache/api/v1/unknown.bin",
             "repos/o/r/cache/api/v1/tree/0123456789abcdef0123456789abcdef01234567.json",
             "future/control-looking.pb",
