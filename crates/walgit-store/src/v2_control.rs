@@ -239,8 +239,14 @@ impl ControlStore {
                     .await),
             },
             Err(error) if error.is_precondition_failed() => {
-                let current = self.load(full_key).await.ok().flatten();
-                Ok(CompareAndSwapOutcome::Conflict(current))
+                let outcome = match self.load(full_key).await {
+                    Ok(Some(current)) if same_exact_control(&current, &successor) => {
+                        CompareAndSwapOutcome::Committed(current)
+                    }
+                    Ok(current) => CompareAndSwapOutcome::Conflict(current),
+                    Err(_) => CompareAndSwapOutcome::Conflict(None),
+                };
+                Ok(outcome)
             }
             Err(_) => Ok(self
                 .resolve_ambiguous_cas(previous, &successor, full_key)

@@ -247,6 +247,33 @@ async fn stale_cas_returns_current_conflict_without_retry_or_rebase() {
 }
 
 #[tokio::test]
+async fn repeated_exact_cas_resolves_412_as_committed_with_one_get() {
+    let truth = MemoryStore::shared();
+    let fault = FaultStore::new(scoped(truth), "exact-cas-replay", 13);
+    let adapter = adapter(fault.clone());
+    let initial = sample_control();
+    let first = committed_create(adapter.create(initial.clone()).await.unwrap());
+    let successor = successor(&initial, 2, "01890f4776447b8b9d7a876543210abf");
+    let landed = committed_cas(
+        adapter
+            .compare_and_swap(&first, successor.clone())
+            .await
+            .unwrap(),
+    );
+
+    let before = fault.stats().ops.load(std::sync::atomic::Ordering::Relaxed);
+    let replay = committed_cas(adapter.compare_and_swap(&first, successor).await.unwrap());
+    let after = fault.stats().ops.load(std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(replay, landed);
+    assert_eq!(
+        after - before,
+        2,
+        "the 412 path is exactly one failed CAS plus one strict GET; no retry, rebase, HEAD, or LIST"
+    );
+}
+
+#[tokio::test]
 async fn fault_store_lost_responses_are_resolved_with_one_fresh_read() {
     let truth = MemoryStore::shared();
     let fault = FaultStore::new(scoped(truth), "lost-response", 17);
