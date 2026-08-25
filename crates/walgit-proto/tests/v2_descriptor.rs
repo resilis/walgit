@@ -184,6 +184,70 @@ fn credential_control_has_the_exact_v5_9_tags_presence_and_bounds() {
     assert_eq!(option(&pool, revoked.options(), "walgit.v2.max_items"), 64);
 }
 
+#[test]
+fn mutation_receipt_schema_has_the_frozen_numeric_contract() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let kinds = pool.get_enum_by_name("walgit.v2.MutationKind").unwrap();
+    let expected = [
+        ("MUTATION_KIND_UNSPECIFIED", 0),
+        ("MUTATION_KIND_CREATE", 1),
+        ("MUTATION_KIND_PUSH", 2),
+        ("MUTATION_KIND_REF_UPDATE", 3),
+        ("MUTATION_KIND_LFS_FINALIZE", 4),
+        ("MUTATION_KIND_POLICY", 5),
+        ("MUTATION_KIND_SETTINGS", 6),
+        ("MUTATION_KIND_GRANTS", 7),
+        ("MUTATION_KIND_LIFECYCLE", 8),
+        ("MUTATION_KIND_CHECKPOINT", 9),
+        ("MUTATION_KIND_COMPACTION", 10),
+        ("MUTATION_KIND_BUNDLE", 11),
+        ("MUTATION_KIND_FOLLOW", 12),
+        ("MUTATION_KIND_IMPORT", 13),
+        ("MUTATION_KIND_REPAIR", 14),
+        ("MUTATION_KIND_PIN", 15),
+        ("MUTATION_KIND_EVENT", 16),
+        ("MUTATION_KIND_RECLAMATION", 17),
+        ("MUTATION_KIND_WRITER_TAKEOVER", 18),
+        ("MUTATION_KIND_INTERNAL_SETTLEMENT", 19),
+    ];
+    assert_eq!(
+        kinds
+            .values()
+            .map(|value| (value.name().to_string(), value.number()))
+            .collect::<Vec<_>>(),
+        expected
+            .into_iter()
+            .map(|(name, number)| (name.to_string(), number))
+            .collect::<Vec<_>>()
+    );
+
+    let states = pool.get_enum_by_name("walgit.v2.ReceiptState").unwrap();
+    assert_eq!(
+        states
+            .values()
+            .map(|value| (value.name().to_string(), value.number()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("RECEIPT_STATE_UNSPECIFIED".to_string(), 0),
+            ("RECEIPT_STATE_UNRESOLVED".to_string(), 1),
+            ("RECEIPT_STATE_SETTLED".to_string(), 2),
+        ]
+    );
+
+    for message in [
+        "MutationReceipt",
+        "MutationResult",
+        "ReceiptCatalogRow",
+        "ReceiptCatalog",
+    ] {
+        assert!(
+            pool.get_message_by_name(&format!("walgit.v2.{message}"))
+                .is_some(),
+            "missing {message}"
+        );
+    }
+}
+
 fn option(pool: &DescriptorPool, options: prost_reflect::DynamicMessage, name: &str) -> u64 {
     let extension = pool.get_extension_by_name(name).unwrap();
     assert!(options.has_extension(&extension));

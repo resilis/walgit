@@ -638,6 +638,36 @@ impl AuthenticatedCapability {
     pub fn grant(&self) -> (&[u8], &[u8]) {
         (&self.claims.grant_issuer, &self.claims.grant_subject)
     }
+    pub fn tenant_id(&self) -> &[u8] {
+        &self.claims.common.tenant_id
+    }
+    pub fn project_id(&self) -> &[u8] {
+        &self.claims.common.project_id
+    }
+    pub fn repository_uuid(&self) -> &[u8; 16] {
+        &self.claims.common.repository_uuid
+    }
+    pub fn generation(&self) -> u64 {
+        self.claims.common.generation
+    }
+    pub fn canonical_path(&self) -> &[u8] {
+        &self.claims.common.canonical_path
+    }
+    pub fn canonical_path_digest(&self) -> &[u8; 32] {
+        &self.claims.common.canonical_path_digest
+    }
+    pub fn routing_digest(&self) -> &[u8; 32] {
+        &self.claims.common.routing_digest
+    }
+    pub fn control_key(&self) -> &[u8] {
+        &self.claims.control_key
+    }
+    pub fn control_version_id(&self) -> &[u8] {
+        &self.claims.control_version_id
+    }
+    pub fn cutover_generation(&self) -> u64 {
+        self.claims.cutover_generation
+    }
 }
 
 fn parse_common(

@@ -6,8 +6,11 @@ use prost::Message;
 use prost_reflect::{DescriptorPool, FieldDescriptor, Kind, MessageDescriptor};
 
 use super::{
-    CredentialControl, MAX_CREDENTIAL_CONTROL_BYTES, MAX_REPO_CONTROL_BYTES, RepoControl,
-    keys::DeploymentPrefix, validate_credential_control, validate_repo_control,
+    CredentialControl, MAX_CREDENTIAL_CONTROL_BYTES, MAX_MUTATION_RECEIPT_BYTES,
+    MAX_MUTATION_RESULT_BYTES, MAX_RECEIPT_CATALOG_BYTES, MAX_REPO_CONTROL_BYTES, MutationReceipt,
+    MutationResult, ReceiptCatalog, RepoControl, keys::DeploymentPrefix,
+    validate_credential_control, validate_mutation_receipt, validate_mutation_result,
+    validate_receipt_catalog, validate_repo_control,
 };
 
 const MAX_NESTING_DEPTH: usize = 16;
@@ -46,6 +49,102 @@ pub fn decode_repo_control(bytes: &[u8]) -> Result<RepoControl, ControlCodecErro
 pub fn preflight_repo_control(bytes: &[u8]) -> Result<(), ControlCodecError> {
     let schema = preflight_schema();
     preflight_message(schema, schema.repo_control_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_mutation_receipt(receipt: &MutationReceipt) -> Result<Vec<u8>, ControlCodecError> {
+    validate_mutation_receipt(receipt)?;
+    encode_bounded(
+        receipt,
+        "walgit.v2.MutationReceipt",
+        MAX_MUTATION_RECEIPT_BYTES,
+        preflight_mutation_receipt,
+    )
+}
+
+pub fn decode_mutation_receipt(bytes: &[u8]) -> Result<MutationReceipt, ControlCodecError> {
+    preflight_mutation_receipt(bytes)?;
+    let value = MutationReceipt::decode(bytes)?;
+    validate_mutation_receipt(&value)?;
+    require_canonical(&value, bytes)?;
+    Ok(value)
+}
+
+pub fn preflight_mutation_receipt(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.mutation_receipt_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_mutation_result(result: &MutationResult) -> Result<Vec<u8>, ControlCodecError> {
+    validate_mutation_result(result)?;
+    encode_bounded(
+        result,
+        "walgit.v2.MutationResult",
+        MAX_MUTATION_RESULT_BYTES,
+        preflight_mutation_result,
+    )
+}
+
+pub fn decode_mutation_result(bytes: &[u8]) -> Result<MutationResult, ControlCodecError> {
+    preflight_mutation_result(bytes)?;
+    let value = MutationResult::decode(bytes)?;
+    validate_mutation_result(&value)?;
+    require_canonical(&value, bytes)?;
+    Ok(value)
+}
+
+pub fn preflight_mutation_result(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.mutation_result_root, bytes, 1).map(|_| ())
+}
+
+pub fn encode_receipt_catalog(catalog: &ReceiptCatalog) -> Result<Vec<u8>, ControlCodecError> {
+    validate_receipt_catalog(catalog)?;
+    encode_bounded(
+        catalog,
+        "walgit.v2.ReceiptCatalog",
+        MAX_RECEIPT_CATALOG_BYTES,
+        preflight_receipt_catalog,
+    )
+}
+
+pub fn decode_receipt_catalog(bytes: &[u8]) -> Result<ReceiptCatalog, ControlCodecError> {
+    preflight_receipt_catalog(bytes)?;
+    let value = ReceiptCatalog::decode(bytes)?;
+    validate_receipt_catalog(&value)?;
+    require_canonical(&value, bytes)?;
+    Ok(value)
+}
+
+pub fn preflight_receipt_catalog(bytes: &[u8]) -> Result<(), ControlCodecError> {
+    let schema = preflight_schema();
+    preflight_message(schema, schema.receipt_catalog_root, bytes, 1).map(|_| ())
+}
+
+fn encode_bounded<M: Message>(
+    value: &M,
+    message: &'static str,
+    maximum: usize,
+    preflight: fn(&[u8]) -> Result<(), ControlCodecError>,
+) -> Result<Vec<u8>, ControlCodecError> {
+    if value.encoded_len() > maximum {
+        return Err(ControlCodecError::MessageTooLarge {
+            message: message.to_string(),
+            actual: value.encoded_len(),
+            maximum,
+        });
+    }
+    let bytes = value.encode_to_vec();
+    preflight(&bytes)?;
+    Ok(bytes)
+}
+
+fn require_canonical<M: Message>(value: &M, bytes: &[u8]) -> Result<(), ControlCodecError> {
+    if value.encode_to_vec() != bytes {
+        return Err(ControlCodecError::NonCanonical(
+            "generated re-encoding differs from the stored bytes",
+        ));
+    }
+    Ok(())
 }
 
 pub fn encode_credential_control(
@@ -264,6 +363,9 @@ fn preflight_message(
 struct PreflightSchema {
     repo_control_root: usize,
     credential_control_root: usize,
+    mutation_receipt_root: usize,
+    mutation_result_root: usize,
+    receipt_catalog_root: usize,
     messages: Vec<PreflightMessage>,
 }
 
@@ -317,6 +419,15 @@ impl PreflightSchema {
             *indexes.get("walgit.v2.CredentialControl").ok_or_else(|| {
                 ControlCodecError::Descriptor("CredentialControl descriptor is missing".into())
             })?;
+        let mutation_receipt_root = *indexes.get("walgit.v2.MutationReceipt").ok_or_else(|| {
+            ControlCodecError::Descriptor("MutationReceipt descriptor is missing".into())
+        })?;
+        let mutation_result_root = *indexes.get("walgit.v2.MutationResult").ok_or_else(|| {
+            ControlCodecError::Descriptor("MutationResult descriptor is missing".into())
+        })?;
+        let receipt_catalog_root = *indexes.get("walgit.v2.ReceiptCatalog").ok_or_else(|| {
+            ControlCodecError::Descriptor("ReceiptCatalog descriptor is missing".into())
+        })?;
         let mut messages = Vec::with_capacity(descriptors.len());
         for descriptor in &descriptors {
             let maximum = usize::try_from(message_bound(descriptor)?).map_err(|_| {
@@ -405,6 +516,9 @@ impl PreflightSchema {
         Ok(Self {
             repo_control_root,
             credential_control_root,
+            mutation_receipt_root,
+            mutation_result_root,
+            receipt_catalog_root,
             messages,
         })
     }

@@ -16,13 +16,17 @@ pub mod keys;
 mod validate;
 
 pub use codec::{
-    ControlCodecError, decode_credential_control, decode_repo_control, encode_credential_control,
-    encode_credential_control_projection, encode_repo_control, lint_v2_descriptors,
-    preflight_credential_control, preflight_repo_control,
+    ControlCodecError, decode_credential_control, decode_mutation_receipt, decode_mutation_result,
+    decode_receipt_catalog, decode_repo_control, encode_credential_control,
+    encode_credential_control_projection, encode_mutation_receipt, encode_mutation_result,
+    encode_receipt_catalog, encode_repo_control, lint_v2_descriptors, preflight_credential_control,
+    preflight_mutation_receipt, preflight_mutation_result, preflight_receipt_catalog,
+    preflight_repo_control,
 };
 pub use validate::{
     ControlValidationError, CredentialTransitionKind, validate_credential_control,
-    validate_credential_control_transition_structure, validate_repo_control,
+    validate_credential_control_transition_structure, validate_mutation_receipt,
+    validate_mutation_result, validate_receipt_catalog, validate_repo_control,
     validate_repo_control_successor,
 };
 
@@ -34,3 +38,8 @@ pub const MAX_REPO_CONTROL_BYTES: usize = 1_048_576;
 pub const CREDENTIAL_CONTROL_SCHEMA_VERSION: u32 = 2;
 /// Maximum exact deterministic protobuf size of one `credential_control` object.
 pub const MAX_CREDENTIAL_CONTROL_BYTES: usize = 65_536;
+/// Frozen mutation receipt/result/catalog schema version.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_MUTATION_RECEIPT_BYTES: usize = 65_536;
+pub const MAX_MUTATION_RESULT_BYTES: usize = 65_536;
+pub const MAX_RECEIPT_CATALOG_BYTES: usize = 1_048_576;
