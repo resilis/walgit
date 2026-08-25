@@ -252,6 +252,23 @@ fn verifier_enforces_slot_state_deny_and_ring_claim_binding() {
                 .is_ok(),
             matches!(state, 2 | 3)
         );
+        if state == 2 {
+            let payload =
+                capability_payload_at(&previous, 900, CapabilityPurpose::CloneRead, NOW + 1);
+            let envelope = sign1(
+                &previous_signer,
+                &previous.data_kid,
+                CAPABILITY_AAD,
+                &payload,
+            );
+            let mut expected = expected_capability(&previous, CapabilityPurpose::CloneRead);
+            expected.common.id = uuid(NOW + 1, 0x40);
+            assert!(
+                authority
+                    .authenticate_capability(&envelope, NOW + 1, &expected)
+                    .is_err()
+            );
+        }
     }
 
     let root_signer = ephemeral_key();
@@ -396,6 +413,30 @@ fn every_transition_kind_requires_the_complete_exact_evidence_chain() {
             "corrupt {kind:?}"
         );
     }
+}
+
+#[test]
+fn transition_rejects_mixed_ring_and_evidence_roots() {
+    let replacement_signer = ephemeral_key();
+    let replacement_root = pinned(&replacement_signer);
+
+    let mut bootstrap = transition_fixture(TransitionKind::Bootstrap);
+    bootstrap.proposed.root = replacement_root;
+    assert_eq!(
+        verify_credential_transition(bootstrap.request()).err(),
+        Some(IdentityError::Transition(
+            "rings and transition evidence do not use one pinned root"
+        ))
+    );
+
+    let mut install = transition_fixture(TransitionKind::InstallNext);
+    install.predecessor.as_mut().unwrap().root = replacement_root;
+    assert_eq!(
+        verify_credential_transition(install.request()).err(),
+        Some(IdentityError::Transition(
+            "rings and transition evidence do not use one pinned root"
+        ))
+    );
 }
 
 #[test]
@@ -646,9 +687,17 @@ fn create_payload_with(ring: &RingFixture, lifetime: i64, issued: i64) -> Vec<u8
     out
 }
 fn capability_payload(ring: &RingFixture, lifetime: i64, purpose: CapabilityPurpose) -> Vec<u8> {
+    capability_payload_at(ring, lifetime, purpose, NOW)
+}
+fn capability_payload_at(
+    ring: &RingFixture,
+    lifetime: i64,
+    purpose: CapabilityPurpose,
+    issued_at: i64,
+) -> Vec<u8> {
     let mut out = Vec::new();
     cbor::map(&mut out, 24);
-    common_payload(&mut out, ring, 2, NOW, NOW + lifetime);
+    common_payload(&mut out, ring, 2, issued_at, issued_at + lifetime);
     cbor::uint(&mut out, 30);
     cbor::uint(&mut out, purpose as u64);
     cbor::uint(&mut out, 31);
@@ -795,7 +844,7 @@ fn transition_fixture(kind: TransitionKind) -> TransitionFixture {
         TransitionKind::RetirePrevious => {
             predecessor.current = Some(ring2.root.clone());
             predecessor.previous = Some(ring1.root.clone());
-            predecessor.previous_last_issue_unix_seconds = Some(NOW - 930);
+            predecessor.previous_last_issue_unix_seconds = Some(NOW - 931);
             proposed = predecessor.clone();
             proposed.control_revision += 1;
             proposed.previous = None;

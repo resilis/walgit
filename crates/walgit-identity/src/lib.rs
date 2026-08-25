@@ -136,6 +136,7 @@ pub struct CredentialAuthority {
     control: CredentialControl,
     rings: Vec<Ring>,
     prefix: DeploymentPrefix,
+    root: PinnedRoot,
 }
 
 impl CredentialAuthority {
@@ -172,6 +173,7 @@ impl CredentialAuthority {
             control: control.clone(),
             rings,
             prefix: prefix.clone(),
+            root: *root,
         })
     }
 
@@ -245,6 +247,17 @@ impl CredentialAuthority {
                 if claims.ring_epoch != ring.epoch || claims.ring_digest != ring.digest {
                     return Err(IdentityError::Authority(
                         "envelope does not bind the selected ring root",
+                    ));
+                }
+                if ring.slot == Slot::Previous
+                    && claims.issued_at
+                        > self
+                            .control
+                            .previous_last_issue_unix_seconds
+                            .expect("validated previous cutoff")
+                {
+                    return Err(IdentityError::Authority(
+                        "envelope was issued after the previous-ring cutoff",
                     ));
                 }
                 if claims.issued_at < key.not_before || claims.issued_at > key.not_after {

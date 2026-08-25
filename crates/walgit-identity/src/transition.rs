@@ -81,6 +81,15 @@ impl VerifiedCredentialTransition {
 pub fn verify_credential_transition(
     request: TransitionRequest<'_>,
 ) -> Result<VerifiedCredentialTransition, IdentityError> {
+    if request.proposed.root != *request.root
+        || request
+            .predecessor
+            .is_some_and(|predecessor| predecessor.authority.root != *request.root)
+    {
+        return Err(IdentityError::Transition(
+            "rings and transition evidence do not use one pinned root",
+        ));
+    }
     let proposed = request.proposed.control();
     let projection_bytes = encode_credential_control_projection(proposed, request.prefix)
         .map_err(|_| IdentityError::Control)?;
@@ -805,9 +814,18 @@ fn validate_ring_semantics(
                 .ok_or(IdentityError::Transition("missing previous last issue"))?
                 as i128)
                 + 930;
-            if (request.now_unix_seconds as i128) < deadline {
+            if (request.now_unix_seconds as i128) <= deadline {
                 return Err(IdentityError::Transition(
                     "previous ring retired before drain horizon",
+                ));
+            }
+            if ack
+                .rows
+                .iter()
+                .any(|row| (row.acknowledged_at as i128) <= deadline)
+            {
+                return Err(IdentityError::Transition(
+                    "retirement acknowledgement is not strictly post-drain",
                 ));
             }
         }
@@ -831,20 +849,20 @@ fn validate_ring_semantics(
             }
         }
         TransitionKind::InstallNext => {
-            let current = predecessor
+            let mut eventual = HashSet::new();
+            for kid in &predecessor.authority.control().revoked_kids {
+                eventual.insert(<[u8; 16]>::try_from(kid.as_ref()).expect("validated kid"));
+            }
+            for kid in predecessor
                 .authority
                 .rings
                 .iter()
-                .find(|ring| ring.slot == Slot::Current)
-                .expect("bound authority has current ring");
-            let denied = &predecessor.authority.control().revoked_kids;
-            let eventual = denied.len()
-                + current
-                    .keys
-                    .iter()
-                    .filter(|key| !denied.iter().any(|kid| kid.as_ref() == key.kid))
-                    .count();
-            if eventual > 64 {
+                .filter(|ring| matches!(ring.slot, Slot::Current | Slot::Previous))
+                .flat_map(|ring| ring.keys.iter().map(|key| key.kid))
+            {
+                eventual.insert(kid);
+            }
+            if eventual.len() > 64 {
                 return Err(IdentityError::Transition(
                     "install would exceed the permanent retirement deny-set bound",
                 ));
@@ -872,9 +890,7 @@ fn validate_ring_semantics(
                 .iter()
                 .filter_map(|row| row.last_issued_at)
                 .max()
-                .ok_or(IdentityError::Transition(
-                    "promotion has no issuer acknowledgement",
-                ))?;
+                .unwrap_or(old_current.issued_at);
             if request.proposed.control().previous_last_issue_unix_seconds != Some(maximum) {
                 return Err(IdentityError::Transition(
                     "promotion last-issue time is not the attested maximum",
@@ -943,6 +959,10 @@ mod regression_tests {
             control: CredentialControl::default(),
             rings: vec![old],
             prefix: DeploymentPrefix::parse("prod/").unwrap(),
+            root: PinnedRoot {
+                public_key: [0; 32],
+                kid: [0; 16],
+            },
         };
         let proposed_control = CredentialControl {
             previous_last_issue_unix_seconds: Some(99),
@@ -952,6 +972,10 @@ mod regression_tests {
             control: proposed_control,
             rings: Vec::new(),
             prefix: DeploymentPrefix::parse("prod/").unwrap(),
+            root: PinnedRoot {
+                public_key: [0; 32],
+                kid: [0; 16],
+            },
         };
         let prefix = DeploymentPrefix::parse("prod/").unwrap();
         let root = PinnedRoot {
@@ -998,5 +1022,257 @@ mod regression_tests {
                 "issuer last-issued-at predates the old current ring"
             ))
         );
+    }
+
+    #[test]
+    fn install_counts_denied_previous_and_current_unique_kids_at_the_exact_bound() {
+        let mut predecessor = CredentialAuthority {
+            control: CredentialControl {
+                revoked_kids: vec![vec![0; 16].into()],
+                ..CredentialControl::default()
+            },
+            rings: vec![
+                test_ring(Slot::Previous, 1..32),
+                test_ring(Slot::Current, 32..64),
+            ],
+            prefix: DeploymentPrefix::parse("prod/").unwrap(),
+            root: PinnedRoot {
+                public_key: [0; 32],
+                kid: [0; 16],
+            },
+        };
+        let proposed = CredentialAuthority {
+            control: CredentialControl::default(),
+            rings: Vec::new(),
+            prefix: DeploymentPrefix::parse("prod/").unwrap(),
+            root: PinnedRoot {
+                public_key: [0; 32],
+                kid: [0; 16],
+            },
+        };
+        let prefix = DeploymentPrefix::parse("prod/").unwrap();
+        let root = PinnedRoot {
+            public_key: [0; 32],
+            kid: [0; 16],
+        };
+        let ack = AckSet {
+            verifier_digest: [0; 32],
+            projection_digest: [0; 32],
+            kind: TransitionKind::InstallNext,
+            binding: Binding::Bootstrap([0; 16]),
+            binding_bytes: Vec::new(),
+            rows: Vec::new(),
+        };
+
+        assert_eq!(
+            validate_ring_semantics(
+                &semantic_request(&root, &prefix, &proposed, &predecessor),
+                TransitionKind::InstallNext,
+                &ack,
+            ),
+            Ok(())
+        );
+
+        predecessor
+            .rings
+            .iter_mut()
+            .find(|ring| ring.slot == Slot::Current)
+            .unwrap()
+            .keys
+            .push(test_key(64));
+        assert_eq!(
+            validate_ring_semantics(
+                &semantic_request(&root, &prefix, &proposed, &predecessor),
+                TransitionKind::InstallNext,
+                &ack,
+            ),
+            Err(IdentityError::Transition(
+                "install would exceed the permanent retirement deny-set bound"
+            ))
+        );
+    }
+
+    #[test]
+    fn promotion_without_issuer_uses_ring_issue_time_and_no_emission_matches_it() {
+        let mut old = test_ring(Slot::Current, 1..2);
+        old.issued_at = 100;
+        let predecessor = test_authority(CredentialControl::default(), vec![old]);
+        let proposed = test_authority(
+            CredentialControl {
+                previous_last_issue_unix_seconds: Some(100),
+                ..CredentialControl::default()
+            },
+            Vec::new(),
+        );
+        let prefix = DeploymentPrefix::parse("prod/").unwrap();
+        let root = test_root();
+        let mut ack = AckSet {
+            verifier_digest: [0; 32],
+            projection_digest: [0; 32],
+            kind: TransitionKind::PromoteNext,
+            binding: Binding::Bootstrap([0; 16]),
+            binding_bytes: Vec::new(),
+            rows: vec![AckRow {
+                id: b"server".to_vec(),
+                epoch: 1,
+                roles: 1,
+                acknowledged_at: 101,
+                last_issued_at: None,
+                signature: [0; 64],
+            }],
+        };
+        assert_eq!(
+            validate_ring_semantics(
+                &semantic_request(&root, &prefix, &proposed, &predecessor),
+                TransitionKind::PromoteNext,
+                &ack,
+            ),
+            Ok(())
+        );
+
+        ack.rows[0].roles = 4;
+        ack.rows[0].last_issued_at = Some(100);
+        assert_eq!(
+            validate_ring_semantics(
+                &semantic_request(&root, &prefix, &proposed, &predecessor),
+                TransitionKind::PromoteNext,
+                &ack,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn retirement_requires_now_and_every_ack_strictly_after_drain() {
+        let previous = test_ring(Slot::Previous, 1..2);
+        let predecessor = test_authority(
+            CredentialControl {
+                previous_last_issue_unix_seconds: Some(0),
+                ..CredentialControl::default()
+            },
+            vec![test_ring(Slot::Current, 2..3), previous],
+        );
+        let proposed = test_authority(
+            CredentialControl {
+                revoked_kids: vec![vec![1; 16].into()],
+                ..CredentialControl::default()
+            },
+            Vec::new(),
+        );
+        let prefix = DeploymentPrefix::parse("prod/").unwrap();
+        let root = test_root();
+        let mut ack = AckSet {
+            verifier_digest: [0; 32],
+            projection_digest: [0; 32],
+            kind: TransitionKind::RetirePrevious,
+            binding: Binding::Bootstrap([0; 16]),
+            binding_bytes: Vec::new(),
+            rows: vec![AckRow {
+                id: b"server".to_vec(),
+                epoch: 1,
+                roles: 1,
+                acknowledged_at: 931,
+                last_issued_at: None,
+                signature: [0; 64],
+            }],
+        };
+        assert_eq!(
+            validate_ring_semantics(
+                &semantic_request_at(&root, &prefix, &proposed, &predecessor, 930),
+                TransitionKind::RetirePrevious,
+                &ack,
+            ),
+            Err(IdentityError::Transition(
+                "previous ring retired before drain horizon"
+            ))
+        );
+        ack.rows[0].acknowledged_at = 930;
+        assert_eq!(
+            validate_ring_semantics(
+                &semantic_request_at(&root, &prefix, &proposed, &predecessor, 931),
+                TransitionKind::RetirePrevious,
+                &ack,
+            ),
+            Err(IdentityError::Transition(
+                "retirement acknowledgement is not strictly post-drain"
+            ))
+        );
+    }
+
+    fn semantic_request<'a>(
+        root: &'a PinnedRoot,
+        prefix: &'a DeploymentPrefix,
+        proposed: &'a CredentialAuthority,
+        predecessor: &'a CredentialAuthority,
+    ) -> TransitionRequest<'a> {
+        semantic_request_at(root, prefix, proposed, predecessor, 0)
+    }
+
+    fn semantic_request_at<'a>(
+        root: &'a PinnedRoot,
+        prefix: &'a DeploymentPrefix,
+        proposed: &'a CredentialAuthority,
+        predecessor: &'a CredentialAuthority,
+        now_unix_seconds: i64,
+    ) -> TransitionRequest<'a> {
+        TransitionRequest {
+            root,
+            prefix,
+            proposed,
+            predecessor: Some(CredentialPredecessor {
+                authority: predecessor,
+                control_key: b"key",
+                object_version_id: b"version",
+                exact_body: b"body",
+                verifier_set_cose: b"set",
+            }),
+            bootstrap_session: None,
+            evidence: TransitionEvidence {
+                verifier_set_cose: b"",
+                acknowledgement_set: b"",
+                transition_proof_cose: b"",
+            },
+            now_unix_seconds,
+        }
+    }
+
+    fn test_root() -> PinnedRoot {
+        PinnedRoot {
+            public_key: [0; 32],
+            kid: [0; 16],
+        }
+    }
+
+    fn test_authority(control: CredentialControl, rings: Vec<Ring>) -> CredentialAuthority {
+        CredentialAuthority {
+            control,
+            rings,
+            prefix: DeploymentPrefix::parse("prod/").unwrap(),
+            root: test_root(),
+        }
+    }
+
+    fn test_ring(slot: Slot, kids: std::ops::Range<u8>) -> Ring {
+        Ring {
+            uuid: [1; 16],
+            issued_at: 0,
+            prior_digest: Vec::new(),
+            epoch: 1,
+            digest: [2; 32],
+            keys: kids.map(test_key).collect(),
+            slot,
+        }
+    }
+
+    fn test_key(value: u8) -> DataKey {
+        DataKey {
+            kid: [value; 16],
+            public_key: [value; 32],
+            issuer: b"issuer".to_vec(),
+            audiences: vec![b"audience".to_vec()],
+            not_before: 0,
+            not_after: 1,
+            state: crate::KeyState::Active,
+        }
     }
 }
