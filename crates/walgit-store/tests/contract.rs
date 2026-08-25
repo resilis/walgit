@@ -1123,6 +1123,86 @@ fn s3_contract_credential_mode(
     }
 }
 
+#[cfg(feature = "s3")]
+#[derive(Debug)]
+struct S3ContractSettings {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    force_path_style: bool,
+    credential_mode: walgit_config::S3CredentialMode,
+    credential_mode_label: &'static str,
+    access_key_env: String,
+    secret_key_env: String,
+    session_token_env: String,
+    configured_prefix: String,
+}
+
+#[cfg(feature = "s3")]
+fn s3_contract_env(
+    read: &mut impl FnMut(&str) -> Result<String, std::env::VarError>,
+    name: &str,
+) -> Result<Option<String>, &'static str> {
+    match read(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("S3 contract environment input must be valid Unicode")
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+fn load_s3_contract_settings(
+    mut read: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<S3ContractSettings>, &'static str> {
+    let Some(endpoint) = s3_contract_env(&mut read, "WALGIT_TEST_S3_ENDPOINT")? else {
+        return Ok(None);
+    };
+    let bucket = s3_contract_env(&mut read, "WALGIT_TEST_S3_BUCKET")?
+        .unwrap_or_else(|| "walgit-test".into());
+    let region =
+        s3_contract_env(&mut read, "WALGIT_TEST_S3_REGION")?.unwrap_or_else(|| "us-east-1".into());
+    let force_path_style =
+        match s3_contract_env(&mut read, "WALGIT_TEST_S3_FORCE_PATH_STYLE")?.as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(_) => return Err("WALGIT_TEST_S3_FORCE_PATH_STYLE must be true or false"),
+        };
+    let credential_mode_value = s3_contract_env(&mut read, "WALGIT_TEST_S3_CREDENTIAL_MODE")?
+        .unwrap_or_else(|| "default".into());
+    let credential_mode = s3_contract_credential_mode(&credential_mode_value)?;
+    let (credential_mode_label, access_key_env, secret_key_env, session_token_env) =
+        match credential_mode {
+            walgit_config::S3CredentialMode::DefaultChain => {
+                ("default", String::new(), String::new(), String::new())
+            }
+            walgit_config::S3CredentialMode::ExplicitEnv => (
+                "explicit",
+                s3_contract_env(&mut read, "WALGIT_TEST_S3_ACCESS_KEY_ENV")?
+                    .unwrap_or_else(|| "AWS_ACCESS_KEY_ID".into()),
+                s3_contract_env(&mut read, "WALGIT_TEST_S3_SECRET_KEY_ENV")?
+                    .unwrap_or_else(|| "AWS_SECRET_ACCESS_KEY".into()),
+                s3_contract_env(&mut read, "WALGIT_TEST_S3_SESSION_TOKEN_ENV")?.unwrap_or_default(),
+            ),
+        };
+    let configured_prefix = s3_contract_env(&mut read, "WALGIT_TEST_S3_PREFIX")?
+        .unwrap_or_else(|| "contract-test".into());
+
+    Ok(Some(S3ContractSettings {
+        endpoint,
+        bucket,
+        region,
+        force_path_style,
+        credential_mode,
+        credential_mode_label,
+        access_key_env,
+        secret_key_env,
+        session_token_env,
+        configured_prefix,
+    }))
+}
+
 // ---- test wrappers -----------------------------------------------------
 
 #[tokio::test]
@@ -1134,43 +1214,29 @@ async fn memory_contract() {
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
-    let endpoint = match std::env::var("WALGIT_TEST_S3_ENDPOINT") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
-            return;
-        }
+    let settings = load_s3_contract_settings(|name| std::env::var(name))
+        .unwrap_or_else(|message| panic!("{message}"));
+    let Some(S3ContractSettings {
+        endpoint,
+        bucket,
+        region,
+        force_path_style,
+        credential_mode,
+        credential_mode_label,
+        access_key_env,
+        secret_key_env,
+        session_token_env,
+        configured_prefix,
+    }) = settings
+    else {
+        eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
+        return;
     };
-    let bucket = std::env::var("WALGIT_TEST_S3_BUCKET").unwrap_or_else(|_| "walgit-test".into());
-    let region = std::env::var("WALGIT_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-    let force_path_style = std::env::var("WALGIT_TEST_S3_FORCE_PATH_STYLE")
-        .map(|value| value.parse::<bool>().expect("true or false"))
-        .unwrap_or(true);
-    let credential_mode =
-        std::env::var("WALGIT_TEST_S3_CREDENTIAL_MODE").unwrap_or_else(|_| "default".into());
-    let credential_mode_config =
-        s3_contract_credential_mode(&credential_mode).unwrap_or_else(|message| panic!("{message}"));
-    let (credential_mode_label, access_key_env, secret_key_env, session_token_env) =
-        match credential_mode_config {
-            walgit_config::S3CredentialMode::DefaultChain => {
-                ("default", String::new(), String::new(), String::new())
-            }
-            walgit_config::S3CredentialMode::ExplicitEnv => (
-                "explicit",
-                std::env::var("WALGIT_TEST_S3_ACCESS_KEY_ENV")
-                    .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".into()),
-                std::env::var("WALGIT_TEST_S3_SECRET_KEY_ENV")
-                    .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".into()),
-                std::env::var("WALGIT_TEST_S3_SESSION_TOKEN_ENV").unwrap_or_default(),
-            ),
-        };
 
     // Validate the exact configured deployment prefix, then isolate this run
     // below it. The run child is an object-key namespace, not another
     // deployment-prefix segment, so a valid 63-byte configured segment stays
     // valid instead of being lengthened by the UUID.
-    let configured_prefix =
-        std::env::var("WALGIT_TEST_S3_PREFIX").unwrap_or_else(|_| "contract-test".into());
     let run_child = format!("contract-run-{}", uuid::Uuid::new_v4().simple());
     let prefix = if configured_prefix.is_empty() {
         run_child
@@ -1188,7 +1254,7 @@ async fn s3_contract() {
         s3: walgit_config::S3Config {
             endpoint: endpoint.clone(),
             region,
-            credential_mode: credential_mode_config,
+            credential_mode,
             access_key_env,
             secret_key_env,
             session_token_env,
@@ -1273,6 +1339,46 @@ fn invalid_s3_contract_credential_mode_is_source_free() {
         "WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit"
     );
     assert!(!error.contains(SENTINEL));
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn non_unicode_s3_contract_settings_are_source_free_and_never_skip() {
+    const SENTINEL: &str = "provider-setting-secret-sentinel";
+    const INPUTS: &[&str] = &[
+        "WALGIT_TEST_S3_ENDPOINT",
+        "WALGIT_TEST_S3_BUCKET",
+        "WALGIT_TEST_S3_REGION",
+        "WALGIT_TEST_S3_FORCE_PATH_STYLE",
+        "WALGIT_TEST_S3_CREDENTIAL_MODE",
+        "WALGIT_TEST_S3_ACCESS_KEY_ENV",
+        "WALGIT_TEST_S3_SECRET_KEY_ENV",
+        "WALGIT_TEST_S3_SESSION_TOKEN_ENV",
+        "WALGIT_TEST_S3_PREFIX",
+    ];
+
+    for invalid_input in INPUTS {
+        let result = load_s3_contract_settings(|name| {
+            if name == *invalid_input {
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    SENTINEL,
+                )))
+            } else {
+                match name {
+                    "WALGIT_TEST_S3_ENDPOINT" => Ok("https://s3.example.test".into()),
+                    "WALGIT_TEST_S3_CREDENTIAL_MODE" => Ok("explicit".into()),
+                    _ => Err(std::env::VarError::NotPresent),
+                }
+            }
+        });
+        let error = result.expect_err("non-Unicode provider input must fail");
+        assert_eq!(error, "S3 contract environment input must be valid Unicode");
+        assert!(!error.contains(SENTINEL));
+    }
+
+    let absent = load_s3_contract_settings(|_| Err(std::env::VarError::NotPresent))
+        .expect("a genuinely absent endpoint may skip the optional contract");
+    assert!(absent.is_none());
 }
 
 #[cfg(feature = "s3")]
