@@ -75,7 +75,11 @@ pub fn lint_v2_descriptors(pool: &DescriptorPool) -> Result<(), String> {
             .iter()
             .map(|field| FieldLayout {
                 number: field.number.unwrap_or_default(),
-                oneof_index: field.oneof_index,
+                oneof_index: if field.proto3_optional == Some(true) {
+                    None
+                } else {
+                    field.oneof_index
+                },
             })
             .collect::<Vec<_>>();
         lint_declared_layout(message.full_name(), &declared)?;
@@ -94,7 +98,10 @@ pub fn lint_v2_descriptors(pool: &DescriptorPool) -> Result<(), String> {
             })?;
             lint_field_options(pool, &field, message_maximum)?;
             let (minimum, maximum) = field_wire_bounds(pool, &field)?;
-            if let Some(oneof_index) = raw_field.oneof_index {
+            if let Some(oneof_index) = raw_field
+                .oneof_index
+                .filter(|_| raw_field.proto3_optional != Some(true))
+            {
                 let oneof_index = usize::try_from(oneof_index)
                     .map_err(|_| format!("{} has a negative oneof index", message.full_name()))?;
                 let slot = oneof_maxima.get_mut(oneof_index).ok_or_else(|| {
@@ -219,7 +226,7 @@ fn lint_field_options(
             usize::try_from(maximum)
                 .map_err(|_| format!("{} byte bound does not fit usize", field.full_name()))?;
         }
-        Kind::Message(_) | Kind::Enum(_) | Kind::Uint32 | Kind::Uint64 => {
+        Kind::Message(_) | Kind::Enum(_) | Kind::Int64 | Kind::Uint32 | Kind::Uint64 => {
             reject_option(
                 pool,
                 &field.options(),
@@ -376,7 +383,7 @@ fn occurrence_wire_bounds(
             true,
         ),
         Kind::Uint32 => (1, 5, false),
-        Kind::Uint64 | Kind::Enum(_) => (1, 10, false),
+        Kind::Int64 | Kind::Uint64 | Kind::Enum(_) => (1, 10, false),
         _ => {
             return Err(format!(
                 "{} uses an unsupported scalar kind",
@@ -400,7 +407,7 @@ fn occurrence_wire_bounds(
 
 fn wire_type(field: &FieldDescriptor) -> Result<u64, String> {
     match field.kind() {
-        Kind::Uint32 | Kind::Uint64 | Kind::Enum(_) => Ok(0),
+        Kind::Int64 | Kind::Uint32 | Kind::Uint64 | Kind::Enum(_) => Ok(0),
         Kind::Bytes | Kind::String | Kind::Message(_) => Ok(2),
         _ => Err(format!(
             "{} uses an unsupported scalar kind",
