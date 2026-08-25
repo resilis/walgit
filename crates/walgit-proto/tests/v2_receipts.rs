@@ -2,13 +2,14 @@ mod support;
 
 use bytes::Bytes;
 use prost::Message;
+use sha2::{Digest, Sha256};
 use walgit_proto::v2::{
-    CatalogKind, CatalogRoot, ControlCodecError, EventObligation as EventObligationValue,
-    EventSubscriberBody, LandedControlRef, MAX_MUTATION_RECEIPT_BYTES, MAX_MUTATION_RESULT_BYTES,
-    MAX_RECEIPT_CATALOG_BYTES, MutationKind, MutationReceipt, MutationResult, NoCapacityObligation,
-    NoEventObligation, NoPriorControl, PriorControlBinding, ReceiptCatalog, ReceiptCatalogRow,
-    ReceiptState, TargetObjectRef, decode_mutation_receipt, decode_mutation_result,
-    decode_receipt_catalog,
+    CapacityObligation as CapacityObligationValue, CatalogKind, CatalogRoot, ControlCodecError,
+    EventObligation as EventObligationValue, EventSubscriberBody, LandedControlRef,
+    MAX_MUTATION_RECEIPT_BYTES, MAX_MUTATION_RESULT_BYTES, MAX_RECEIPT_CATALOG_BYTES, MutationKind,
+    MutationReceipt, MutationResult, NoCapacityObligation, NoEventObligation, NoPriorControl,
+    PriorControlBinding, ReceiptCatalog, ReceiptCatalogRow, ReceiptState, TargetObjectRef,
+    decode_mutation_receipt, decode_mutation_result, decode_receipt_catalog,
     digests::ProtobufObjectDigest,
     encode_mutation_receipt, encode_mutation_result, encode_receipt_catalog,
     mutation_receipt::{CapacityObligation, EventObligation, Predecessor},
@@ -46,7 +47,7 @@ fn receipt_result_and_catalog_have_stable_golden_bytes() {
     let catalog_bytes = encode_receipt_catalog(&settled_catalog).unwrap();
     assert_eq!(
         hex::encode(&catalog_bytes),
-        "08011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1ad6040a1001890f4776447b8b9d7a876543210ac010021afb0108011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1a1001890f4776447b8b9d7a876543210ac02006280130013a2044444444444444444444444444444444444444444444444444444444444444444220555555555555555555555555555555555555555555555555555555555555555552120a056361732d31120976657273696f6e2d315a006a0022c1020a82010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f12820170726f642f76322f7265706f7369746f726965732f62792d69642f30313839306634373736343437623862396437613837363534333231306162642f67303030303030303030303030303030312f72656365697074732f726573756c74732f30313839306634373736343437623862396437613837363534333231306163302e70621a10726573756c742d76657273696f6e2d3122207777777777777777777777777777777777777777777777777777777777777777288004",
+        "08011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1ae8040a1001890f4776447b8b9d7a876543210ac010021afb0108011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1a1001890f4776447b8b9d7a876543210ac02006280130013a2044444444444444444444444444444444444444444444444444444444444444444220555555555555555555555555555555555555555555555555555555555555555552120a056361732d31120976657273696f6e2d315a006a0022c1020a82010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f12820170726f642f76322f7265706f7369746f726965732f62792d69642f30313839306634373736343437623862396437613837363534333231306162642f67303030303030303030303030303030312f72656365697074732f726573756c74732f30313839306634373736343437623862396437613837363534333231306163302e70621a10726573756c742d76657273696f6e2d31222077777777777777777777777777777777777777777777777777777777777777772880042a1001890f4776447b8b9d7a876543210aff",
         "catalog bytes changed"
     );
     assert_eq!(
@@ -63,7 +64,7 @@ fn receipt_result_and_catalog_have_stable_golden_bytes() {
     );
     assert_eq!(
         ProtobufObjectDigest::of_exact_protobuf(&catalog_bytes).lower_hex(),
-        "242ea2bc921963f22f388c85857f4181e78dcf416f1221d1a5acf7b9a25b0d16"
+        "c86e220d555ca2118bbf1832fcf823d0e641a4ad833917b117971305a3b5a810"
     );
     let unresolved_catalog = catalog(ReceiptState::Unresolved, None);
     let unresolved_bytes = encode_receipt_catalog(&unresolved_catalog).unwrap();
@@ -86,6 +87,29 @@ fn every_mutation_kind_has_the_frozen_wire_value() {
         };
         assert_eq!(bytes, expected, "MutationKind wire value {value} changed");
     }
+}
+
+#[test]
+fn predecessor_capacity_and_event_arms_have_stable_golden_bytes() {
+    let mut no_prior = receipt();
+    no_prior.kind = MutationKind::Create as i32;
+    no_prior.predecessor = Some(Predecessor::NoPriorControl(NoPriorControl {}));
+    assert_eq!(
+        hex::encode(encode_mutation_receipt(&no_prior).unwrap()),
+        "08011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1a1001890f4776447b8b9d7a876543210ac02001280130013a204444444444444444444444444444444444444444444444444444444444444444422055555555555555555555555555555555555555555555555555555555555555554a005a006a00"
+    );
+
+    let capacity = capacity_receipt();
+    assert_eq!(
+        hex::encode(encode_mutation_receipt(&capacity).unwrap()),
+        "08011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1a1001890f4776447b8b9d7a876543210ac02006280130013a2044444444444444444444444444444444444444444444444444444444444444444220555555555555555555555555555555555555555555555555555555555555555552120a056361732d31120976657273696f6e2d3162650801122c70726f642f76322f63617061636974792f7368617264732f63312f63617061636974795f73686172642e70621a0b63617061636974792d7631221001890f4776447b8b9d7a876543210ac02801321001890f4776447b8b9d7a876543210ac038016a00"
+    );
+
+    let event = event_receipt();
+    assert_eq!(
+        hex::encode(encode_mutation_receipt(&event).unwrap()),
+        "08011282010a0874656e616e742d31120970726f6a6563742d311a1001890f4776447b8b9d7a876543210abd20012a1374656e616e742f70726f6a6563742f7265706f322004b769541bf0e8952bdfb4977f0a0139c5a41d024caeacf621a03a40ac1aeb513a204e1a43dcf3483848180c87b6c6fa2ef537b875dd215a76cf1fb6707a3e9c981f1a1001890f4776447b8b9d7a876543210ac02006280130013a2044444444444444444444444444444444444444444444444444444444444444444220555555555555555555555555555555555555555555555555555555555555555552120a056361732d31120976657273696f6e2d315a0072df010a1001890f4776447b8b9d7a876543210ac010011a20666666666666666666666666666666666666666666666666666666666666666622800170726f642f76322f7265706f7369746f726965732f62792d69642f30313839306634373736343437623862396437613837363534333231306162642f67303030303030303030303030303030312f6576656e74732f726573756c74732f30313839306634373736343437623862396437613837363534333231306163302e70622a240a2077777777777777777777777777777777777777777777777777777777777777771001"
+    );
 }
 
 #[test]
@@ -210,6 +234,16 @@ fn receipt_unions_and_catalog_states_are_closed_and_internal_settlement_is_recei
     );
     assert!(encode_receipt_catalog(&catalog(ReceiptState::Settled, None)).is_err());
     assert!(encode_receipt_catalog(&catalog(ReceiptState::Settled, Some(result_target()))).is_ok());
+
+    let mut unresolved = catalog(ReceiptState::Unresolved, None);
+    unresolved.rows[0].settlement_mutation_id =
+        Bytes::from(hex::decode("01890f4776447b8b9d7a876543210aff").unwrap());
+    assert!(encode_receipt_catalog(&unresolved).is_err());
+    let mut settled = catalog(ReceiptState::Settled, Some(result_target()));
+    settled.rows[0].settlement_mutation_id = Bytes::new();
+    assert!(encode_receipt_catalog(&settled).is_err());
+    settled.rows[0].settlement_mutation_id = Bytes::from_static(b"not-a-uuid-v7!!");
+    assert!(encode_receipt_catalog(&settled).is_err());
 }
 
 #[test]
@@ -269,11 +303,18 @@ fn exact_maximum_tokens_versions_event_keys_and_sorted_bodies_are_closed() {
     assert!(encode_mutation_receipt(&value).is_err());
 
     let mut value = receipt();
+    let identity = value.identity.as_ref().unwrap();
+    let event_result_key = format!(
+        "prod/v2/repositories/by-id/{}/g{:016x}/events/results/{}.pb",
+        hex::encode(&identity.repository_uuid),
+        identity.generation,
+        hex::encode(&value.mutation_id)
+    );
     value.event_obligation = Some(EventObligation::Event(EventObligationValue {
         event_id: value.mutation_id.clone(),
         wal_sequence: value.wal_sequence,
         subscriber_set_digest: Bytes::from(vec![0x66; 32]),
-        result_key: Bytes::from(vec![b'k'; 1_024]),
+        result_key: Bytes::from(event_result_key),
         subscriber_bodies: vec![
             EventSubscriberBody {
                 digest: Bytes::from(vec![1; 32]),
@@ -294,7 +335,7 @@ fn exact_maximum_tokens_versions_event_keys_and_sorted_bodies_are_closed() {
     match value.event_obligation.as_mut() {
         Some(EventObligation::Event(event)) => {
             event.subscriber_bodies.swap(0, 1);
-            event.result_key = Bytes::from(vec![b'k'; 1_025]);
+            event.result_key = Bytes::from_static(b"prod/v2/events/results/arbitrary.pb");
         }
         _ => unreachable!(),
     }
@@ -305,6 +346,57 @@ fn exact_maximum_tokens_versions_event_keys_and_sorted_bodies_are_closed() {
     assert!(encode_receipt_catalog(&value).is_ok());
     value.rows[0].result.as_mut().unwrap().object_version_id = Bytes::from(vec![b'v'; 1_025]);
     assert!(encode_receipt_catalog(&value).is_err());
+}
+
+#[test]
+fn obligation_keys_and_receipt_result_sizes_are_exact() {
+    let mut capacity = capacity_receipt();
+    let shard = Sha256::digest(&capacity.identity.as_ref().unwrap().repository_uuid)[0];
+    assert!(encode_mutation_receipt(&capacity).is_ok());
+    let Some(CapacityObligation::Capacity(binding)) = capacity.capacity_obligation.as_mut() else {
+        unreachable!()
+    };
+    binding.shard_key = Bytes::from(format!("v2/capacity/shards/{shard:02x}/capacity_shard.pb"));
+    assert!(encode_mutation_receipt(&capacity).is_ok());
+    let Some(CapacityObligation::Capacity(binding)) = capacity.capacity_obligation.as_mut() else {
+        unreachable!()
+    };
+    binding.shard_key = Bytes::from(format!(
+        "prod/v2/capacity/shards/{:02x}/capacity_shard.pb",
+        shard.wrapping_add(1)
+    ));
+    assert!(encode_mutation_receipt(&capacity).is_err());
+
+    let mut event = event_receipt();
+    assert!(encode_mutation_receipt(&event).is_ok());
+    let Some(EventObligation::Event(binding)) = event.event_obligation.as_mut() else {
+        unreachable!()
+    };
+    binding.result_key = Bytes::from(format!(
+        "v2/repositories/by-id/{}/g{:016x}/events/results/{}.pb",
+        hex::encode(&event.identity.as_ref().unwrap().repository_uuid),
+        event.identity.as_ref().unwrap().generation,
+        hex::encode(&binding.event_id)
+    ));
+    assert!(encode_mutation_receipt(&event).is_ok());
+    let Some(EventObligation::Event(binding)) = event.event_obligation.as_mut() else {
+        unreachable!()
+    };
+    binding.result_key = Bytes::from(format!(
+        "prod/v2/repositories/by-id/{}/g{:016x}/events/results/{}.pb",
+        hex::encode(&event.identity.as_ref().unwrap().repository_uuid),
+        event.identity.as_ref().unwrap().generation,
+        "01890f4776447b8b9d7a876543210afe"
+    ));
+    assert!(encode_mutation_receipt(&event).is_err());
+
+    let mut settled = catalog(ReceiptState::Settled, Some(result_target()));
+    settled.rows[0].result.as_mut().unwrap().size = 0;
+    assert!(encode_receipt_catalog(&settled).is_err());
+    settled.rows[0].result.as_mut().unwrap().size = MAX_MUTATION_RESULT_BYTES as u64;
+    assert!(encode_receipt_catalog(&settled).is_ok());
+    settled.rows[0].result.as_mut().unwrap().size = MAX_MUTATION_RESULT_BYTES as u64 + 1;
+    assert!(encode_receipt_catalog(&settled).is_err());
 }
 
 fn receipt() -> MutationReceipt {
@@ -325,6 +417,44 @@ fn receipt() -> MutationReceipt {
         capacity_obligation: Some(CapacityObligation::NoCapacity(NoCapacityObligation {})),
         event_obligation: Some(EventObligation::NoEvent(NoEventObligation {})),
     }
+}
+
+fn capacity_receipt() -> MutationReceipt {
+    let mut receipt = receipt();
+    let shard = Sha256::digest(&receipt.identity.as_ref().unwrap().repository_uuid)[0];
+    receipt.capacity_obligation = Some(CapacityObligation::Capacity(CapacityObligationValue {
+        allocation_epoch: 1,
+        shard_key: Bytes::from(format!(
+            "prod/v2/capacity/shards/{shard:02x}/capacity_shard.pb"
+        )),
+        shard_object_version_id: Bytes::from_static(b"capacity-v1"),
+        reservation_id: receipt.mutation_id.clone(),
+        tenant_slice_bytes: 1,
+        mutation_id: receipt.mutation_id.clone(),
+        byte_count: 1,
+    }));
+    receipt
+}
+
+fn event_receipt() -> MutationReceipt {
+    let mut receipt = receipt();
+    let identity = receipt.identity.as_ref().unwrap();
+    receipt.event_obligation = Some(EventObligation::Event(EventObligationValue {
+        event_id: receipt.mutation_id.clone(),
+        wal_sequence: receipt.wal_sequence,
+        subscriber_set_digest: Bytes::from(vec![0x66; 32]),
+        result_key: Bytes::from(format!(
+            "prod/v2/repositories/by-id/{}/g{:016x}/events/results/{}.pb",
+            hex::encode(&identity.repository_uuid),
+            identity.generation,
+            hex::encode(&receipt.mutation_id)
+        )),
+        subscriber_bodies: vec![EventSubscriberBody {
+            digest: Bytes::from(vec![0x77; 32]),
+            size: 1,
+        }],
+    }));
+    receipt
 }
 
 fn result() -> MutationResult {
@@ -356,6 +486,11 @@ fn catalog(state: ReceiptState, result: Option<TargetObjectRef>) -> ReceiptCatal
             state: state as i32,
             receipt: Some(receipt),
             result,
+            settlement_mutation_id: if state == ReceiptState::Settled {
+                Bytes::from(hex::decode("01890f4776447b8b9d7a876543210aff").unwrap())
+            } else {
+                Bytes::new()
+            },
         }],
     }
 }

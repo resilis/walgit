@@ -356,8 +356,9 @@ message MutationResult {
   uint64 wal_sequence = 8;
 }
 
-// Settlement preserves the receipt core and changes only this row's state and
-// exact result reference. Rows are strictly sorted by mutation_id.
+// Settlement preserves the receipt core and records both the exact settlement
+// mutation ID and exact result reference. Rows are strictly sorted by
+// mutation_id.
 message ReceiptCatalogRow {
   option (max_encoded_bytes) = 65536;
 
@@ -365,10 +366,11 @@ message ReceiptCatalogRow {
   ReceiptState state = 2;
   MutationReceipt receipt = 3;
   TargetObjectRef result = 4;
+  bytes settlement_mutation_id = 5 [(min_bytes) = 0, (max_bytes) = 16];
 }
 
 message ReceiptCatalog {
-  option (max_encoded_bytes) = 1048576;
+  option (max_encoded_bytes) = 524288;
 
   uint32 schema_version = 1;
   RepositoryIdentity identity = 2;

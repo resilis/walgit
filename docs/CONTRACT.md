@@ -97,11 +97,14 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   sealed repository/control binding including the current stored-control
   `ObjectVersionId`, requires the exact inline issuer/subject grant, applies
   the closed purpose/role matrix, and fails closed on grant catalogs. The
-  controller supports only `SETTINGS`, `GRANTS`, `WRITER_TAKEOVER`, and
-  receiptless `INTERNAL_SETTLEMENT`. Every ordinary mutation roots an
+  public controller supports only `SETTINGS`, `GRANTS`, and receiptless
+  `INTERNAL_SETTLEMENT`. `WRITER_TAKEOVER` stays unavailable to administrator
+  capabilities until a future sealed lease/writer coordination authority is
+  specified. Every ordinary mutation roots an
   `UNRESOLVED` receipt. No later ordinary CAS is admitted until the exact
   landed-control result is materialized and a settlement CAS preserves the
-  row as `SETTLED`. The flat catalog has both a 4,096-item cap and a 1 MiB
+  row as `SETTLED`, with the exact settlement mutation ID and result. The flat
+  catalog has both a 4,096-item cap and a 512 KiB
   encoded cap. Either cap can apply earlier, and admission reserves the
   maximum valid settled-result space before publish. The crate uses the
   real `walgit-store::v2_control` adapter and remains disconnected from V1,

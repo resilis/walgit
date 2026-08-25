@@ -62,7 +62,6 @@ impl RepositoryAction {
 pub enum SupportedMutationKind {
     Settings,
     Grants,
-    WriterTakeover,
 }
 
 impl TryFrom<MutationKind> for SupportedMutationKind {
@@ -72,7 +71,6 @@ impl TryFrom<MutationKind> for SupportedMutationKind {
         match kind {
             MutationKind::Settings => Ok(Self::Settings),
             MutationKind::Grants => Ok(Self::Grants),
-            MutationKind::WriterTakeover => Ok(Self::WriterTakeover),
             _ => Err(ControlError::UnsupportedMutation),
         }
     }
@@ -84,21 +82,34 @@ pub struct MutationRequestDigest([u8; 32]);
 
 impl MutationRequestDigest {
     pub fn of(kind: MutationKind, exact_request: &[u8]) -> Result<Self, ControlError> {
-        SupportedMutationKind::try_from(kind)?;
-        let length =
-            u64::try_from(exact_request.len()).map_err(|_| ControlError::InvalidRequest)?;
-        let digest = Sha256::new()
-            .chain_update(REQUEST_DIGEST_DOMAIN)
-            .chain_update((kind as i32).to_be_bytes())
-            .chain_update(length.to_be_bytes())
-            .chain_update(exact_request)
-            .finalize();
+        let preimage = mutation_request_preimage(kind, exact_request)?;
+        let digest = Sha256::digest(preimage);
         Ok(Self(digest.into()))
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+}
+
+fn mutation_request_preimage(
+    kind: MutationKind,
+    exact_request: &[u8],
+) -> Result<Vec<u8>, ControlError> {
+    if !matches!(
+        kind,
+        MutationKind::Settings | MutationKind::Grants | MutationKind::WriterTakeover
+    ) {
+        return Err(ControlError::UnsupportedMutation);
+    }
+    let length = u64::try_from(exact_request.len()).map_err(|_| ControlError::InvalidRequest)?;
+    let mut preimage =
+        Vec::with_capacity(REQUEST_DIGEST_DOMAIN.len() + 4 + 8 + exact_request.len());
+    preimage.extend_from_slice(REQUEST_DIGEST_DOMAIN);
+    preimage.extend_from_slice(&(kind as u32).to_be_bytes());
+    preimage.extend_from_slice(&length.to_be_bytes());
+    preimage.extend_from_slice(exact_request);
+    Ok(preimage)
 }
 
 #[derive(Debug, Error)]
@@ -259,11 +270,29 @@ fn role_allows(role: GrantRole, action: RepositoryAction) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub enum MutationOutcome {
     Committed(StoredRepoControl),
-    ExactReplay(StoredRepoControl),
+    ExactReplay(RootedMutationResult),
     RecoveryRequired(StoredRepoControl),
     Conflict(Option<StoredRepoControl>),
     NotCommitted(StoredRepoControl),
     Indeterminate,
+}
+
+/// One immutable result whose exact rooted version and receipt binding were
+/// verified before it was returned by the controller.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RootedMutationResult {
+    target: TargetObjectRef,
+    result: MutationResult,
+}
+
+impl RootedMutationResult {
+    pub fn target(&self) -> &TargetObjectRef {
+        &self.target
+    }
+
+    pub fn result(&self) -> &MutationResult {
+        &self.result
+    }
 }
 
 /// Domain controller over the real V2 control and object-store adapters.
@@ -340,40 +369,8 @@ impl RepositoryController {
         .await
     }
 
-    pub async fn take_over_writer(
-        &self,
-        previous: &StoredRepoControl,
-        capability: &AuthenticatedCapability,
-        expected_writer: &WriterFence,
-        mutation_id: [u8; 16],
-        new_holder: Bytes,
-    ) -> Result<MutationOutcome, ControlError> {
-        authorize_inline_grant(previous, capability, RepositoryAction::RepositoryAdmin)?;
-        require_writer(previous.control(), expected_writer)?;
-        if new_holder.is_empty() || new_holder.len() > 256 || new_holder == expected_writer.holder {
-            return Err(ControlError::InvalidRequest);
-        }
-        let request_digest = MutationRequestDigest::of(MutationKind::WriterTakeover, &new_holder)?;
-        let epoch = expected_writer
-            .epoch
-            .checked_add(1)
-            .ok_or(ControlError::InvalidRequest)?;
-        let mut successor = ordinary_successor(previous.control(), mutation_id)?;
-        successor.writer = Some(WriterFence {
-            holder: new_holder,
-            epoch,
-        });
-        self.publish(
-            previous,
-            successor,
-            MutationKind::WriterTakeover,
-            mutation_id,
-            request_digest,
-        )
-        .await
-    }
-
-    /// Materialize the result for the one unresolved landed mutation.
+    /// Materialize the result for the one unresolved landed mutation, or
+    /// verify and return the immutable result already rooted by settlement.
     pub async fn materialize_result(
         &self,
         landed: &StoredRepoControl,
@@ -386,11 +383,15 @@ impl RepositoryController {
             .iter()
             .find(|row| row.mutation_id.as_ref() == mutation_id)
             .ok_or(ControlError::OutOfOrder)?;
+        let receipt = row.receipt.as_ref().ok_or(ControlError::InvalidObject)?;
+        require_none_obligations(receipt)?;
+        if row.state == ReceiptState::Settled as i32 {
+            let target = row.result.as_ref().ok_or(ControlError::InvalidObject)?;
+            return Ok(self.load_rooted_result(target, receipt).await?.target);
+        }
         if row.state != ReceiptState::Unresolved as i32 || row.result.is_some() {
             return Err(ControlError::OutOfOrder);
         }
-        let receipt = row.receipt.as_ref().ok_or(ControlError::InvalidObject)?;
-        require_none_obligations(receipt)?;
         if landed.control().last_internal_mutation_id.as_ref() != mutation_id {
             return Err(ControlError::OutOfOrder);
         }
@@ -466,12 +467,19 @@ impl RepositoryController {
             .ok_or(ControlError::OutOfOrder)?;
         let row = &catalog.rows[row_index];
         if row.state == ReceiptState::Settled as i32 {
-            if previous.control().last_internal_mutation_id.as_ref() == settlement_mutation_id {
-                return Ok(MutationOutcome::ExactReplay(previous.clone()));
+            if row.settlement_mutation_id.as_ref() != settlement_mutation_id {
+                return Err(ControlError::ReplayConflict);
             }
-            return Err(ControlError::OutOfOrder);
+            let receipt = row.receipt.as_ref().ok_or(ControlError::InvalidObject)?;
+            require_none_obligations(receipt)?;
+            let target = row.result.as_ref().ok_or(ControlError::InvalidObject)?;
+            let rooted = self.load_rooted_result(target, receipt).await?;
+            return Ok(MutationOutcome::ExactReplay(rooted));
         }
-        if row.state != ReceiptState::Unresolved as i32 || row.result.is_some() {
+        if row.state != ReceiptState::Unresolved as i32
+            || row.result.is_some()
+            || !row.settlement_mutation_id.is_empty()
+        {
             return Err(ControlError::OutOfOrder);
         }
         let receipt = row.receipt.clone().ok_or(ControlError::InvalidObject)?;
@@ -482,6 +490,7 @@ impl RepositoryController {
         let row = &mut catalog.rows[row_index];
         row.state = ReceiptState::Settled as i32;
         row.result = Some(result_target);
+        row.settlement_mutation_id = Bytes::copy_from_slice(&settlement_mutation_id);
 
         let root = self.persist_catalog(&catalog).await?;
         let mut successor = ordinary_successor(previous.control(), settlement_mutation_id)?;
@@ -518,7 +527,15 @@ impl RepositoryController {
                 Ok(ReceiptState::Unresolved) => {
                     Ok(MutationOutcome::RecoveryRequired(previous.clone()))
                 }
-                Ok(ReceiptState::Settled) => Ok(MutationOutcome::ExactReplay(previous.clone())),
+                Ok(ReceiptState::Settled) => {
+                    let target = existing
+                        .result
+                        .as_ref()
+                        .ok_or(ControlError::InvalidObject)?;
+                    Ok(MutationOutcome::ExactReplay(
+                        self.load_rooted_result(target, receipt).await?,
+                    ))
+                }
                 _ => Err(ControlError::InvalidObject),
             };
         }
@@ -574,6 +591,7 @@ impl RepositoryController {
             state: ReceiptState::Unresolved as i32,
             receipt: Some(receipt),
             result: None,
+            settlement_mutation_id: Bytes::new(),
         });
         catalog
             .rows
@@ -777,6 +795,44 @@ impl RepositoryController {
         target_from_meta(identity.clone(), full_key, &body, meta)
     }
 
+    async fn load_rooted_result(
+        &self,
+        target: &TargetObjectRef,
+        receipt: &MutationReceipt,
+    ) -> Result<RootedMutationResult, ControlError> {
+        let identity = receipt
+            .identity
+            .as_ref()
+            .ok_or(ControlError::InvalidObject)?;
+        let mutation_id: [u8; 16] = receipt
+            .mutation_id
+            .as_ref()
+            .try_into()
+            .map_err(|_| ControlError::InvalidObject)?;
+        let expected_key = receipt_result_key(&self.prefix, identity, &mutation_id)?;
+        if target.identity.as_ref() != Some(identity)
+            || target.key.as_ref() != expected_key.as_bytes()
+            || target.size == 0
+            || target.size > MAX_MUTATION_RESULT_BYTES as u64
+        {
+            return Err(ControlError::InvalidObject);
+        }
+        let (meta, body) = self.load_exact(target, V2KeyKind::ReceiptResult).await?;
+        if meta.size != body.len() as u64 || body.len() as u64 != target.size {
+            return Err(ControlError::InvalidObject);
+        }
+        let digest = ProtobufObjectDigest::of_exact_protobuf(&body);
+        if digest.as_bytes().as_slice() != target.digest.as_ref() {
+            return Err(ControlError::InvalidObject);
+        }
+        let result = decode_mutation_result(&body).map_err(ControlError::persistence)?;
+        verify_result_receipt_binding(&result, receipt)?;
+        Ok(RootedMutationResult {
+            target: target.clone(),
+            result,
+        })
+    }
+
     async fn load_exact(
         &self,
         object: &TargetObjectRef,
@@ -894,6 +950,30 @@ fn require_none_obligations(receipt: &MutationReceipt) -> Result<(), ControlErro
     }
 }
 
+fn verify_result_receipt_binding(
+    result: &MutationResult,
+    receipt: &MutationReceipt,
+) -> Result<(), ControlError> {
+    let kind = MutationKind::try_from(receipt.kind).map_err(|_| ControlError::InvalidObject)?;
+    let expected_writer_epoch = if kind == MutationKind::WriterTakeover {
+        receipt
+            .writer_epoch
+            .checked_add(1)
+            .ok_or(ControlError::InvalidObject)?
+    } else {
+        receipt.writer_epoch
+    };
+    if result.identity != receipt.identity
+        || result.mutation_id != receipt.mutation_id
+        || result.kind != receipt.kind
+        || result.writer_epoch != expected_writer_epoch
+        || result.wal_sequence != receipt.wal_sequence
+    {
+        return Err(ControlError::InvalidObject);
+    }
+    Ok(())
+}
+
 fn ordinary_successor(
     previous: &RepoControl,
     mutation_id: [u8; 16],
@@ -960,6 +1040,10 @@ fn ensure_settlement_capacity(
         .find(|row| row.mutation_id.as_ref() == mutation_id)
         .ok_or(ControlError::InvalidObject)?;
     row.state = ReceiptState::Settled as i32;
+    row.settlement_mutation_id = Bytes::from_static(&[
+        0x01, 0x89, 0x0f, 0x47, 0x76, 0x44, 0x7b, 0x8b, 0x9d, 0x7a, 0x87, 0x65, 0x43, 0x21, 0x0a,
+        0xff,
+    ]);
     row.result = Some(TargetObjectRef {
         identity: Some(identity.clone()),
         key: Bytes::from(receipt_result_key(prefix, &identity, mutation_id)?),

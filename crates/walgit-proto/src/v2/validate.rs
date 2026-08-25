@@ -4,11 +4,11 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BucketSafetyBinding, CREDENTIAL_CONTROL_SCHEMA_VERSION, CapacityBinding, CatalogKind,
-    CatalogRoot, CredentialControl, GrantRole, Lifecycle, MutationKind, MutationReceipt,
-    MutationResult, ObjectFormat, PackRoot, RECEIPT_SCHEMA_VERSION, REPO_CONTROL_SCHEMA_VERSION,
-    ReceiptCatalog, ReceiptCatalogRow, ReceiptState, ReclamationPhase, RepoControl,
-    RepositoryGrant, RepositoryIdentity, TargetObjectRef, VerificationRingRoot, Visibility,
-    WalEntryKind, WalState,
+    CatalogRoot, CredentialControl, GrantRole, Lifecycle, MAX_MUTATION_RESULT_BYTES, MutationKind,
+    MutationReceipt, MutationResult, ObjectFormat, PackRoot, RECEIPT_SCHEMA_VERSION,
+    REPO_CONTROL_SCHEMA_VERSION, ReceiptCatalog, ReceiptCatalogRow, ReceiptState, ReclamationPhase,
+    RepoControl, RepositoryGrant, RepositoryIdentity, TargetObjectRef, VerificationRingRoot,
+    Visibility, WalEntryKind, WalState,
     keys::{
         CanonicalPathDigest, DeploymentPrefix, ParsedV2Key, RepositoryKeyIdentity, RoutingDigest,
         V2KeyKind, parse_key, repo_control_key,
@@ -111,7 +111,7 @@ pub fn validate_mutation_receipt(receipt: &MutationReceipt) -> Result<(), Contro
                 "receipt.capacity.allocation_epoch",
                 capacity.allocation_epoch,
             )?;
-            bounded_bytes("receipt.capacity.shard_key", &capacity.shard_key, 1, 1024)?;
+            validate_receipt_capacity_shard_key(identity, &capacity.shard_key)?;
             bounded_bytes(
                 "receipt.capacity.shard_object_version_id",
                 &capacity.shard_object_version_id,
@@ -148,7 +148,7 @@ pub fn validate_mutation_receipt(receipt: &MutationReceipt) -> Result<(), Contro
                 &event.subscriber_set_digest,
                 32,
             )?;
-            bounded_ascii("receipt.event.result_key", &event.result_key, 1, 1024)?;
+            validate_receipt_event_result_key(identity, &event.event_id, &event.result_key)?;
             if event.subscriber_bodies.len() > 64 {
                 return Err(invalid(
                     "receipt.event.subscriber_bodies",
@@ -255,17 +255,34 @@ fn validate_receipt_catalog_row(
     }
     let state = ReceiptState::try_from(row.state)
         .map_err(|_| invalid("receipt_catalog.row.state", "is unknown"))?;
-    match (state, row.result.as_ref()) {
-        (ReceiptState::Unresolved, None) => Ok(()),
-        (ReceiptState::Settled, Some(result)) => {
+    match state {
+        ReceiptState::Unresolved => {
+            if !row.settlement_mutation_id.is_empty() {
+                return Err(invalid(
+                    "receipt_catalog.row.settlement_mutation_id",
+                    "must be absent while UNRESOLVED",
+                ));
+            }
+            if row.result.is_some() {
+                return Err(invalid(
+                    "receipt_catalog.row.result",
+                    "must be absent while UNRESOLVED",
+                ));
+            }
+            Ok(())
+        }
+        ReceiptState::Settled => {
+            validate_uuid_v7(
+                "receipt_catalog.row.settlement_mutation_id",
+                &row.settlement_mutation_id,
+            )?;
+            let result = row
+                .result
+                .as_ref()
+                .ok_or_else(|| missing("receipt_catalog.row.result"))?;
             validate_receipt_result_target(result, identity, &row.mutation_id)
         }
-        (ReceiptState::Unresolved, Some(_)) => Err(invalid(
-            "receipt_catalog.row.result",
-            "must be absent while UNRESOLVED",
-        )),
-        (ReceiptState::Settled, None) => Err(missing("receipt_catalog.row.result")),
-        (ReceiptState::Unspecified, _) => Err(invalid(
+        ReceiptState::Unspecified => Err(invalid(
             "receipt_catalog.row.state",
             "must be UNRESOLVED or SETTLED",
         )),
@@ -1484,6 +1501,75 @@ fn validate_receipt_result_target(
         return Err(invalid(
             "receipt_catalog.row.result.key",
             "is not a receipt result key",
+        ));
+    }
+    if target.size == 0 || target.size > MAX_MUTATION_RESULT_BYTES as u64 {
+        return Err(invalid(
+            "receipt_catalog.row.result.size",
+            "must be in 1..=65536",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_capacity_shard_key(
+    identity: &RepositoryIdentity,
+    key: &[u8],
+) -> Result<(), ControlValidationError> {
+    bounded_ascii("receipt.capacity.shard_key", key, 1, 1024)?;
+    let shard = Sha256::digest(&identity.repository_uuid)[0];
+    let suffix = format!("v2/capacity/shards/{shard:02x}/capacity_shard.pb");
+    let key_text = std::str::from_utf8(key)
+        .map_err(|_| invalid("receipt.capacity.shard_key", "must be ASCII"))?;
+    let prefix = key_text
+        .strip_suffix(&suffix)
+        .ok_or_else(|| invalid("receipt.capacity.shard_key", "is not deterministic"))?;
+    let prefix = DeploymentPrefix::parse(prefix)
+        .map_err(|_| invalid("receipt.capacity.shard_key", "has an invalid prefix"))?;
+    let parsed = parse_key(&prefix, key)
+        .map_err(|_| invalid("receipt.capacity.shard_key", "is outside the V2 grammar"))?;
+    if parsed.kind != V2KeyKind::CapacityShard {
+        return Err(invalid(
+            "receipt.capacity.shard_key",
+            "is not the repository capacity shard key",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_event_result_key(
+    identity: &RepositoryIdentity,
+    event_id: &[u8],
+    key: &[u8],
+) -> Result<(), ControlValidationError> {
+    bounded_ascii("receipt.event.result_key", key, 1, 1024)?;
+    let mut repository_uuid = [0u8; 16];
+    repository_uuid.copy_from_slice(&identity.repository_uuid);
+    let suffix = format!(
+        "v2/repositories/by-id/{}/g{:016x}/events/results/{}.pb",
+        hex::encode(repository_uuid),
+        identity.generation,
+        hex::encode(event_id)
+    );
+    let key_text = std::str::from_utf8(key)
+        .map_err(|_| invalid("receipt.event.result_key", "must be ASCII"))?;
+    let prefix = key_text
+        .strip_suffix(&suffix)
+        .ok_or_else(|| invalid("receipt.event.result_key", "is not deterministic"))?;
+    let prefix = DeploymentPrefix::parse(prefix)
+        .map_err(|_| invalid("receipt.event.result_key", "has an invalid prefix"))?;
+    let parsed = parse_key(&prefix, key)
+        .map_err(|_| invalid("receipt.event.result_key", "is outside the V2 grammar"))?;
+    if parsed.kind != V2KeyKind::EventResult
+        || parsed.repository
+            != Some(RepositoryKeyIdentity {
+                repository_uuid,
+                generation: identity.generation,
+            })
+    {
+        return Err(invalid(
+            "receipt.event.result_key",
+            "does not match the repository identity and event ID",
         ));
     }
     Ok(())

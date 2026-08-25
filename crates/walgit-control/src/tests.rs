@@ -1,16 +1,21 @@
 // Tests are kept with the domain crate so they can exercise the private
 // authenticated-binding core without adding a forgeable capability constructor.
 
-use std::sync::Arc;
+use std::{fs::File, io::Read, sync::Arc};
 
 use bytes::Bytes;
+use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use walgit_identity::CapabilityPurpose;
+use walgit_identity::{
+    BoundRingObjects, CapabilityPurpose, CredentialAuthority, ExactRingObject, ExpectedCapability,
+    ExpectedCommonClaims, PinnedRoot,
+};
 use walgit_proto::v2::{
-    BucketSafetyBinding, CapacityBinding, CatalogRoot, GrantRole, InlineGrants, InlinePackRoots,
-    Lifecycle, MutationKind, ObjectFormat, QuotaState, ReclamationPhase, ReclamationState,
-    RepoControl, RepositoryGrant, RepositoryIdentity, Visibility, WalState, WriterFence,
+    BucketSafetyBinding, CapacityBinding, CatalogRoot, CredentialControl, GrantRole, InlineGrants,
+    InlinePackRoots, Lifecycle, MutationKind, ObjectFormat, QuotaState, ReclamationPhase,
+    ReclamationState, RepoControl, RepositoryGrant, RepositoryIdentity, VerificationRingRoot,
+    Visibility, WalState, WriterFence,
     keys::{CanonicalPathDigest, DeploymentPrefix, RoutingDigest, repo_control_key},
     repo_control::{GrantRepresentation, PackRepresentation},
 };
@@ -151,6 +156,16 @@ async fn inline_authorization_checks_every_sealed_binding_and_exact_role_matrix(
         ),
         Err(ControlError::GrantCatalogUnsupported)
     ));
+}
+
+#[tokio::test]
+async fn real_verified_capability_authorizes_the_exact_stored_control() {
+    let (_objects, prefix, stored) = fixture().await;
+    let capability = verified_admin_capability(&stored, &prefix);
+    assert_eq!(
+        authorize_inline_grant(&stored, &capability, RepositoryAction::RepositoryAdmin,).unwrap(),
+        GrantRole::Administrator
+    );
 }
 
 #[tokio::test]
@@ -314,7 +329,7 @@ async fn receipt_result_and_settlement_survive_restart_and_gate_later_cas() {
     assert!(catalog.rows[0].result.is_some());
     assert_eq!(catalog.rows[0].receipt, unresolved.rows[0].receipt);
 
-    let replayed_control = match restarted
+    let replayed = match restarted
         .publish(
             &settled,
             ordinary_successor(settled.control(), mutation_id).unwrap(),
@@ -328,60 +343,112 @@ async fn receipt_result_and_settlement_survive_restart_and_gate_later_cas() {
         MutationOutcome::ExactReplay(value) => value,
         other => panic!("unexpected settled replay outcome: {other:?}"),
     };
-    let replayed_catalog = restarted
-        .load_current_catalog(replayed_control.control())
-        .await
-        .unwrap();
-    assert_eq!(replayed_catalog.rows[0].state, ReceiptState::Settled as i32);
-    assert!(replayed_catalog.rows[0].result.is_some());
+    assert_eq!(replayed.target, first_result);
+    assert_eq!(replayed.result.mutation_id.as_ref(), mutation_id);
 
-    assert!(matches!(
+    let replayed_settlement = match restarted
+        .settle(&settled, &writer, mutation_id, settlement_id)
+        .await
+        .unwrap()
+    {
+        MutationOutcome::ExactReplay(value) => value,
+        other => panic!("unexpected settlement replay outcome: {other:?}"),
+    };
+    assert_eq!(replayed_settlement.target, first_result);
+    assert_eq!(
         restarted
-            .settle(&settled, &writer, mutation_id, settlement_id)
+            .materialize_result(&settled, mutation_id)
             .await
             .unwrap(),
-        MutationOutcome::ExactReplay(_)
-    ));
+        first_result
+    );
 
-    let later_digest =
-        MutationRequestDigest::of(MutationKind::WriterTakeover, b"writer-2").unwrap();
+    let second_settlement_id = uuid("01890f4776447b8b9d7a876543210acf");
+    let later_digest = MutationRequestDigest::of(MutationKind::Settings, b"later").unwrap();
     let mut later = ordinary_successor(settled.control(), later_id).unwrap();
-    later.writer = Some(WriterFence {
-        holder: Bytes::from_static(b"writer-2"),
-        epoch: 2,
-    });
-    let takeover = committed(
+    later.inline_settings = Bytes::from_static(b"later");
+    let second_landed = committed(
         restarted
             .publish(
                 &settled,
                 later,
-                MutationKind::WriterTakeover,
+                MutationKind::Settings,
                 later_id,
                 later_digest,
             )
             .await
             .unwrap(),
     );
-    let takeover_catalog = restarted
-        .load_current_catalog(takeover.control())
+    let second_result = restarted
+        .materialize_result(&second_landed, later_id)
         .await
         .unwrap();
-    let takeover_row = takeover_catalog
-        .rows
-        .iter()
-        .find(|row| row.mutation_id.as_ref() == later_id)
-        .unwrap();
-    assert_eq!(takeover_row.receipt.as_ref().unwrap().writer_epoch, 1);
-    let result_target = restarted
-        .materialize_result(&takeover, later_id)
+    let second_settled = committed(
+        restarted
+            .settle(&second_landed, &writer, later_id, second_settlement_id)
+            .await
+            .unwrap(),
+    );
+    let catalog = restarted
+        .load_current_catalog(second_settled.control())
         .await
         .unwrap();
-    let (_, result_bytes) = restarted
-        .load_exact(&result_target, V2KeyKind::ReceiptResult)
+    assert_eq!(catalog.rows.len(), 2);
+    assert_eq!(
+        catalog.rows[0].settlement_mutation_id.as_ref(),
+        settlement_id
+    );
+    assert_eq!(
+        catalog.rows[1].settlement_mutation_id.as_ref(),
+        second_settlement_id
+    );
+    let first_exact = match restarted
+        .settle(&second_settled, &writer, mutation_id, settlement_id)
         .await
-        .unwrap();
-    let result = walgit_proto::v2::decode_mutation_result(&result_bytes).unwrap();
-    assert_eq!(result.writer_epoch, 2);
+        .unwrap()
+    {
+        MutationOutcome::ExactReplay(value) => value,
+        other => panic!("unexpected A/S1 replay: {other:?}"),
+    };
+    let second_exact = match restarted
+        .settle(&second_settled, &writer, later_id, second_settlement_id)
+        .await
+        .unwrap()
+    {
+        MutationOutcome::ExactReplay(value) => value,
+        other => panic!("unexpected B/S2 replay: {other:?}"),
+    };
+    assert_eq!(first_exact.target, first_result);
+    assert_eq!(second_exact.target, second_result);
+    assert!(matches!(
+        restarted
+            .settle(&second_settled, &writer, mutation_id, second_settlement_id)
+            .await,
+        Err(ControlError::ReplayConflict)
+    ));
+    assert!(matches!(
+        restarted
+            .settle(&second_settled, &writer, later_id, settlement_id)
+            .await,
+        Err(ControlError::ReplayConflict)
+    ));
+
+    assert!(matches!(
+        restarted
+            .publish(
+                &second_settled,
+                ordinary_successor(
+                    second_settled.control(),
+                    uuid("01890f4776447b8b9d7a876543210ad0")
+                )
+                .unwrap(),
+                MutationKind::WriterTakeover,
+                uuid("01890f4776447b8b9d7a876543210ad0"),
+                MutationRequestDigest::of(MutationKind::WriterTakeover, b"writer-2").unwrap(),
+            )
+            .await,
+        Err(ControlError::UnsupportedMutation)
+    ));
 }
 
 #[tokio::test]
@@ -559,6 +626,116 @@ async fn lost_result_and_settlement_responses_resume_from_persisted_state() {
     );
 }
 
+#[tokio::test]
+async fn rooted_result_replay_rejects_target_and_receipt_binding_changes() {
+    let (objects, prefix, initial) = fixture().await;
+    let controller = RepositoryController::new(objects, prefix).unwrap();
+    let mutation_id = uuid("01890f4776447b8b9d7a876543210ad1");
+    let settlement_id = uuid("01890f4776447b8b9d7a876543210ad2");
+    let mut successor = ordinary_successor(initial.control(), mutation_id).unwrap();
+    successor.inline_settings = Bytes::from_static(b"rooted");
+    let landed = committed(
+        controller
+            .publish(
+                &initial,
+                successor,
+                MutationKind::Settings,
+                mutation_id,
+                MutationRequestDigest::of(MutationKind::Settings, b"rooted").unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let target = controller
+        .materialize_result(&landed, mutation_id)
+        .await
+        .unwrap();
+    let writer = landed.control().writer.as_ref().unwrap();
+    let settled = committed(
+        controller
+            .settle(&landed, writer, mutation_id, settlement_id)
+            .await
+            .unwrap(),
+    );
+    let catalog = controller
+        .load_current_catalog(settled.control())
+        .await
+        .unwrap();
+    let receipt = catalog.rows[0].receipt.as_ref().unwrap();
+    let rooted = controller
+        .load_rooted_result(&target, receipt)
+        .await
+        .unwrap();
+    assert_eq!(rooted.target, target);
+
+    let mut wrong = target.clone();
+    wrong.object_version_id = Bytes::from_static(b"wrong-version");
+    assert!(
+        controller
+            .load_rooted_result(&wrong, receipt)
+            .await
+            .is_err()
+    );
+    let mut wrong = target.clone();
+    let mut digest = wrong.digest.to_vec();
+    digest[0] ^= 1;
+    wrong.digest = Bytes::from(digest);
+    assert!(matches!(
+        controller.load_rooted_result(&wrong, receipt).await,
+        Err(ControlError::InvalidObject)
+    ));
+    let mut wrong = target.clone();
+    wrong.size += 1;
+    assert!(matches!(
+        controller.load_rooted_result(&wrong, receipt).await,
+        Err(ControlError::InvalidObject)
+    ));
+    let mut wrong = target;
+    wrong.identity.as_mut().unwrap().generation += 1;
+    assert!(matches!(
+        controller.load_rooted_result(&wrong, receipt).await,
+        Err(ControlError::InvalidObject)
+    ));
+
+    let exact = rooted.result;
+    for changed in [
+        MutationResult {
+            mutation_id: Bytes::copy_from_slice(&uuid("01890f4776447b8b9d7a876543210ad3")),
+            ..exact.clone()
+        },
+        MutationResult {
+            kind: MutationKind::Grants as i32,
+            ..exact.clone()
+        },
+        MutationResult {
+            writer_epoch: exact.writer_epoch + 1,
+            ..exact.clone()
+        },
+        MutationResult {
+            wal_sequence: exact.wal_sequence + 1,
+            ..exact.clone()
+        },
+    ] {
+        assert!(matches!(
+            verify_result_receipt_binding(&changed, receipt),
+            Err(ControlError::InvalidObject)
+        ));
+    }
+
+    let mut takeover_receipt = receipt.clone();
+    takeover_receipt.kind = MutationKind::WriterTakeover as i32;
+    takeover_receipt.writer_epoch = 7;
+    let mut takeover_result = exact;
+    takeover_result.kind = MutationKind::WriterTakeover as i32;
+    takeover_result.writer_epoch = 8;
+    assert!(verify_result_receipt_binding(&takeover_result, &takeover_receipt).is_ok());
+    takeover_result.writer_epoch = 7;
+    assert!(matches!(
+        verify_result_receipt_binding(&takeover_result, &takeover_receipt),
+        Err(ControlError::InvalidObject)
+    ));
+}
+
 #[test]
 fn writer_fences_and_prefix_forms_are_exact() {
     let control = sample_control();
@@ -642,6 +819,63 @@ fn grant_requests_reject_invalid_fields_and_duplicates_but_bind_exact_order() {
 }
 
 #[test]
+fn request_digest_forms_have_exact_golden_preimages_and_sha256() {
+    let settings = b"settings-v2";
+    let grants = canonical_grant_request(&[
+        RepositoryGrant {
+            issuer: Bytes::from_static(b"issuer-b"),
+            subject: Bytes::from_static(b"subject-b"),
+            role: GrantRole::Reader as i32,
+        },
+        RepositoryGrant {
+            issuer: Bytes::from_static(b"issuer-a"),
+            subject: Bytes::from_static(b"subject-a"),
+            role: GrantRole::Writer as i32,
+        },
+    ])
+    .unwrap();
+    let takeover = b"writer-2";
+    assert_eq!(hex::encode(settings), "73657474696e67732d7632");
+    assert_eq!(
+        hex::encode(&grants),
+        "00000002000000086973737565722d62000000097375626a6563742d6200000001000000086973737565722d61000000097375626a6563742d6100000002"
+    );
+    assert_eq!(hex::encode(takeover), "7772697465722d32");
+
+    for (kind, request, preimage_hex, digest_hex) in [
+        (
+            MutationKind::Settings,
+            settings.as_slice(),
+            "77616c6769742d7265706f7369746f72792d6d75746174696f6e2d726571756573742d763100000006000000000000000b73657474696e67732d7632",
+            "03ff98f71a8866052391ad4001c8e1e3c17e24c76617ca7383892298c7f2ca29",
+        ),
+        (
+            MutationKind::Grants,
+            grants.as_slice(),
+            "77616c6769742d7265706f7369746f72792d6d75746174696f6e2d726571756573742d763100000007000000000000003e00000002000000086973737565722d62000000097375626a6563742d6200000001000000086973737565722d61000000097375626a6563742d6100000002",
+            "3e7ab792d3f3412aa8490041c9f5baa2897f1e5540bfca4a0ce1141a0f52b64c",
+        ),
+        (
+            MutationKind::WriterTakeover,
+            takeover.as_slice(),
+            "77616c6769742d7265706f7369746f72792d6d75746174696f6e2d726571756573742d76310000001200000000000000087772697465722d32",
+            "7606c7c4821fbe84308c822afff160edca0dc07d97bbb484d87e7b9d2574be83",
+        ),
+    ] {
+        assert_eq!(
+            hex::encode(mutation_request_preimage(kind, request).unwrap()),
+            preimage_hex,
+            "preimage changed for {kind:?}"
+        );
+        assert_eq!(
+            hex::encode(MutationRequestDigest::of(kind, request).unwrap().as_bytes()),
+            digest_hex,
+            "digest changed for {kind:?}"
+        );
+    }
+}
+
+#[test]
 fn unresolved_catalog_reserves_maximum_settlement_result_space() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
     let identity = sample_control().identity.unwrap();
@@ -707,11 +941,7 @@ async fn invalid_ids_and_unsupported_kinds_fail_before_writes() {
             .await,
         Err(ControlError::InvalidRequest)
     ));
-    for kind in [
-        MutationKind::Settings,
-        MutationKind::Grants,
-        MutationKind::WriterTakeover,
-    ] {
+    for kind in [MutationKind::Settings, MutationKind::Grants] {
         assert!(SupportedMutationKind::try_from(kind).is_ok());
     }
     for kind in [
@@ -731,6 +961,7 @@ async fn invalid_ids_and_unsupported_kinds_fail_before_writes() {
         MutationKind::Pin,
         MutationKind::Event,
         MutationKind::Reclamation,
+        MutationKind::WriterTakeover,
         MutationKind::InternalSettlement,
     ] {
         assert!(matches!(
@@ -833,6 +1064,11 @@ fn receipt_row(
             digest: Bytes::from(vec![0x55; 32]),
             size: 1,
         }),
+        settlement_mutation_id: if settled {
+            Bytes::copy_from_slice(&uuid("01890f4776447b8b9d7a876543210aff"))
+        } else {
+            Bytes::new()
+        },
     }
 }
 
@@ -923,5 +1159,280 @@ fn sample_control() -> RepoControl {
                 role: GrantRole::Administrator as i32,
             }],
         })),
+    }
+}
+
+fn verified_admin_capability(
+    stored: &StoredRepoControl,
+    prefix: &DeploymentPrefix,
+) -> walgit_identity::AuthenticatedCapability {
+    const NOW: i64 = 1_800_000_000;
+    const ROOT_KID_DOMAIN: &[u8] = b"walgit-ed25519-root-kid-v1";
+    const RING_AAD: &[u8] = b"walgit-verification-key-ring-v1";
+    const CAPABILITY_AAD: &[u8] = b"walgit-capability-v1";
+
+    let root_signer = ephemeral_signing_key();
+    let root_public = root_signer.verifying_key().to_bytes();
+    let root_kid: [u8; 16] = Sha256::new()
+        .chain_update(ROOT_KID_DOMAIN)
+        .chain_update(root_public)
+        .finalize()[..16]
+        .try_into()
+        .unwrap();
+    let root = PinnedRoot::new(root_public, root_kid).unwrap();
+    let data_signer = ephemeral_signing_key();
+    let data_kid = [0x51; 16];
+
+    let mut ring_payload = Vec::new();
+    test_cbor_map(&mut ring_payload, 6);
+    test_cbor_uint(&mut ring_payload, 1);
+    test_cbor_uint(&mut ring_payload, 1);
+    test_cbor_uint(&mut ring_payload, 2);
+    test_cbor_bytes(&mut ring_payload, &time_uuid(NOW - 10, 0x52));
+    test_cbor_uint(&mut ring_payload, 3);
+    test_cbor_int(&mut ring_payload, NOW - 10);
+    test_cbor_uint(&mut ring_payload, 4);
+    test_cbor_bytes(&mut ring_payload, &[]);
+    test_cbor_uint(&mut ring_payload, 5);
+    test_cbor_array(&mut ring_payload, 1);
+    test_cbor_map(&mut ring_payload, 7);
+    test_cbor_uint(&mut ring_payload, 1);
+    test_cbor_bytes(&mut ring_payload, &data_kid);
+    test_cbor_uint(&mut ring_payload, 2);
+    test_cbor_bytes(&mut ring_payload, &data_signer.verifying_key().to_bytes());
+    test_cbor_uint(&mut ring_payload, 3);
+    test_cbor_bytes(&mut ring_payload, b"cloud-core");
+    test_cbor_uint(&mut ring_payload, 4);
+    test_cbor_array(&mut ring_payload, 1);
+    test_cbor_bytes(&mut ring_payload, b"walgit");
+    test_cbor_uint(&mut ring_payload, 5);
+    test_cbor_int(&mut ring_payload, NOW - 1_000);
+    test_cbor_uint(&mut ring_payload, 6);
+    test_cbor_int(&mut ring_payload, NOW + 1_000);
+    test_cbor_uint(&mut ring_payload, 7);
+    test_cbor_uint(&mut ring_payload, 2);
+    test_cbor_uint(&mut ring_payload, 6);
+    test_cbor_uint(&mut ring_payload, 1);
+    let ring_body = test_sign1(&root_signer, &root_kid, RING_AAD, &ring_payload);
+    let ring_digest: [u8; 32] = Sha256::digest(&ring_body).into();
+    let ring_root = VerificationRingRoot {
+        key: Bytes::from(format!(
+            "{}v2/control/key-rings/{}.cose",
+            prefix.as_str(),
+            hex::encode(ring_digest)
+        )),
+        object_version_id: Bytes::from_static(b"ring-version-1"),
+        digest: Bytes::copy_from_slice(&ring_digest),
+        size: ring_body.len() as u64,
+        ring_epoch: 1,
+    };
+    let credential_control = CredentialControl {
+        schema_version: 2,
+        control_revision: 1,
+        issuer_epoch: 1,
+        current: Some(ring_root.clone()),
+        next: None,
+        previous: None,
+        previous_last_issue_unix_seconds: None,
+        revoked_kids: Vec::new(),
+        verifier_set_digest: Bytes::from(vec![0x61; 32]),
+        acknowledgement_proof_digest: Bytes::from(vec![0x62; 32]),
+    };
+    let authority = CredentialAuthority::bind(
+        &root,
+        &credential_control,
+        prefix,
+        BoundRingObjects {
+            current: ExactRingObject {
+                key: &ring_root.key,
+                object_version_id: &ring_root.object_version_id,
+                body: &ring_body,
+            },
+            next: None,
+            previous: None,
+        },
+    )
+    .unwrap();
+
+    let control = stored.control();
+    let identity = control.identity.as_ref().unwrap();
+    let token_id = time_uuid(NOW, 0x53);
+    let mut payload = Vec::new();
+    test_cbor_map(&mut payload, 24);
+    for (key, value) in [(1, 1), (2, 2)] {
+        test_cbor_uint(&mut payload, key);
+        test_cbor_uint(&mut payload, value);
+    }
+    test_cbor_uint(&mut payload, 3);
+    test_cbor_bytes(&mut payload, b"cloud-core");
+    test_cbor_uint(&mut payload, 4);
+    test_cbor_bytes(&mut payload, b"walgit");
+    test_cbor_uint(&mut payload, 5);
+    test_cbor_bytes(&mut payload, &token_id);
+    for (key, value) in [(6, NOW), (7, NOW), (8, NOW + 900)] {
+        test_cbor_uint(&mut payload, key);
+        test_cbor_int(&mut payload, value);
+    }
+    test_cbor_uint(&mut payload, 9);
+    test_cbor_bytes(&mut payload, &identity.tenant_id);
+    test_cbor_uint(&mut payload, 10);
+    test_cbor_bytes(&mut payload, &identity.project_id);
+    test_cbor_uint(&mut payload, 11);
+    test_cbor_bytes(&mut payload, &identity.repository_uuid);
+    test_cbor_uint(&mut payload, 12);
+    test_cbor_uint(&mut payload, identity.generation);
+    test_cbor_uint(&mut payload, 13);
+    test_cbor_bytes(&mut payload, &identity.canonical_path);
+    test_cbor_uint(&mut payload, 14);
+    test_cbor_bytes(&mut payload, &identity.canonical_path_digest);
+    test_cbor_uint(&mut payload, 15);
+    test_cbor_uint(&mut payload, 1);
+    test_cbor_uint(&mut payload, 16);
+    test_cbor_bytes(&mut payload, &ring_digest);
+    test_cbor_uint(&mut payload, 17);
+    test_cbor_bytes(&mut payload, &identity.routing_digest);
+    test_cbor_uint(&mut payload, 30);
+    test_cbor_uint(&mut payload, CapabilityPurpose::RepositoryAdmin as u64);
+    test_cbor_uint(&mut payload, 31);
+    test_cbor_uint(&mut payload, control.authorization_epoch);
+    test_cbor_uint(&mut payload, 32);
+    test_cbor_bytes(&mut payload, &control.repo_control_key);
+    test_cbor_uint(&mut payload, 33);
+    test_cbor_bytes(
+        &mut payload,
+        stored.binding().object_version_id().as_str().as_bytes(),
+    );
+    test_cbor_uint(&mut payload, 34);
+    test_cbor_uint(&mut payload, control.cutover_generation);
+    test_cbor_uint(&mut payload, 35);
+    test_cbor_bytes(&mut payload, b"cloud-core");
+    test_cbor_uint(&mut payload, 36);
+    test_cbor_bytes(&mut payload, b"admin-1");
+    let envelope = test_sign1(&data_signer, &data_kid, CAPABILITY_AAD, &payload);
+
+    let repository_uuid: [u8; 16] = identity.repository_uuid.as_ref().try_into().unwrap();
+    let ring_digest_expected = ring_digest;
+    let routing_digest: [u8; 32] = identity.routing_digest.as_ref().try_into().unwrap();
+    let expected = ExpectedCapability {
+        common: ExpectedCommonClaims {
+            issuer: b"cloud-core",
+            audience: b"walgit",
+            id: token_id,
+            tenant_id: &identity.tenant_id,
+            project_id: &identity.project_id,
+            repository_uuid,
+            canonical_path: &identity.canonical_path,
+            ring_epoch: 1,
+            ring_digest: ring_digest_expected,
+            routing_digest,
+        },
+        purpose: CapabilityPurpose::RepositoryAdmin,
+        authorization_epoch: control.authorization_epoch,
+        control_key: &control.repo_control_key,
+        control_version_id: stored.binding().object_version_id().as_str().as_bytes(),
+        cutover_generation: control.cutover_generation,
+        grant_issuer: b"cloud-core",
+        grant_subject: b"admin-1",
+    };
+    authority
+        .authenticate_capability(&envelope, NOW, &expected)
+        .unwrap()
+}
+
+fn ephemeral_signing_key() -> SigningKey {
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
+    let key = SigningKey::from_bytes(&bytes);
+    bytes.fill(0);
+    key
+}
+
+fn time_uuid(timestamp: i64, tail: u8) -> [u8; 16] {
+    let mut value = [tail; 16];
+    let millis = (timestamp as u64) * 1_000;
+    value[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
+    value[6] = (value[6] & 0x0f) | 0x70;
+    value[8] = (value[8] & 0x3f) | 0x80;
+    value
+}
+
+fn test_sign1(signing: &SigningKey, kid: &[u8; 16], aad: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut protected = Vec::new();
+    test_cbor_map(&mut protected, 2);
+    test_cbor_uint(&mut protected, 1);
+    test_cbor_int(&mut protected, -8);
+    test_cbor_uint(&mut protected, 4);
+    test_cbor_bytes(&mut protected, kid);
+
+    let mut structure = Vec::new();
+    test_cbor_array(&mut structure, 4);
+    test_cbor_text(&mut structure, b"Signature1");
+    test_cbor_bytes(&mut structure, &protected);
+    test_cbor_bytes(&mut structure, aad);
+    test_cbor_bytes(&mut structure, payload);
+    let signature = signing.sign(&structure).to_bytes();
+
+    let mut envelope = Vec::new();
+    test_cbor_array(&mut envelope, 4);
+    test_cbor_bytes(&mut envelope, &protected);
+    test_cbor_map(&mut envelope, 0);
+    test_cbor_bytes(&mut envelope, payload);
+    test_cbor_bytes(&mut envelope, &signature);
+    envelope
+}
+
+fn test_cbor_uint(out: &mut Vec<u8>, value: u64) {
+    test_cbor_head(out, 0, value);
+}
+
+fn test_cbor_int(out: &mut Vec<u8>, value: i64) {
+    if value >= 0 {
+        test_cbor_head(out, 0, value as u64);
+    } else {
+        test_cbor_head(out, 1, (-1i128 - value as i128) as u64);
+    }
+}
+
+fn test_cbor_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    test_cbor_head(out, 2, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn test_cbor_text(out: &mut Vec<u8>, value: &[u8]) {
+    test_cbor_head(out, 3, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn test_cbor_array(out: &mut Vec<u8>, count: usize) {
+    test_cbor_head(out, 4, count as u64);
+}
+
+fn test_cbor_map(out: &mut Vec<u8>, count: usize) {
+    test_cbor_head(out, 5, count as u64);
+}
+
+fn test_cbor_head(out: &mut Vec<u8>, major: u8, value: u64) {
+    let prefix = major << 5;
+    match value {
+        0..=23 => out.push(prefix | value as u8),
+        24..=0xff => {
+            out.push(prefix | 24);
+            out.push(value as u8);
+        }
+        0x100..=0xffff => {
+            out.push(prefix | 25);
+            out.extend_from_slice(&(value as u16).to_be_bytes());
+        }
+        0x1_0000..=0xffff_ffff => {
+            out.push(prefix | 26);
+            out.extend_from_slice(&(value as u32).to_be_bytes());
+        }
+        _ => {
+            out.push(prefix | 27);
+            out.extend_from_slice(&value.to_be_bytes());
+        }
     }
 }

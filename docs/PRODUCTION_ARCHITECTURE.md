@@ -1083,6 +1083,25 @@ has two closed tagged unions:
 No absent obligation is represented by an empty or guessed identifier. The
 candidate control roots the immutable receipt catalog.
 
+The exact request digest is:
+
+`SHA-256("walgit-repository-mutation-request-v1" || kind_u32_be || request_length_u64_be || exact_request)`.
+
+The domain has exactly the shown ASCII bytes and no terminator. `kind_u32_be`
+is the frozen nonnegative `MutationKind` value in four-byte big-endian form.
+`request_length_u64_be` is the exact request byte length in eight-byte
+big-endian form. The implemented request forms are closed:
+
+- `SETTINGS`: `exact_request` is the raw inline settings byte string.
+- `GRANTS`: `exact_request` is `count_u32_be`, followed in caller order by
+  `issuer_length_u32_be || issuer || subject_length_u32_be || subject ||
+  role_i32_be` for every grant. Caller order is digest-bound. Duplicate
+  `(issuer, subject)` entries are rejected; they are not sorted or collapsed.
+- `WRITER_TAKEOVER`: the frozen future request form is the raw new-holder byte
+  string. The dormant public capability API cannot execute this mutation. A
+  future implementation must supply a sealed lease/writer coordination
+  authority rather than an administrator capability.
+
 The successful control CAS decides repository state. A timeout or lost response
 does not make a landed CAS fail. After the CAS, an immutable result envelope at
 a deterministic mutation-ID key records the successful target
@@ -1094,7 +1113,8 @@ change repository state.
 No unrelated, takeover, or maintenance CAS may follow an unresolved receipt.
 After the successful mutation result envelope is materialized, a serialized
 internal-settlement control CAS roots that exact result and changes the receipt
-catalog row from `UNRESOLVED` to `SETTLED`. The full row remains rooted
+catalog row from `UNRESOLVED` to `SETTLED`. It records the exact settlement
+mutation ID in the row. The full row remains rooted
 indefinitely; settlement does not remove it. Settlement waits for a terminal capacity state
 only when the tag is `CAPACITY`. It waits for the event result, exact archives,
 and control-rooted archive watermark only when the tag is `EVENT`. A `NONE`
@@ -1106,7 +1126,8 @@ before another CAS.
 An event core does not contain its future result `ObjectVersionID`. A resolved
 envelope supplies that value after publication. Checkpoint, compaction, and
 receipt-catalog compaction cannot remove a settled row. A flat bounded receipt
-catalog applies backpressure at 4,096 rows or the 1 MiB encoded bound,
+catalog applies backpressure at 4,096 rows or the 512 KiB (524,288-byte)
+encoded bound,
 whichever comes first. Admission reserves space for the unresolved row's
 maximum valid settled result before the publishing CAS. A later evolution can
 replace this lower limit only with a separately specified canonical compaction rule.
