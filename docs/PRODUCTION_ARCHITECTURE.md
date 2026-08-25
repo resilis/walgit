@@ -1,7 +1,7 @@
 # Production architecture charter
 
-Status: frozen V5.8 production target. PR1 implements only the storage and
-preservation gate described below. The V5.8 identity, control, event, recovery,
+Status: frozen V5.9 production target. PR1 implements only the storage and
+preservation gate described below. The V5.9 identity, control, event, recovery,
 Cloud Core, cutover, and production-promotion contracts are future gates. They
 are not implemented by PR1, and this document does not claim that WalGit is
 ready for production.
@@ -78,7 +78,7 @@ production approval. No PR1 image is production-deployable.
   addressing mode, credential mode, temporary bucket, and unique prefix
   selected for production.
 
-## Future V5.8 repository control contract
+## Future V5.9 repository control contract
 
 Everything in this section is frozen future scope. PR1 does not implement it.
 
@@ -103,6 +103,24 @@ routing_digest = SHA-256("walgit-repo-path-v1" || u32be(len(C)) || C)
 repo_control_key = P || "v2/repositories/by-path/<routing_digest-lowerhex>/repo_control.pb"
 R = P || "v2/repositories/by-id/<repository-uuid-lowerhex>/g<generation-16hex>/"
 ```
+
+Every V2 key in this contract is the full physical provider key and therefore
+includes `P` exactly once. The configured `ObjectStore` is already scoped to
+`P`; its methods accept a validated store-relative suffix `S`, and the provider
+sees `P || S`. The V2 adapter is the only translation boundary. It accepts a
+full V2 key `K`, verifies the closed grammar and exact configured prefix,
+proves `K = P || S`, strips `P` exactly once, and passes only `S` to the
+configured store. For metadata, exact-version, and listing results, the adapter
+prepends `P` exactly once before returning the full key to V2 semantic code.
+This rule also applies when `P` is empty.
+
+A prefix mismatch is `KEY_PREFIX_MISMATCH` and fails closed. No V2 caller
+passes a full `K` directly to the already-prefixed store, treats a
+store-relative suffix as an authoritative key, or concatenates `P` a second
+time. In particular, `P || P || S` is never valid. Every lookup, parent root,
+persisted key field, digest preimage that includes a key, and returned object
+identity uses the full physical key `K`; only the configured store call uses
+the relative suffix `S`.
 
 The public path therefore addresses `repo_control` without first knowing the
 tenant, project, UUID, or generation. A direct lookup reads this exact key and
@@ -181,6 +199,10 @@ Each digest has one exact preimage:
 - a verification-ring key uses the digest of the exact stored untagged
   verification-ring `COSE_Sign1` bytes.
 
+These are object and envelope identity digests. The credential verifier-set and
+acknowledgement-set semantic fields below use their separately domain-separated
+digest formulas; neither retained evidence value is a bucket object identity.
+
 Readers hash the stored bytes before parsing and reject a non-matching digest.
 Persisted protobuf uses deterministic field ordering, minimal varints, packed
 canonical repeated scalars, no maps, no unknown fields, no duplicate singular
@@ -250,9 +272,10 @@ authority.
 | Catalog node | 524,288 |
 | Event archive watermark | 524,288 |
 | Mutation receipt or result, event core, result, archive, pin, build row, provider row, host row, recovery row, reclamation row, WAL-tail entry, bootstrap, cutover, bucket-safety evidence row, signed cutover-proof envelope, or signed verification key ring | 65,536 |
+| Signed credential verifier-set envelope or credential acknowledgement-set bytes | 65,536 |
 | Archive-root reference | 4,096 |
 | Capacity reservation, tenant-capacity allocation row, verification data-key row, or build-context row | 16,384 |
-| Create-intent or capability `COSE_Sign1` envelope | 8,192 |
+| Create-intent, capability, or credential-transition-proof `COSE_Sign1` envelope | 8,192 |
 | Lease | 16,384 |
 | Any other nested V2 control message | 4,096 |
 
@@ -261,7 +284,7 @@ The following field limits apply across the V2 schema:
 | Field class | Bound |
 |---|---:|
 | Tenant, project, issuer, subject, audience, holder, purpose, cursor owner, and other opaque identifiers | 1–256 bytes |
-| Repository, intent, token, mutation, event, reservation, recovery, operation, or bootstrap-session UUID | exactly 16 bytes; RFC 9562 UUIDv7 except a pre-existing repository UUID supplied by Cloud Core |
+| Repository, intent, token, proof, mutation, event, reservation, recovery, operation, or bootstrap-session UUID | exactly 16 bytes; RFC 9562 UUIDv7 except a pre-existing repository UUID supplied by Cloud Core |
 | Canonical repository path | 1–1,024 UTF-8 bytes |
 | Object key | 1–1,024 bytes in the closed ASCII key grammar |
 | `CasToken` | 1–256 opaque bytes |
@@ -415,8 +438,8 @@ Only a signed Cloud Core create intent can create control. It binds identity,
 path, object format, initial visibility, finite quota, and the initial
 repository-admin grant. It also binds issuer, audience, key ID, intent ID,
 issue time, and expiry. One `Create` of `repo_control` makes the candidate
-`ACTIVE`. An exact replay is idempotent. A different intent or identity at the
-same path fails.
+`ACTIVE`. At that same derived `repo_control` key, an exact replay is idempotent
+and a different intent or identity fails.
 
 ### Signed create intents and capabilities
 
@@ -473,11 +496,26 @@ The capability map also requires:
 | 32 | issuing control-key byte string, 1–1,024 ASCII bytes |
 | 33 | issuing `ObjectVersionID` byte string, 1–1,024 bytes |
 | 34 | unsigned 64-bit cutover generation |
+| 35 | repository-grant issuer byte string, 1–256 bytes |
+| 36 | repository-grant subject byte string, 1–256 bytes |
 
 Purpose is an unsigned enum: `1` clone-read, `2` Git-read, `3` Git-write, `4`
 LFS-read, `5` LFS-finalize, `6` webhook-admin, `7` service-build, or `8`
 repository-admin. Unknown keys, enum values, and missing required keys fail
-closed.
+closed. Key 3 identifies the capability signer. Keys 35 and 36 identify the
+exact repository grant and are independent of key 3. Binary equality is
+required; a verifier does not derive either grant identity from an email,
+display name, signer, token holder, or request path.
+
+Every capability-authorized read or mutation rereads the current
+`repo_control`, finds the exact `(grant issuer, grant subject)` pair, checks its
+role and the capability authorization epoch, and then applies lifecycle,
+visibility, and purpose rules. Clone-read, Git-read, LFS-read, and service-build
+require reader, writer, or administrator. Git-write and LFS-finalize require
+writer or administrator. Webhook-admin and repository-admin require
+administrator. A mutation repeats this grant check against the exact control
+version it will CAS, including after CAS contention. A missing, revoked,
+wrong-role, or changed grant fails closed.
 
 The create external AAD is the exact ASCII bytes
 `walgit-create-intent-v1`. The capability external AAD is the exact ASCII bytes
@@ -486,12 +524,18 @@ the exact protected header bytes, and the exact payload bytes.
 
 Intent and token IDs are RFC 9562 UUIDv7 values encoded as their raw 16 bytes.
 Their embedded millisecond timestamp must be within 30 seconds of issued-at.
-An exact create envelope replay is idempotent; reuse of its intent UUID with
-any changed byte is a conflict. The allowed clock skew is 30 seconds. A create
-intent lives at most 10 minutes and a capability at most 15 minutes. Both
-require `issued_at <= not_before <= expiry`; issue time cannot be more than 30
-seconds in the future. A verifier accepts time only from 30 seconds before
-not-before through 30 seconds after expiry.
+At the same derived `repo_control` key, an exact create envelope replay is
+idempotent; reuse of its intent UUID with any changed byte is a conflict. WalGit
+does not create, query, or LIST a global intent-ID index. Before signing, Cloud
+Core atomically records and permanently enforces uniqueness of every
+create-intent UUID across all tenants, projects, paths, and repository UUIDs. A
+valid signature is the producer assertion that this reservation completed;
+this does not create a second global bucket authority. The allowed clock skew
+is 30 seconds. A create intent
+lives at most 10 minutes and a capability at most 15 minutes. Both require
+`issued_at <= not_before <= expiry`; issue time cannot be more than 30 seconds
+in the future. A verifier accepts time only from 30 seconds before not-before
+through 30 seconds after expiry.
 
 Cloud Core publishes a deterministic-CBOR verification key ring in untagged
 `COSE_Sign1`, signed by a pinned Ed25519 root with external AAD equal to the
@@ -502,14 +546,45 @@ Here `first16` means the first 16 digest bytes in wire order. The production
 candidate and `cutover_control` pin both exact values. The ring
 protected header is the exact deterministic-CBOR map `{1: -8, 4: root_kid}`;
 its unprotected header is the exact empty map. Its integer-keyed payload
-contains schema version at key 1, ring UUIDv7 at key 2, issued-at at key 3, prior-ring SHA-256
-digest or an empty byte string at key 4, the data-key array at key 5, and a
-positive unsigned 64-bit ring epoch at key 6. The array is sorted by binary
-`kid` and contains at most 64 unique entries. A data key uses integer keys 1–7
-for 16-byte `kid`, 32-byte public key, issuer byte string, a binary-sorted array
-of at most 16 unique audience byte strings, not-before, not-after, and state.
-Issuer and audience values have 1–256 bytes. Times are signed 64-bit Unix
-seconds. State is `1` PENDING, `2` ACTIVE, `3` RETIRING, or `4` REVOKED.
+contains schema version exactly `1` at key 1, ring UUIDv7 at key 2, issued-at at
+key 3, prior-ring SHA-256 digest at key 4, the data-key array at key 5, and a
+positive unsigned 64-bit ring epoch at key 6. Key 4 is an empty byte string only
+for the bootstrap ring and otherwise is exactly 32 bytes. The array is sorted
+by binary `kid` and contains 1–64 unique entries. A data key uses integer keys
+1–7 for 16-byte `kid`, 32-byte public key, issuer byte string, a binary-sorted
+array of at most 16 unique audience byte strings, not-before, not-after, and
+state. Issuer and audience values have 1–256 bytes. Times are signed 64-bit
+Unix seconds. State is `1` PENDING, `2` ACTIVE, `3` RETIRING, or `4` REVOKED.
+
+The bootstrap `CredentialControl` has schema version `2`, control revision `1`,
+issuer epoch `1`, exactly the bootstrap ring root in `current`, absent `next`
+and `previous`, absent `previous_last_issue_unix_seconds`, and an empty
+`revoked_kids` list. The bootstrap ring has ring epoch `1`, an empty prior-ring
+digest, and at least one `ACTIVE` data key. Its verifier-set and
+acknowledgement-proof digests come from the bootstrap transition proof below.
+No other bootstrap value is valid.
+
+For every later install, checked addition must prove
+`next.ring_epoch = current.ring_epoch + 1`; `current.ring_epoch = u64::MAX`
+therefore makes another install impossible. The next ring payload key 6 must
+equal that epoch, and payload key 4 must equal the exact `current.digest`. The
+next root's full key, `ObjectVersionID`, digest, size, and epoch must match that
+payload and immutable object. A skipped epoch, zero or wrapped epoch, empty or
+wrong prior digest, rollback, or a candidate fork from any root other than the
+currently bound `current` fails closed. If two candidates fork from one
+current, only one install CAS can land; the loser can never become `next` after
+the winner changes current lineage.
+
+Cloud Core permanently reserves each ring UUIDv7, data `kid`, and Ed25519
+public-key byte string before signing a ring. It never reuses one in another
+ring, including after retirement or revocation. The root signature is the
+producer assertion that those reservations completed; WalGit creates no global
+bucket index. WalGit additionally rejects a next ring whose UUID, root tuple,
+`kid`, or public key duplicates any bound current, next, or previous ring, or
+whose `kid` occurs in `revoked_kids`. Because epoch and prior digest are inside
+the signed bytes and the object key is their digest, a valid descendant cannot
+reuse an older ring body or root identity. Digest collision, duplicate root,
+reused identity, and retired-key reuse all fail closed.
 
 Slot position and key state jointly decide use:
 
@@ -527,23 +602,293 @@ slot position prevents issuance until the promotion CAS. `PENDING` and
 allowed `current` or `previous` slot. The global revoked-`kid` set overrides
 the matrix.
 
-`credential_control` contains exactly one immutable `current` ring root and at
-most one immutable `next` and one immutable `previous` root. Each root records
-key, `ObjectVersionID`, digest of the exact ring `COSE_Sign1` bytes, size, and
-ring epoch. It also records issuer epoch, last-issue time for `previous`, a
-bounded global revoked-`kid` set, and exact signed verifier-set and
-acknowledgement-proof digests. A verifier accepts a ring only when its complete
-root equals one of these explicitly bound slots. It never follows an unbound
-ring or falls back to a cached binding.
+The credential authority uses these exact protobuf fields and tags. The shown
+scalar types are the wire types. The message fields have protobuf presence;
+`previous_last_issue_unix_seconds` uses explicit optional presence so Unix
+second zero is distinct from absence.
+
+```proto
+message VerificationRingRoot {            // maximum 4,096 encoded bytes
+  bytes key = 1;                           // 1..1,024 bytes
+  bytes object_version_id = 2;             // 1..1,024 bytes
+  bytes digest = 3;                        // exactly 32 bytes
+  uint64 size = 4;                         // 1..65,536
+  uint64 ring_epoch = 5;                   // positive
+}
+
+message CredentialControl {               // maximum 65,536 encoded bytes
+  uint32 schema_version = 1;               // exactly 2
+  uint64 control_revision = 2;             // positive
+  uint64 issuer_epoch = 3;                 // positive
+  VerificationRingRoot current = 4;        // exactly one
+  VerificationRingRoot next = 5;           // zero or one
+  VerificationRingRoot previous = 6;       // zero or one
+  optional int64 previous_last_issue_unix_seconds = 7;
+  repeated bytes revoked_kids = 8;          // 0..64; each exactly 16 bytes
+  bytes verifier_set_digest = 9;            // exactly 32 bytes
+  bytes acknowledgement_proof_digest = 10; // exactly 32 bytes
+}
+```
+
+`current` is present exactly once. `next` and `previous` are independently
+optional and cannot occur more than once. The previous-last-issue field is
+present if and only if `previous` is present. `revoked_kids` is binary-sorted,
+unique, and has at most 64 entries. `verifier_set_digest` is the
+domain-separated digest of the exact signed verifier-set envelope defined
+below. `acknowledgement_proof_digest` is the SHA-256 digest of the exact
+untagged credential-transition `COSE_Sign1` bytes defined below. Both fields
+are always present. Duplicate singular fields, unknown fields, alternate tags,
+and non-canonical encodings fail before generated decoding.
+
+Every `VerificationRingRoot.key` is the full physical key
+`P || "v2/control/key-rings/<digest-lowerhex>.cose"`; the leaf digest equals the
+root's `digest`. Exact-version GET and HEAD must return the same full key,
+`ObjectVersionID`, body digest, and size, and the verified ring payload epoch
+must equal `ring_epoch`. A root with a zero size or epoch, a mismatched key,
+metadata, body, or epoch, pairwise-equal slot roots, or duplicate slot epochs
+fails closed. A verifier accepts a ring only when this complete five-field root
+equals one explicitly bound slot. It never follows an unbound ring or falls
+back to a cached binding.
+
+Every successful credential-control CAS increments `control_revision` by
+exactly one. `issuer_epoch` never decreases and increments by exactly one when
+a promotion changes the signing ring or when the deny set grows. Installing
+`next` does not change `issuer_epoch`. The deny set is binary-sorted,
+append-only, and permanent for schema version 2. Retirement adds every `kid`
+from `previous` that is not already present, then removes `previous` and its
+last issue time in the same CAS. Before installing `next`, the controller proves
+that eventual retirement of current would keep this union at or below 64. If
+the bound cannot hold, rotation fails closed and requires a later root-key or
+schema ceremony; it never drops history. Preload installs only `next`.
+Promotion requires `next` and an empty `previous` slot, moves `next` to
+`current`, moves the old `current` to `previous`, clears `next`, and records the
+last issue time for the old current ring in the same CAS. No other slot
+transition is valid.
+
+Tags 1–10 and their meanings, wire types, bounds, presence, and cardinality are
+permanent for schema version 2. A tag is never reused, and a writer never emits
+an unknown field. An incompatible change requires a new schema and object
+contract introduced through `EXPAND`, `SWITCH`, and later `CONTRACT`; readers
+do not accept an alias, dual encoding, or mixed interpretation.
+
+#### Credential verifier and acknowledgement sets
+
+The credential verifier set is an untagged `COSE_Sign1` signed by the same
+pinned Ed25519 root that signs verification rings. Its protected header is the
+exact deterministic-CBOR map `{1: -8, 4: root_kid}`, its unprotected header is
+the exact empty map, and its external AAD is the exact ASCII bytes
+`walgit-credential-verifier-set-v1`. The decoded deterministic-CBOR payload has
+a maximum of 65,024 bytes, contains no text strings, and uses exactly these
+numeric keys:
+
+| Key | Exact value |
+|---:|---|
+| 1 | unsigned schema version, exactly `1` |
+| 2 | verifier-set UUIDv7, 16-byte byte string |
+| 3 | issued-at, signed 64-bit Unix seconds |
+| 4 | positive unsigned 64-bit verifier-set epoch |
+| 5 | array of 1–64 verifier-member maps |
+
+A verifier-member map has exactly these numeric keys:
+
+| Key | Exact value |
+|---:|---|
+| 1 | opaque member ID byte string, 1–256 bytes |
+| 2 | unsigned role bit mask, 1–15: bit 0 serving instance, bit 1 writer, bit 2 issuer, bit 3 verifier |
+| 3 | acknowledgement `kid`, 16-byte byte string |
+| 4 | Ed25519 acknowledgement public key, 32-byte byte string |
+| 5 | positive unsigned 64-bit membership epoch |
+
+Members sort first by raw member-ID bytes in lexicographic order, then by
+unsigned membership epoch in ascending numeric order, then by raw
+acknowledgement-`kid` bytes in lexicographic order. Member IDs and
+acknowledgement `kid` values are independently unique; duplicate public keys
+are invalid. Unknown keys, zero or unknown role bits, empty members, and
+non-canonical CBOR fail closed. The root uses strict RFC 8032 verification.
+Cloud Core permanently reserves the set UUID and member acknowledgement
+identities before signing. The bootstrap set epoch is exactly `1`. A
+verifier-set-update uses checked current epoch plus one and a new set UUID;
+every other transition retains the predecessor set bytes and digest. Rollback,
+skip, wrap, fork publication, UUID reuse, or a same-epoch changed set fails
+closed. Define the semantic digest:
+
+```text
+verifier_set_digest =
+  SHA-256("walgit-credential-verifier-set-digest-v1" ||
+          u32be(len(exact_untagged_verifier_set_COSE_Sign1_bytes)) ||
+          exact_untagged_verifier_set_COSE_Sign1_bytes)
+```
+
+The credential acknowledgement set is one deterministic-CBOR map with a
+maximum of 65,536 bytes and exactly these numeric keys:
+
+| Key | Presence and exact value |
+|---:|---|
+| 1 | required unsigned schema version, exactly `1` |
+| 2 | required `verifier_set_digest`, 32-byte byte string |
+| 3 | required `transition_projection_digest`, 32-byte byte string |
+| 4 | required unsigned transition kind, exactly the proof key 3 value |
+| 5 | required unsigned binding kind: `1` bootstrap or `2` predecessor |
+| 6 | bootstrap only: bootstrap-session UUIDv7, 16-byte byte string |
+| 7 | predecessor only: full physical credential-control key, 1–1,024 ASCII bytes |
+| 8 | predecessor only: `ObjectVersionID`, 1–1,024 bytes |
+| 9 | predecessor only: exact-body SHA-256 digest, 32 bytes |
+| 10 | predecessor only: exact-body size, unsigned 1–65,536 |
+| 11 | required array of 1–64 acknowledgement-member maps |
+
+An acknowledgement-member map has exactly these numeric keys:
+
+| Key | Presence and exact value |
+|---:|---|
+| 1 | required member ID byte string, 1–256 bytes |
+| 2 | required positive unsigned 64-bit membership epoch |
+| 3 | required unsigned role bit mask, 1–15 |
+| 4 | required acknowledgement time, signed 64-bit Unix seconds |
+| 5 | promote-next issuer only: last issued-at, signed 64-bit Unix seconds |
+| 6 | required strict Ed25519 signature, 64-byte byte string |
+
+The acknowledgement rows have exactly the verifier-set member count and the
+same order. Their member ID, membership epoch, and role mask equal the matching
+verifier member. Key 5 is present if and only if the transition is promote-next
+and the role mask contains the issuer bit. It is not later than key 4. For an
+issuer that emitted no envelope, key 5 is the current ring issued-at value.
+Binding kind `1` is valid only for transition kind bootstrap, requires key 6,
+and rejects keys 7–10. Binding kind `2` is required for every other transition,
+requires keys 7–10, and rejects key 6.
+
+Let `acknowledgement_binding_bytes` be the exact deterministic-CBOR encoding of
+acknowledgement-set keys 1–10, omitting key 11. Let
+`unsigned_acknowledgement_member_bytes` be the exact deterministic-CBOR encoding
+of that member's keys 1–5, omitting key 6. Each member signature uses its bound
+acknowledgement public key and strict RFC 8032 over these exact bytes:
+
+```text
+"walgit-credential-member-ack-v1" ||
+u32be(len(acknowledgement_binding_bytes)) || acknowledgement_binding_bytes ||
+u32be(len(unsigned_acknowledgement_member_bytes)) ||
+unsigned_acknowledgement_member_bytes
+```
+
+Every signature must verify. Unknown, missing, duplicate, extra, reordered, or
+wrong-member rows fail closed. Define:
+
+```text
+acknowledgement_set_digest =
+  SHA-256("walgit-credential-acknowledgement-set-digest-v1" ||
+          u32be(len(exact_acknowledgement_set_bytes)) ||
+          exact_acknowledgement_set_bytes)
+```
+
+#### Credential transition proof
+
+Every credential-control Create or CAS carries one
+`CredentialTransitionProof`. First form `transition_projection_bytes` as the
+exact deterministic protobuf encoding of the proposed `CredentialControl`
+fields 1–9 in tag order. Field 10,
+`acknowledgement_proof_digest`, is absent. No proposed `CasToken`, object key,
+`ObjectVersionID`, object digest, object size, provider response, or other
+metadata assigned by the future Create or CAS is part of the projection. All
+normal field bounds, presence rules, ordering rules, and semantic validation
+apply before projection. Define:
+
+```text
+transition_projection_digest =
+  SHA-256("walgit-credential-control-transition-v1" ||
+          u32be(len(transition_projection_bytes)) ||
+          transition_projection_bytes)
+```
+
+The proof is untagged `COSE_Sign1` signed by the same pinned Ed25519 root that
+signs verification rings. Its protected header is the exact
+deterministic-CBOR map `{1: -8, 4: root_kid}`. Its unprotected header is the
+exact empty map. Its external AAD is the exact ASCII bytes
+`walgit-credential-transition-proof-v1`. The decoded deterministic-CBOR payload
+is at most 7,680 bytes, contains no text strings, and uses these numeric keys:
+
+| Key | Presence and exact value |
+|---:|---|
+| 1 | required unsigned schema version, exactly `1` |
+| 2 | required proof UUIDv7, 16-byte byte string |
+| 3 | required unsigned transition kind: `1` bootstrap, `2` install-next, `3` promote-next, `4` retire-previous, `5` revoke-kid, `6` verifier-set-update, or `7` acknowledgement-update |
+| 4 | required issued-at, signed 64-bit Unix seconds |
+| 5 | required not-before, signed 64-bit Unix seconds |
+| 6 | required expiry, signed 64-bit Unix seconds |
+| 7 | required domain-separated `verifier_set_digest`, 32-byte byte string |
+| 8 | required domain-separated `acknowledgement_set_digest`, 32-byte byte string |
+| 9 | required `transition_projection_digest`, 32-byte byte string |
+| 10 | required unsigned projection byte length, 1–65,536 |
+| 11 | non-bootstrap only: predecessor full physical credential-control key, 1–1,024 ASCII bytes |
+| 12 | non-bootstrap only: predecessor `ObjectVersionID`, 1–1,024 bytes |
+| 13 | non-bootstrap only: predecessor exact-body SHA-256 digest, 32 bytes |
+| 14 | non-bootstrap only: predecessor exact-body size, 1–65,536 |
+| 15 | bootstrap only: cutover bootstrap-session UUIDv7, 16-byte byte string |
+
+Keys 1–10 are always present. Bootstrap has key 15 and omits keys 11–14.
+Every other kind has keys 11–14 and omits key 15. No other key, variant, or
+empty substitute is valid. Key 7 equals proposed field 9. Keys 9 and 10 equal
+the digest and length recomputed from the proposed control after removing only
+field 10. For a non-bootstrap transition, keys 11–14 equal the exact currently
+bound predecessor; for bootstrap, key 15 equals the bootstrap plan session.
+The verifier recomputes key 7 from the retained exact root-signed verifier-set
+envelope and key 8 from the retained exact acknowledgement-set bytes. It then
+verifies every acknowledgement row and requires both retained sets to bind the
+same projection, transition kind, and predecessor or bootstrap session as this
+proof. The verifier-set issued-at and every acknowledgement time are not later
+than proof issued-at; every acknowledgement time is within the proof's
+not-before-to-expiry interval. A supplied digest without its exact retained
+bytes fails closed.
+
+The root uses strict RFC 8032 verification. Deterministic-CBOR rejection rules
+for create intents apply unchanged. The proof requires
+`issued_at <= not_before <= expiry`, has a maximum ten-minute lifetime and
+30-second skew, and its UUIDv7 timestamp is within 30 seconds of issued-at.
+Cloud Core permanently reserves each proof UUID before signing. The exact
+proof envelope may retry only the same predecessor and projection. Reusing its
+UUID with changed bytes, using a stale predecessor, changing the projection,
+or replaying it after another transition fails closed.
+
+After proof verification, set proposed field 10 to
+`SHA-256(exact_untagged_CredentialTransitionProof_COSE_Sign1_bytes)` and encode
+the final deterministic `CredentialControl`. The proof never includes that
+field or metadata assigned to the resulting object, so neither the signature
+nor either digest is self-referential. The final control may differ from the
+validated projection only by field 10. Its conditional Create or CAS is still
+the sole credential commit point.
+
+Cloud Core's credential authority permanently retains the exact untagged
+verifier-set envelope, acknowledgement-set bytes, and untagged transition-proof
+envelope by their digests for recovery and audit. WalGit receives all three
+exact byte strings during Create or CAS, recomputes proof keys 7 and 8, verifies
+their signatures and bindings, and persists only the verifier-set and proof
+digests in `credential_control`. Retained evidence bytes are not bucket objects,
+mutable authorities, or alternate commit points.
+
+Each transition kind permits only its named state change plus
+`control_revision + 1` and the new field-10 proof digest. Install-next adds the
+one checked descendant and changes no issuer epoch. Promote-next performs the
+slot move above and increments `issuer_epoch` by one. Retire-previous removes
+the slot and timestamp, appends its data `kid` values to the deny set, and
+increments `issuer_epoch` by one if that set grows. Revoke-kid appends exactly
+one previously absent bound `kid` and increments `issuer_epoch` by one.
+Verifier-set-update changes only field 9. Acknowledgement-update changes no
+field in the projection except `control_revision`. Bootstrap uses only the
+frozen values above. Combining kinds or changing another field fails closed.
 
 Rotation first writes immutable `next`, CASes it into `credential_control`, and
 preloads it on every issuer and verifier. During preload, verifiers accept
 `current` and `next`, but the issuer signs only with `current`. A signed proof
-that every serving instance, writer, issuer, and other verifier loaded the exact
-control version is required before one atomic credential-control CAS promotes
-`next` to `current` and moves the old `current` to `previous`. The issuer then
-signs only with the new `current`; verifiers accept only the explicitly bound
-`current`, optional `next`, and optional `previous`.
+that every serving instance, writer, issuer, and other verifier loaded the
+exact control version is required before promotion. Each issuer then fences
+old-current issuance, reports its last issued-at value, and cannot issue again
+until it observes the promoted exact control version. The signed
+acknowledgement proof covers that complete issuer fence and verifier set. Its
+digest is written by the one atomic credential-control CAS that promotes
+`next` to `current` and moves the old `current` to `previous`.
+`previous_last_issue_unix_seconds` is the maximum attested issued-at value
+across all fenced issuers; when no issuer used the ring, it is the ring's
+issued-at value. The issuer then signs only with the new `current`; verifiers
+accept only the explicitly bound `current`, optional `next`, and optional
+`previous`. An issuer cannot emit a late old-ring envelope after the proof.
 
 There is at most one `previous`. Another promotion cannot occur while that slot
 is occupied. Its removal CAS is allowed only after the recorded last issue plus
@@ -557,7 +902,9 @@ three ring slots. Cloud Core must distribute the exact new credential-control
 version and collect acknowledgements from every verifier within 30 seconds.
 Every verifier renews readiness against the current version; a verifier that
 does not acknowledge within 30 seconds leaves readiness and cannot serve or
-mutate. Only after that proof can Cloud Core report revocation complete.
+mutate. The root-signed kind-7 proof and its acknowledgement-update CAS bind
+those post-revocation acknowledgements. Only after that CAS can Cloud Core
+report revocation complete.
 Root-key rotation requires its own signed cutover or deployment ceremony. Ring
 rotation changes credential authority, not repository state or terminal
 `cutover_control`.
@@ -849,10 +1196,12 @@ A capability uses the signed envelope above. It binds tenant, project,
 repository UUID, generation, canonical path, `canonical_path_digest`,
 `routing_digest`, purpose, token identity, authorization epoch, expiry,
 verification-ring epoch and digest, and the issuing control key and
-`ObjectVersionID`. Mutations reauthorize against the exact control version they
-CAS. New reads check current control visibility, lifecycle, grants, and
-authorization epoch. In-flight reads have a bounded timeout after revocation or
-deletion.
+`ObjectVersionID`, plus the exact repository-grant issuer and subject. Every
+capability-authorized operation matches that grant pair and its required role
+in current control. Mutations reauthorize against the exact control version
+they CAS and repeat the check after contention. New reads check current control
+visibility, lifecycle, exact grant, and authorization epoch. In-flight reads
+have a bounded timeout after revocation or deletion.
 
 WalGit does not issue presigned URLs that outlive repository authorization.
 LFS upload can stream to an immutable candidate, but finalize reauthorizes and
@@ -1133,6 +1482,13 @@ deterministic key, body digest, size, type, dependency-row indexes, and state
 are known, the next CAS resolves that stage and appends the exact
 `credential_control` and `capacity_control` parent rows. The plan is append-only
 within one cutover generation and fits inside the 1 MiB `cutover_control` bound.
+
+For the initial credential-control row, the resolved key-ring version first
+fills the frozen bootstrap `current` root. The controller then forms the
+field-10-free projection, verifies the root-signed bootstrap transition proof
+for this bootstrap session, inserts the exact proof digest as field 10, and only
+then appends the final control key, body digest, and size to stage two. Cloud
+Core retains the proof bytes; they are not a 263rd plan row or a bucket object.
 
 Each initial object uses conditional Create. One stage runs at most 32 Creates
 concurrently. Success returns its assigned `ObjectVersionID`; one batched
@@ -1472,16 +1828,20 @@ These scenarios are required by later gates. PR1 does not implement them.
   management-route separation, `canonical_path_digest` verification,
   independent raw and routing digest collision failures, and permanent
   tombstone path denial.
-- Namespace tests prove every V2 object uses its closed physical key. Immutable
-  bodies bind identity and semantic content but never their own key,
-  `ObjectVersionID`, digest, or size. Each authoritative parent binds those
-  exact values for its target. Standard raw Git pack, LFS, and bundle bytes
-  remain unmodified. No host, capacity, lease, event, or recovery object can
-  replace the routing-digest-derived control authority.
+- Namespace tests prove every V2 object uses its closed full physical key.
+  Empty and non-empty `P` vectors prove that the V2 adapter strips `P` exactly
+  once for a configured prefixed store call, restores it exactly once on every
+  metadata, exact-version, and listing result, and rejects prefix mismatch,
+  relative-key authority, and `P || P || S`. Immutable bodies bind identity and
+  semantic content but never their own key, `ObjectVersionID`, digest, or size.
+  Each authoritative parent binds those exact values for its target. Standard
+  raw Git pack, LFS, and bundle bytes remain unmodified. No host, capacity,
+  lease, event, or recovery object can replace the routing-digest-derived
+  control authority.
 - Byte-vector tests prove every allowed leaf and reject every unlisted leaf.
   They verify deterministic protobuf bytes, raw payload bytes, complete signed
-  envelope bytes, and exact verification-ring COSE bytes as distinct digest
-  preimages.
+  envelope bytes, exact verification-ring COSE bytes, and the credential-control
+  transition projection as distinct digest preimages.
 - Descriptor tests prove that every variable field, message, repeated field,
   and catalog has the stated numeric bound. Boundary tests prove exact
   inline-to-catalog transitions, mutually exclusive representations, bounded
@@ -1491,15 +1851,40 @@ These scenarios are required by later gates. PR1 does not implement them.
   524,288 bytes.
 - Cross-language deterministic-CBOR and COSE vectors cover create and
   capability payloads, independent keys 14 and 17, swapped or conflated digest
-  rejection, every rejected encoding, UUIDv7 and time boundaries, exact replay,
-  exact data and root `kid` headers, all slot/state matrix cells, key-ring
-  signatures, current/next preload, atomic promotion, bounded previous
-  retirement, the 30-second revocation deadline, stale verifiers, and immediate
-  deny-set enforcement.
+  rejection, required grant keys 35 and 36, exact grant-pair and purpose-role
+  checks, every rejected encoding, UUIDv7 and time boundaries, same-control-key
+  exact replay and changed-byte conflict, exact data and root `kid` headers, all
+  slot/state matrix cells, key-ring signatures, current/next preload, atomic
+  promotion, bounded previous retirement, the 30-second revocation deadline,
+  stale verifiers, and immediate deny-set enforcement. Credential-control wire
+  vectors cover tags 1–10, required and optional presence, maximum revoked-key
+  cardinality and ordering, proof digests, complete ring-root metadata and body
+  binding, legal evolution, and rejection of every other slot transition.
+- Ring-lineage vectors cover the exact bootstrap values, checked
+  `current + 1` installation, exact prior-ring digest, promotion, and
+  retirement. Negative vectors cover rollback, fork publication, skipped and
+  wrapped or overflowing epochs, duplicate ring/root/key identities, digest
+  collision, deny-set overflow, and retired-key reuse.
+- Cross-language credential-transition vectors cover the exact field-10-free
+  protobuf projection and domain-separated digest; the exact root-signed
+  verifier-set COSE headers, AAD, numeric payload, bounded member rows, sorting,
+  and domain-separated digest; and the exact acknowledgement-set map, member
+  signature preimages, one-to-one ordering, and domain-separated digest. They
+  also cover proof keys 7/8 recomputation from retained bytes, the proof's
+  untagged COSE headers, external AAD, numeric payload variants, pinned-root
+  signature, predecessor full key/version/digest/size, bootstrap session, final
+  field-10 insertion, and exact retry. Negative vectors cover a self-cycle,
+  future object metadata, projection or predecessor corruption, missing,
+  duplicate, extra, reordered, wrong-role, and bad-signature members,
+  unknown/duplicate/missing CBOR keys, digest-only evidence, changed-byte
+  proof-ID reuse, stale-proof replay, and wrong-root signatures.
 - A valid signed create intent creates the exact UUID, generation, path,
   canonical path digest, routing digest, visibility, quota, and initial admin
-  once. Unsigned, altered, expired, cross-tenant, cross-project, and
-  replay-conflict requests publish nothing.
+  once. Cloud Core vectors prove permanent global intent-ID uniqueness before
+  signing; WalGit vectors prove that replay state is scoped to the one derived
+  `repo_control` key and creates no global index. Unsigned, altered, expired,
+  cross-tenant, cross-project, and same-key replay-conflict requests publish
+  nothing.
 - Every client and system mutation becomes visible only through one
   `repo_control` CAS. Mutable side state cannot publish, authorize, or replace a
   root.
