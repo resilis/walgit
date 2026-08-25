@@ -1300,11 +1300,14 @@ accepts any control at the same derived by-path key, including an exact
 same-identity occupancy or a different-identity routing-key collision.
 `SAME_WRITER_VERSION_ADVANCED` requires non-Create with an exact prior,
 different landed `ObjectVersionID`, the same identity, and loaded writer epoch
-`E`. `WRITER_EPOCH_ADVANCED` requires the same facts at checked epoch `E+1`.
-Every arm binds canonical control key/body/digest/size and its current last
-mutation. The conflict proof must originate from a typed current provider GET
-at the abort decision. Its stored object version supports later exact replay,
-but protobuf validation alone cannot prove provider currentness.
+`E`. `WRITER_EPOCH_ADVANCED` requires the same facts at an exact typed-current
+writer epoch strictly greater than `E`. It accepts `E+1` and later epochs
+because successive takeovers can land and settle while this external
+COMMITTING row remains unresolved. Every arm binds canonical control
+key/body/digest/size and its current last mutation. The conflict proof must
+originate from a typed current provider GET at the abort decision. Its stored
+object version supports later exact replay, but protobuf validation alone
+cannot prove provider currentness.
 
 A lost result after the control CAS is success. Reconciliation uses the
 control receipt and exact object version to finish `CHARGED`. It resumes a

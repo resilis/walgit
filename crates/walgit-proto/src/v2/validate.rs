@@ -1197,7 +1197,7 @@ pub fn validate_capacity_charged_repo_control(
         CapacityRepoControlExpectation {
             mutation_id: &commit.mutation_id,
             require_reservation_identity: true,
-            writer_epoch: Some(writer_epoch),
+            writer_epoch: CapacityWriterEpochExpectation::Exact(writer_epoch),
         },
         prefix,
     )?;
@@ -1250,7 +1250,7 @@ pub fn validate_capacity_conflicting_repo_control(
     })?;
     let class = validate_capacity_conflict_class(commit, conflict.conflict_class)?;
     let (require_reservation_identity, expected_writer_epoch) = match class {
-        CapacityConflictClass::CreateControlExists => (false, None),
+        CapacityConflictClass::CreateControlExists => (false, CapacityWriterEpochExpectation::Any),
         CapacityConflictClass::SameWriterVersionAdvanced => {
             let Some(CapacityCommitPredecessor::PriorControl(prior)) = &commit.predecessor else {
                 return Err(invalid(
@@ -1264,7 +1264,10 @@ pub fn validate_capacity_conflicting_repo_control(
                     "must differ from the exact expected predecessor version",
                 ));
             }
-            (true, Some(commit.writer_epoch))
+            (
+                true,
+                CapacityWriterEpochExpectation::Exact(commit.writer_epoch),
+            )
         }
         CapacityConflictClass::WriterEpochAdvanced => {
             let Some(CapacityCommitPredecessor::PriorControl(prior)) = &commit.predecessor else {
@@ -1279,13 +1282,10 @@ pub fn validate_capacity_conflicting_repo_control(
                     "must differ from the exact expected predecessor version",
                 ));
             }
-            let writer_epoch = commit.writer_epoch.checked_add(1).ok_or_else(|| {
-                invalid(
-                    "capacity_commit.writer_epoch",
-                    "cannot advance past u64::MAX",
-                )
-            })?;
-            (true, Some(writer_epoch))
+            (
+                true,
+                CapacityWriterEpochExpectation::GreaterThan(commit.writer_epoch),
+            )
         }
         CapacityConflictClass::Unspecified => {
             return Err(invalid("capacity_conflict.class", "must be nonzero"));
@@ -1379,7 +1379,13 @@ fn validate_terminal_capacity_reservation(
 struct CapacityRepoControlExpectation<'a> {
     mutation_id: &'a [u8],
     require_reservation_identity: bool,
-    writer_epoch: Option<u64>,
+    writer_epoch: CapacityWriterEpochExpectation,
+}
+
+enum CapacityWriterEpochExpectation {
+    Any,
+    Exact(u64),
+    GreaterThan(u64),
 }
 
 fn validate_exact_landed_capacity_repo_control(
@@ -1431,17 +1437,22 @@ fn validate_exact_landed_capacity_repo_control(
             "does not equal the proof mutation ID",
         ));
     }
-    if let Some(expected_writer_epoch) = expectation.writer_epoch
-        && control
-            .writer
-            .as_ref()
-            .ok_or_else(|| missing("capacity_repo_control.writer"))?
-            .epoch
-            != expected_writer_epoch
-    {
+    let writer_epoch = control
+        .writer
+        .as_ref()
+        .ok_or_else(|| missing("capacity_repo_control.writer"))?
+        .epoch;
+    let writer_epoch_matches = match expectation.writer_epoch {
+        CapacityWriterEpochExpectation::Any => true,
+        CapacityWriterEpochExpectation::Exact(expected) => writer_epoch == expected,
+        CapacityWriterEpochExpectation::GreaterThan(prior) => prior
+            .checked_add(1)
+            .is_some_and(|minimum| writer_epoch >= minimum),
+    };
+    if !writer_epoch_matches {
         return Err(invalid(
             "capacity_repo_control.writer.epoch",
-            "does not equal the proof writer epoch",
+            "does not satisfy the proof writer epoch relation",
         ));
     }
     let encoded = control.encode_to_vec();

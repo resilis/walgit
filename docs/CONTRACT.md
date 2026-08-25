@@ -105,12 +105,13 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   mutation is absent, and proves the conflicting current mutation is present.
   `CREATE_CONTROL_EXISTS` accepts any exact control at the by-path key.
   `SAME_WRITER_VERSION_ADVANCED` requires a different object version at epoch
-  `E`; `WRITER_EPOCH_ADVANCED` requires a different object version at checked
-  epoch `E+1`. All arms match canonical body key/digest/size and the current
-  catalog's represented last mutation. The controller obtains the conflicting
-  proof from a typed current GET at the abort decision; the durable proof can
-  later exact-load that object version. Proto validation cannot prove provider
-  currentness by itself.
+  `E`; `WRITER_EPOCH_ADVANCED` requires a different object version at an exact
+  typed-current writer epoch strictly greater than `E`. This includes `E+1`
+  and later epochs after successive takeovers. All arms match canonical body
+  key/digest/size and the current catalog's represented last mutation. The
+  controller obtains the conflicting proof from a typed current GET at the
+  abort decision; the durable proof can later exact-load that object version.
+  Proto validation cannot prove provider currentness by itself.
 
   Redistribution has only `STABLE`, `PREPARING/DRAINING`, and
   `PREPARING/APPLYING` cells. DRAINING retains the exact prior stable plan and

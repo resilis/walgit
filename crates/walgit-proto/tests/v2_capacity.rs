@@ -1211,6 +1211,46 @@ fn terminal_repo_control_proofs_bind_exact_body_provider_mutation_and_writer() {
 }
 
 #[test]
+fn writer_epoch_advanced_accepts_every_strictly_greater_current_epoch() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    for (commit_epoch, current_epoch, accepted) in [
+        (1, 2, true),
+        (1, 3, true),
+        (1, 1, false),
+        (2, 1, false),
+        (u64::MAX - 1, u64::MAX, true),
+        (u64::MAX, u64::MAX, false),
+    ] {
+        let mut conflict = conflicting_reservation(&prefix);
+        set_conflicting_class(&mut conflict, CapacityConflictClass::WriterEpochAdvanced);
+        set_conflicting_writer_epoch(&mut conflict, commit_epoch);
+        let raw = repo_control_for_reservation(
+            &conflict,
+            CONFLICTING_MUTATION_ID,
+            current_epoch,
+            &prefix,
+        );
+        let (control, object, catalog, receipt, shard, shard_object) =
+            conflict_proof_inputs(&mut conflict, raw, b"writer-epoch-current-v1", &prefix);
+        let result = validate_capacity_conflicting_repo_control(
+            &conflict,
+            &control,
+            &object,
+            &catalog,
+            &receipt,
+            &shard,
+            &shard_object,
+            &prefix,
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "commit epoch {commit_epoch}, current epoch {current_epoch}"
+        );
+    }
+}
+
+#[test]
 fn receipt_catalog_and_capacity_obligation_are_exact_composition_gates() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
     let mut charged = charged_reservation(&prefix);
@@ -2074,6 +2114,19 @@ fn set_conflicting_mutation_id(reservation: &mut CapacityReservation, mutation_i
         panic!("conflict proof")
     };
     proof.conflicting_mutation_id = uuid(mutation_id);
+}
+
+fn set_conflicting_writer_epoch(reservation: &mut CapacityReservation, writer_epoch: u64) {
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::ConflictingCommit(proof)) =
+        aborted.proof.as_mut()
+    else {
+        panic!("conflict proof")
+    };
+    proof.commit.as_mut().unwrap().writer_epoch = writer_epoch;
 }
 
 fn reservation(
