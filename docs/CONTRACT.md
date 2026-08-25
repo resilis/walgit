@@ -377,8 +377,10 @@ refreshable AWS SDK chain. `explicit_env` requires bounded portable access and
 secret variable names plus an optional session-token name; every named value
 must resolve non-empty or construction fails without falling back or exposing
 the value. The same static validator also closes region, DNS-compatible bucket,
-deployment-prefix, multipart-part-size, and endpoint syntax. Custom endpoints
-are origin-only and non-loopback endpoints require HTTPS. `Config::validate`
+deployment-prefix, multipart-part-size, and endpoint syntax. The endpoint is
+required and bound explicitly so ambient AWS endpoint configuration cannot
+select the provider. It uses exact canonical origin syntax with no path or
+trailing slash, and non-loopback endpoints require HTTPS. `Config::validate`
 and `S3Store::new` call this validator before credential or network access.
 S3 SDK diagnostics retain only the internal operation, transport category,
 numeric status, and an allowlisted service code. Raw SDK/provider messages,
@@ -387,7 +389,8 @@ codes are not included in errors or provider-contract banners.
 
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for S3 when `WALGIT_TEST_S3_ENDPOINT` is set (endpoint, region, bucket, prefix, addressing mode,
-and closed default-chain/explicit-env credentials are parameterized with `WALGIT_TEST_S3_*`; every run adds a unique suffix),
+and closed default-chain/explicit-env credentials are parameterized with `WALGIT_TEST_S3_*`; the exact configured
+deployment prefix is validated and every run writes only below a unique child key),
 for gcs when `WALGIT_TEST_GCS_BUCKET` set.
 
 S3 large writes and compose use multipart completion as the destination's

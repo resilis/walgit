@@ -69,40 +69,45 @@ pub struct S3Store {
 impl S3Store {
     /// Build a store from `walgit-config::StoreConfig`.
     ///
-    /// The AWS SDK default chain supplies refreshable credentials. The env
-    /// vars named in `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// override it only when both resolve to non-empty values. A configured
-    /// `session_token_env` is included for temporary explicit credentials.
+    /// `default_chain` delegates to the refreshable AWS SDK chain and accepts
+    /// no custom variable names. `explicit_env` requires the configured
+    /// access/secret variables and optional session-token variable to resolve
+    /// non-empty before AWS SDK setup; it never falls back to ambient AWS
+    /// identity. The required validated endpoint always replaces ambient AWS
+    /// endpoint, FIPS, and dual-stack settings.
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
         cfg.validate_s3()?;
-        let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
-        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(region.clone())
-            .load()
-            .await;
-        let mut s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-            .region(region)
-            .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
-
-        if let Some((access_key, secret_key, session_token)) = explicit_credentials(
+        let explicit_credentials = explicit_credentials(
             cfg.s3.credential_mode,
             &cfg.s3.access_key_env,
             &cfg.s3.secret_key_env,
             &cfg.s3.session_token_env,
             |name| std::env::var(name),
-        )? {
-            s3_config = s3_config.credentials_provider(Credentials::new(
+        )?
+        .map(|(access_key, secret_key, session_token)| {
+            Credentials::new(
                 access_key,
                 secret_key,
                 session_token,
                 None,
                 "walgit-explicit-env",
-            ));
-        }
+            )
+        });
 
-        if !cfg.s3.endpoint.is_empty() {
-            s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
+        let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(region.clone())
+            .endpoint_url(&cfg.s3.endpoint)
+            .use_fips(false)
+            .use_dual_stack(false);
+        if let Some(credentials) = explicit_credentials.clone() {
+            config_loader = config_loader.credentials_provider(credentials);
+        }
+        let shared_config = config_loader.load().await;
+        let mut s3_config = closed_s3_config_builder(&shared_config, cfg);
+
+        if let Some(credentials) = explicit_credentials {
+            s3_config = s3_config.credentials_provider(credentials);
         }
 
         let client = S3Client::from_conf(s3_config.build());
@@ -231,6 +236,19 @@ impl S3Store {
             s => Err(StoreError::Other(anyhow::anyhow!("s3 get status {s}"))),
         }
     }
+}
+
+fn closed_s3_config_builder(
+    shared_config: &aws_config::SdkConfig,
+    cfg: &walgit_config::StoreConfig,
+) -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::from(shared_config)
+        .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
+        .endpoint_url(&cfg.s3.endpoint)
+        .use_fips(false)
+        .use_dual_stack(false)
+        .force_path_style(cfg.s3.force_path_style)
+        .behavior_version_latest()
 }
 
 const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -1724,6 +1742,50 @@ mod tests {
         assert!(error.contains("default_chain"), "{error}");
         assert!(!error.contains("SHOULD_NOT_BE_READ"), "{error}");
         assert!(!error.contains("ALSO_SHOULD_NOT_BE_READ"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn configured_endpoint_replaces_imported_aws_endpoint_modifiers() {
+        let shared_config = aws_config::SdkConfig::builder()
+            .region(aws_sdk_s3::config::Region::new("hostile-region"))
+            .endpoint_url("http://hostile.example.test")
+            .use_fips(true)
+            .use_dual_stack(true)
+            .build();
+        let mut cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "trusted-bucket".into(),
+            ..Default::default()
+        };
+        cfg.s3.endpoint = "https://trusted.example.test".into();
+        cfg.s3.region = "trusted-region-1".into();
+        cfg.s3.force_path_style = true;
+
+        let service_config = closed_s3_config_builder(&shared_config, &cfg)
+            .credentials_provider(Credentials::new(
+                "test-access",
+                "test-secret",
+                None,
+                None,
+                "endpoint-authority-test",
+            ))
+            .build();
+        let request = S3Client::from_conf(service_config)
+            .get_object()
+            .bucket(&cfg.bucket)
+            .key("object")
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap())
+            .await
+            .expect("presign with the closed endpoint configuration");
+        let uri = request.uri();
+
+        assert!(
+            uri.starts_with("https://trusted.example.test/trusted-bucket/object?"),
+            "unexpected provider target"
+        );
+        assert!(!uri.contains("hostile.example.test"));
+        assert!(!uri.contains("fips"));
+        assert!(!uri.contains("dualstack"));
     }
 
     #[test]

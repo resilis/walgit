@@ -1046,36 +1046,81 @@ async fn test_s3_multipart_failures_and_conditions(store: &DynStore, prefix: &st
 async fn s3_test_client(cfg: &walgit_config::StoreConfig) -> aws_sdk_s3::Client {
     use aws_sdk_s3::config::{Credentials, Region};
 
+    let explicit_credentials = s3_contract_explicit_credentials(cfg, |name| std::env::var(name))
+        .unwrap_or_else(|message| panic!("{message}"))
+        .map(|(access, secret, token)| {
+            Credentials::new(access, secret, token, None, "walgit-contract-explicit-env")
+        });
     let region = Region::new(cfg.s3.region.clone());
-    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region.clone())
-        .load()
-        .await;
+        .endpoint_url(&cfg.s3.endpoint)
+        .use_fips(false)
+        .use_dual_stack(false);
+    if let Some(credentials) = explicit_credentials.clone() {
+        loader = loader.credentials_provider(credentials);
+    }
+    let shared = loader.load().await;
     let mut builder = aws_sdk_s3::config::Builder::from(&shared)
         .region(region)
+        .endpoint_url(&cfg.s3.endpoint)
+        .use_fips(false)
+        .use_dual_stack(false)
         .force_path_style(cfg.s3.force_path_style)
         .behavior_version_latest();
-    if cfg.s3.credential_mode == walgit_config::S3CredentialMode::ExplicitEnv {
-        let access = std::env::var(&cfg.s3.access_key_env)
-            .expect("configured S3 contract access-key variable");
-        let secret = std::env::var(&cfg.s3.secret_key_env)
-            .expect("configured S3 contract secret-key variable");
-        let token = (!cfg.s3.session_token_env.is_empty()).then(|| {
-            std::env::var(&cfg.s3.session_token_env)
-                .expect("configured S3 contract session-token variable")
-        });
-        builder = builder.credentials_provider(Credentials::new(
-            access,
-            secret,
-            token,
-            None,
-            "walgit-contract-explicit-env",
-        ));
-    }
-    if !cfg.s3.endpoint.is_empty() {
-        builder = builder.endpoint_url(&cfg.s3.endpoint);
+    if let Some(credentials) = explicit_credentials {
+        builder = builder.credentials_provider(credentials);
     }
     aws_sdk_s3::Client::from_conf(builder.build())
+}
+
+#[cfg(feature = "s3")]
+type S3ContractCredentials = (String, String, Option<String>);
+
+#[cfg(feature = "s3")]
+fn s3_contract_explicit_credentials(
+    cfg: &walgit_config::StoreConfig,
+    read: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<S3ContractCredentials>, &'static str> {
+    cfg.validate_s3()
+        .map_err(|_| "invalid static S3 contract configuration")?;
+    if cfg.s3.credential_mode == walgit_config::S3CredentialMode::DefaultChain {
+        return Ok(None);
+    }
+
+    let required = |name: &str, error| {
+        read(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or(error)
+    };
+    let access = required(
+        &cfg.s3.access_key_env,
+        "configured S3 contract access-key credential is missing or invalid",
+    )?;
+    let secret = required(
+        &cfg.s3.secret_key_env,
+        "configured S3 contract secret-key credential is missing or invalid",
+    )?;
+    let token = if cfg.s3.session_token_env.is_empty() {
+        None
+    } else {
+        Some(required(
+            &cfg.s3.session_token_env,
+            "configured S3 contract session-token credential is missing or invalid",
+        )?)
+    };
+    Ok(Some((access, secret, token)))
+}
+
+fn s3_contract_credential_mode(
+    value: &str,
+) -> Result<walgit_config::S3CredentialMode, &'static str> {
+    match value {
+        "default" => Ok(walgit_config::S3CredentialMode::DefaultChain),
+        "explicit" => Ok(walgit_config::S3CredentialMode::ExplicitEnv),
+        _ => Err("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit"),
+    }
 }
 
 // ---- test wrappers -----------------------------------------------------
@@ -1103,39 +1148,43 @@ async fn s3_contract() {
         .unwrap_or(true);
     let credential_mode =
         std::env::var("WALGIT_TEST_S3_CREDENTIAL_MODE").unwrap_or_else(|_| "default".into());
-    let (credential_mode_config, access_key_env, secret_key_env, session_token_env) =
-        match credential_mode.as_str() {
-            "default" => (
-                walgit_config::S3CredentialMode::DefaultChain,
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-            "explicit" => (
-                walgit_config::S3CredentialMode::ExplicitEnv,
+    let credential_mode_config =
+        s3_contract_credential_mode(&credential_mode).unwrap_or_else(|message| panic!("{message}"));
+    let (credential_mode_label, access_key_env, secret_key_env, session_token_env) =
+        match credential_mode_config {
+            walgit_config::S3CredentialMode::DefaultChain => {
+                ("default", String::new(), String::new(), String::new())
+            }
+            walgit_config::S3CredentialMode::ExplicitEnv => (
+                "explicit",
                 std::env::var("WALGIT_TEST_S3_ACCESS_KEY_ENV")
                     .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".into()),
                 std::env::var("WALGIT_TEST_S3_SECRET_KEY_ENV")
                     .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".into()),
                 std::env::var("WALGIT_TEST_S3_SESSION_TOKEN_ENV").unwrap_or_default(),
             ),
-            other => {
-                panic!("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit, got {other}")
-            }
         };
 
-    // Unique prefix per run.
-    let prefix_base =
+    // Validate the exact configured deployment prefix, then isolate this run
+    // below it. The run child is an object-key namespace, not another
+    // deployment-prefix segment, so a valid 63-byte configured segment stays
+    // valid instead of being lengthened by the UUID.
+    let configured_prefix =
         std::env::var("WALGIT_TEST_S3_PREFIX").unwrap_or_else(|_| "contract-test".into());
-    let prefix = format!("{prefix_base}-{}", uuid::Uuid::new_v4().simple());
+    let run_child = format!("contract-run-{}", uuid::Uuid::new_v4().simple());
+    let prefix = if configured_prefix.is_empty() {
+        run_child
+    } else {
+        format!("{configured_prefix}/{run_child}")
+    };
     eprintln!(
-        "[s3_contract] provider parameters loaded: path_style={force_path_style} credentials={credential_mode}"
+        "[s3_contract] provider parameters loaded: path_style={force_path_style} credentials={credential_mode_label}"
     );
 
     let cfg = walgit_config::StoreConfig {
         backend: walgit_config::StoreBackend::S3,
         bucket: bucket.clone(),
-        prefix: prefix.clone(),
+        prefix: configured_prefix,
         s3: walgit_config::S3Config {
             endpoint: endpoint.clone(),
             region,
@@ -1213,6 +1262,50 @@ async fn s3_contract() {
         incomplete.uploads().is_empty(),
         "contract cleanup left incomplete multipart uploads under the disposable prefix"
     );
+}
+
+#[test]
+fn invalid_s3_contract_credential_mode_is_source_free() {
+    const SENTINEL: &str = "credential-mode-secret-sentinel";
+    let error = s3_contract_credential_mode(SENTINEL).unwrap_err();
+    assert_eq!(
+        error,
+        "WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit"
+    );
+    assert!(!error.contains(SENTINEL));
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn non_unicode_s3_contract_credentials_are_source_free() {
+    const SENTINEL: &str = "credential-secret-sentinel";
+    let mut cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::S3,
+        bucket: "contract-bucket".into(),
+        ..Default::default()
+    };
+    cfg.s3.endpoint = "https://s3.example.test".into();
+    cfg.s3.credential_mode = walgit_config::S3CredentialMode::ExplicitEnv;
+    cfg.s3.access_key_env = "CONTRACT_ACCESS_KEY".into();
+    cfg.s3.secret_key_env = "CONTRACT_SECRET_KEY".into();
+
+    let error = s3_contract_explicit_credentials(&cfg, |name| {
+        if name == "CONTRACT_ACCESS_KEY" {
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                SENTINEL,
+            )))
+        } else {
+            Ok("other-secret-sentinel".into())
+        }
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        "configured S3 contract access-key credential is missing or invalid"
+    );
+    assert!(!error.contains(SENTINEL));
+    assert!(!error.contains("other-secret-sentinel"));
 }
 
 #[cfg(feature = "gcs")]

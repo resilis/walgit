@@ -1961,22 +1961,24 @@ impl StoreConfig {
             valid_prefix,
             "store.prefix must be empty or 1-4 canonical S3 key segments totaling at most 256 bytes"
         );
-        if !self.s3.endpoint.is_empty() {
-            let endpoint = validated_http_url("store.s3.endpoint", &self.s3.endpoint, false)?;
-            anyhow::ensure!(
-                endpoint.path() == "/",
-                "store.s3.endpoint must be an origin without a path"
-            );
-            let loopback = endpoint.host().is_some_and(|host| match host {
-                url::Host::Domain(domain) => domain == "localhost",
-                url::Host::Ipv4(address) => address.is_loopback(),
-                url::Host::Ipv6(address) => address.is_loopback(),
-            });
-            anyhow::ensure!(
-                endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback),
-                "store.s3.endpoint must use https (http is allowed only for a loopback development store)"
-            );
-        }
+        anyhow::ensure!(
+            !self.s3.endpoint.is_empty(),
+            "store.s3.endpoint must be set explicitly"
+        );
+        let endpoint = validated_http_url("store.s3.endpoint", &self.s3.endpoint, false)?;
+        anyhow::ensure!(
+            self.s3.endpoint == endpoint.origin().ascii_serialization(),
+            "store.s3.endpoint must use exact canonical origin syntax without a path or trailing slash"
+        );
+        let loopback = endpoint.host().is_some_and(|host| match host {
+            url::Host::Domain(domain) => domain == "localhost",
+            url::Host::Ipv4(address) => address.is_loopback(),
+            url::Host::Ipv6(address) => address.is_loopback(),
+        });
+        anyhow::ensure!(
+            endpoint.scheme() == "https" || (endpoint.scheme() == "http" && loopback),
+            "store.s3.endpoint must use https (http is allowed only for a loopback development store)"
+        );
 
         const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
         const S3_MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -2258,10 +2260,19 @@ mod tests {
             }
         }
         cfg.store.prefix = "production/walgit".into();
+        cfg.validate().unwrap();
+        cfg.store.prefix = format!("contract-{}", "a".repeat(40));
+        cfg.validate()
+            .expect("the protected CI deployment prefix must remain valid");
 
         for endpoint in [
+            "",
             "http://s3.example.com",
             "https://s3.example.com/provider-path",
+            "https://s3.example.com/./",
+            "https://s3.example.com/provider-path/..",
+            "https://s3.example.com/%2e%2e/",
+            "https://S3.EXAMPLE.COM:443",
             "https://s3.example.com?query=sentinel",
         ] {
             cfg.store.s3.endpoint = endpoint.into();

@@ -60,19 +60,25 @@ production approval. No PR1 image is production-deployable.
   multipart operations. The design continues to support a 64 GiB receive, a
   16 GiB LFS object, and 30 GiB or larger packs and bundles. It has no 4 GiB
   product limit.
-- The AWS SDK default credential chain supplies refreshable credentials. Empty
-  explicit override names leave standard AWS environment variables and
-  temporary credentials under that chain. Configured custom access and secret
-  variables override it only when both contain non-empty values. A configured
-  custom session-token variable must also resolve. An incoherent partial
-  override is a startup error. Secret values never enter logs or errors.
+- Credential selection is a closed `default_chain | explicit_env` mode.
+  `default_chain` accepts no custom variable names and delegates to the
+  refreshable AWS SDK chain, including standard AWS environment variables and
+  temporary credentials. `explicit_env` requires bounded custom access and
+  secret variable names plus an optional session-token name. Every named value
+  must resolve non-empty, and missing, empty, or non-Unicode values fail
+  startup without falling back to ambient AWS identity. This greenfield hard
+  cut intentionally rejects the earlier pre-1 implicit custom-name override
+  shape. Secret values never enter logs or errors.
 - Runtime multipart abort is best effort. The production bucket must configure
   `AbortIncompleteMultipartUpload` cleanup for uploads left by process death or
   provider outages.
 - Endpoint, region, bucket, prefix, and path-style settings remain explicit
-  deployment inputs. Memory, GCS, and standalone behavior remain supported for
-  development and non-production contracts. Only an S3-compatible provider is
-  eligible for the future production hard cut.
+  deployment inputs. The endpoint is required and uses exact canonical origin
+  syntax with no path or trailing slash. WalGit binds it after AWS SDK config
+  loading and disables ambient endpoint, FIPS, and dual-stack modifiers.
+  Memory, GCS, and standalone behavior remain supported for development and
+  non-production contracts. Only an S3-compatible provider is eligible for the
+  future production hard cut.
 - PR1 local RustFS evidence does not prove the production provider. The PR2
   provider gate below must use the exact S3-compatible endpoint, region,
   addressing mode, credential mode, temporary bucket, and unique prefix
