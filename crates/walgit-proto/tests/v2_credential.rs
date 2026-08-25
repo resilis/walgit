@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use walgit_proto::v2::{
     ControlCodecError, CredentialControl, CredentialTransitionKind, VerificationRingRoot,
-    decode_credential_control, encode_credential_control, keys::DeploymentPrefix,
-    preflight_credential_control, validate_credential_control,
+    decode_credential_control, encode_credential_control, encode_credential_control_projection,
+    keys::DeploymentPrefix, preflight_credential_control, validate_credential_control,
     validate_credential_control_transition_structure,
 };
 
@@ -16,6 +16,21 @@ fn bootstrap_has_an_exact_canonical_golden_encoding() {
         "0802100118012293010a5f70726f642f76322f636f6e74726f6c2f6b65792d72696e67732f313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131313131312e636f7365120976657273696f6e2d311a20111111111111111111111111111111111111111111111111111111111111111120802028014a20222222222222222222222222222222222222222222222222222222222222222252203333333333333333333333333333333333333333333333333333333333333333"
     );
     assert_eq!(decode_credential_control(&bytes, &prefix).unwrap(), control);
+}
+
+#[test]
+fn transition_projection_validates_complete_control_then_omits_only_field_ten() {
+    let prefix = prefix();
+    let control = bootstrap(&prefix);
+    let full = encode_credential_control(&control, &prefix).unwrap();
+    let projection = encode_credential_control_projection(&control, &prefix).unwrap();
+    assert_eq!(&full[..full.len() - 34], projection);
+    assert_eq!(control.acknowledgement_proof_digest.as_ref(), &[0x33; 32]);
+    preflight_credential_control(&projection).unwrap();
+
+    let mut incomplete = control;
+    incomplete.acknowledgement_proof_digest.clear();
+    assert!(encode_credential_control_projection(&incomplete, &prefix).is_err());
 }
 
 #[test]

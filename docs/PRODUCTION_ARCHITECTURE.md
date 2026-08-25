@@ -522,6 +522,11 @@ The create external AAD is the exact ASCII bytes
 `walgit-capability-v1`. The normal COSE `Sig_structure` signs that external AAD,
 the exact protected header bytes, and the exact payload bytes.
 
+Every `COSE_Sign1` in this credential contract uses an attached, non-null
+byte-string payload. Detached and CBOR-null payloads fail closed. Data-key and
+acknowledgement `kid` values are opaque reserved 16-byte values; a verifier
+derives only `root_kid` from a public key.
+
 Intent and token IDs are RFC 9562 UUIDv7 values encoded as their raw 16 bytes.
 Their embedded millisecond timestamp must be within 30 seconds of issued-at.
 At the same derived `repo_control` key, an exact create envelope replay is
@@ -536,6 +541,16 @@ lives at most 10 minutes and a capability at most 15 minutes. Both require
 `issued_at <= not_before <= expiry`; issue time cannot be more than 30 seconds
 in the future. A verifier accepts time only from 30 seconds before not-before
 through 30 seconds after expiry.
+
+The lifetime calculation is checked `expiry - issued_at`: at most 600 seconds
+for a create intent or transition proof and 900 seconds for a capability.
+Envelope validity uses the verifier's explicit `now` and only the stated
+30-second envelope skew. A data key requires `not_before <= not_after`; key
+eligibility is evaluated at the signed envelope `issued_at` with no key skew.
+These are separate checks, so a correctly issued envelope can remain valid
+while a previous ring drains. Ring and verifier-set IDs need valid UUIDv7 wire
+form only. They have no UUID-to-issued-at proximity, artifact lifetime, or
+future-skew rule beyond the requirements stated for their containing object.
 
 Cloud Core publishes a deterministic-CBOR verification key ring in untagged
 `COSE_Sign1`, signed by a pinned Ed25519 root with external AAD equal to the

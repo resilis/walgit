@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/walgit-identity",
     "crates/walgit-proto",
     "crates/walgit-store",
     "crates/walgit-config",
@@ -19,6 +20,7 @@ rust-version = "1.90"
 
 [workspace.dependencies]
 walgit-proto = { path = "crates/walgit-proto" }
+walgit-identity = { path = "crates/walgit-identity" }
 walgit-store = { path = "crates/walgit-store" }
 walgit-config = { path = "crates/walgit-config" }
 walgit-git = { path = "crates/walgit-git" }
@@ -84,6 +86,7 @@ clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "std"] }
 hmac = "0.12"
 hex = "0.4"
 humantime = "2"
