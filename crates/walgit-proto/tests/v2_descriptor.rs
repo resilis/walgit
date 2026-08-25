@@ -588,7 +588,7 @@ fn capacity_schema_has_the_frozen_numeric_tags_types_and_bounds() {
         );
     }
 
-    for (message, field, minimum, maximum) in [
+    for (message, field_name, minimum, maximum) in [
         ("TenantCapacityAllocation", "slices", 256, 256),
         ("TenantCapacityCatalogPage", "allocations", 0, 4_096),
         ("CapacityShard", "tenant_accounts", 0, 4_096),
@@ -600,7 +600,7 @@ fn capacity_schema_has_the_frozen_numeric_tags_types_and_bounds() {
         let field = pool
             .get_message_by_name(&format!("walgit.v2.{message}"))
             .unwrap()
-            .get_field_by_name(field)
+            .get_field_by_name(field_name)
             .unwrap();
         assert_eq!(
             option(&pool, field.options(), "walgit.v2.min_items"),
@@ -609,6 +609,40 @@ fn capacity_schema_has_the_frozen_numeric_tags_types_and_bounds() {
         assert_eq!(
             option(&pool, field.options(), "walgit.v2.max_items"),
             maximum
+        );
+    }
+
+    for (message, field_name, minimum, maximum) in [
+        ("CapacityObjectRef", "key", 1, 1_024),
+        ("CapacityObjectRef", "object_version_id", 1, 1_024),
+        ("CapacityObjectRef", "digest", 32, 32),
+        ("TenantCapacityAllocation", "tenant_id", 1, 256),
+        ("CapacityCommitBinding", "mutation_id", 16, 16),
+        (
+            "ConflictingCapacityCommit",
+            "conflicting_mutation_id",
+            16,
+            16,
+        ),
+        ("CapacityReservation", "reservation_id", 16, 16),
+        ("CapacityReservation", "tenant_id", 1, 256),
+        ("CapacityTenantAccount", "tenant_id", 1, 256),
+        ("CapacityRedistribution", "admission_fence_id", 16, 16),
+    ] {
+        let field = pool
+            .get_message_by_name(&format!("walgit.v2.{message}"))
+            .unwrap()
+            .get_field_by_name(field_name)
+            .unwrap();
+        assert_eq!(
+            option(&pool, field.options(), "walgit.v2.min_bytes"),
+            minimum,
+            "wrong byte minimum for {message}.{field_name}"
+        );
+        assert_eq!(
+            option(&pool, field.options(), "walgit.v2.max_bytes"),
+            maximum,
+            "wrong byte maximum for {message}.{field_name}"
         );
     }
 }

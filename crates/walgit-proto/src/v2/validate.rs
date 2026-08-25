@@ -255,6 +255,82 @@ pub fn validate_capacity_shard_object(
     validate_exact_protobuf_object(object, &shard.encode_to_vec(), "capacity_shard.object")
 }
 
+/// Exact-bind one loaded historical epoch-start shard body to the matching
+/// retained `CapacityShardBudget` proof in either STABLE or PREPARING.
+///
+/// This proof is deliberately distinct from the mutable current-shard object
+/// gate. During PREPARING/APPLYING, a drained baseline can have newer provider
+/// metadata than this retained epoch-start proof.
+pub fn validate_capacity_retained_shard_budget_object(
+    control: &CapacityControl,
+    shard: &CapacityShard,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_control(control, prefix)?;
+    let shard_index = capacity_shard_index(shard.shard)?;
+    let budget = &control.shard_budgets[shard_index];
+    validate_capacity_shard_object(
+        shard,
+        budget
+            .shard_object
+            .as_ref()
+            .ok_or_else(|| missing("capacity_control.shard_budget.shard_object"))?,
+        prefix,
+    )?;
+    validate_retained_capacity_shard_fields(control, shard, budget)
+}
+
+/// Exact-bind one loaded mutable current shard body to observed provider
+/// metadata and to the matching retained control epoch and shard budget.
+///
+/// The observed metadata is not compared with the historical epoch-start
+/// proof in `CapacityShardBudget`. Terminal transitions can legitimately make
+/// the mutable object's version, digest, and size newer than that proof.
+pub fn validate_capacity_current_shard_object(
+    control: &CapacityControl,
+    shard: &CapacityShard,
+    observed_object: &CapacityObjectRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_control(control, prefix)?;
+    validate_capacity_shard_object(shard, observed_object, prefix)?;
+    let shard_index = capacity_shard_index(shard.shard)?;
+    validate_retained_capacity_shard_fields(control, shard, &control.shard_budgets[shard_index])
+}
+
+fn validate_retained_capacity_shard_fields(
+    control: &CapacityControl,
+    shard: &CapacityShard,
+    budget: &CapacityShardBudget,
+) -> Result<(), ControlValidationError> {
+    if budget.shard != shard.shard {
+        return Err(invalid(
+            "capacity_control.shard_budget.shard",
+            "does not equal the loaded shard number",
+        ));
+    }
+    if shard.allocation_epoch != control.allocation_epoch {
+        return Err(invalid(
+            "capacity_shard.allocation_epoch",
+            "does not equal the retained current control epoch",
+        ));
+    }
+    if shard.budget_bytes != budget.budget_bytes {
+        return Err(invalid(
+            "capacity_shard.budget_bytes",
+            "does not equal the retained current control shard budget",
+        ));
+    }
+    Ok(())
+}
+
+fn capacity_shard_index(shard: u32) -> Result<usize, ControlValidationError> {
+    usize::try_from(shard)
+        .ok()
+        .filter(|index| *index < 256)
+        .ok_or_else(|| invalid("capacity_shard.shard", "must be in 0..=255"))
+}
+
 /// Cross-check current shard tenant accounts against one exact-loaded tenant
 /// catalog page. The page's exact root binding is validated separately by
 /// [`validate_capacity_control_catalogs`].
@@ -265,10 +341,7 @@ pub fn validate_capacity_shard_catalog(
 ) -> Result<(), ControlValidationError> {
     validate_capacity_shard(shard, prefix)?;
     validate_tenant_capacity_catalog_page(page)?;
-    let shard_index = usize::try_from(shard.shard)
-        .ok()
-        .filter(|index| *index < 256)
-        .ok_or_else(|| invalid("capacity_shard.shard", "must be in 0..=255"))?;
+    let shard_index = capacity_shard_index(shard.shard)?;
     for account in &shard.tenant_accounts {
         let allocation_index = page
             .allocations
@@ -285,6 +358,30 @@ pub fn validate_capacity_shard_catalog(
             return Err(invalid(
                 "capacity_shard.tenant_account.current_slice_bytes",
                 "does not equal the exact current catalog slice",
+            ));
+        }
+    }
+    for reservation in &shard.reservations {
+        if reservation.allocation_epoch != shard.allocation_epoch
+            || reservation.state == CapacityReservationState::Aborted as i32
+        {
+            continue;
+        }
+        let account_index = shard
+            .tenant_accounts
+            .binary_search_by(|account| account.tenant_id.cmp(&reservation.tenant_id))
+            .map_err(|_| {
+                invalid(
+                    "capacity_shard.reservations",
+                    "current reservation tenant has no current account",
+                )
+            })?;
+        if reservation.tenant_slice_bytes
+            != shard.tenant_accounts[account_index].current_slice_bytes
+        {
+            return Err(invalid(
+                "capacity_reservation.tenant_slice_bytes",
+                "does not equal the exact current account and catalog slice",
             ));
         }
     }
@@ -434,26 +531,12 @@ pub fn validate_capacity_current_shard_view(
     control: &CapacityControl,
     current_page: &TenantCapacityCatalogPage,
     shard: &CapacityShard,
+    observed_object: &CapacityObjectRef,
     prefix: &DeploymentPrefix,
 ) -> Result<(), ControlValidationError> {
     validate_capacity_current_catalog(control, current_page, prefix)?;
+    validate_capacity_current_shard_object(control, shard, observed_object, prefix)?;
     validate_capacity_shard_catalog(shard, current_page, prefix)?;
-    let shard_index = usize::try_from(shard.shard)
-        .ok()
-        .filter(|index| *index < 256)
-        .ok_or_else(|| invalid("capacity_shard.shard", "must be in 0..=255"))?;
-    if shard.allocation_epoch != control.allocation_epoch {
-        return Err(invalid(
-            "capacity_shard.allocation_epoch",
-            "does not equal the retained current control epoch",
-        ));
-    }
-    if shard.budget_bytes != control.shard_budgets[shard_index].budget_bytes {
-        return Err(invalid(
-            "capacity_shard.budget_bytes",
-            "does not equal the retained current control shard budget",
-        ));
-    }
     Ok(())
 }
 
@@ -463,13 +546,521 @@ pub fn validate_capacity_admission_view(
     control: &CapacityControl,
     current_page: &TenantCapacityCatalogPage,
     shard: &CapacityShard,
+    observed_object: &CapacityObjectRef,
     prefix: &DeploymentPrefix,
 ) -> Result<(), ControlValidationError> {
-    validate_capacity_current_shard_view(control, current_page, shard, prefix)?;
+    validate_capacity_current_shard_view(control, current_page, shard, observed_object, prefix)?;
     if CapacityControlState::try_from(control.state) != Ok(CapacityControlState::Stable) {
         return Err(invalid(
             "capacity_control.state",
             "admission requires STABLE",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an exact retry or one legal reservation transition between two
+/// exact capacity-shard states. The caller supplies its observed wall-clock
+/// seconds; this validator never reads a clock.
+pub fn validate_capacity_shard_successor(
+    previous: &CapacityShard,
+    successor: &CapacityShard,
+    observed_now_unix_seconds: u64,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_capacity_shard(previous, prefix)?;
+    validate_capacity_shard(successor, prefix)?;
+    if previous == successor {
+        return Ok(());
+    }
+    if previous.schema_version != successor.schema_version
+        || previous.shard != successor.shard
+        || previous.allocation_epoch != successor.allocation_epoch
+        || previous.budget_bytes != successor.budget_bytes
+    {
+        return Err(invalid(
+            "capacity_shard.successor",
+            "cannot change schema, shard, allocation epoch, or budget",
+        ));
+    }
+    let expected_revision = previous.control_revision.checked_add(1).ok_or_else(|| {
+        invalid(
+            "capacity_shard.control_revision",
+            "cannot advance past u64::MAX",
+        )
+    })?;
+    if successor.control_revision != expected_revision {
+        return Err(invalid(
+            "capacity_shard.control_revision",
+            "must advance by exactly one for a real successor",
+        ));
+    }
+
+    let mut previous_index = 0usize;
+    let mut successor_index = 0usize;
+    let mut effect = None;
+    while previous_index < previous.reservations.len()
+        || successor_index < successor.reservations.len()
+    {
+        match (
+            previous.reservations.get(previous_index),
+            successor.reservations.get(successor_index),
+        ) {
+            (Some(before), Some(after)) => match before.reservation_id.cmp(&after.reservation_id) {
+                std::cmp::Ordering::Equal => {
+                    if before != after {
+                        set_capacity_transition_effect(
+                            &mut effect,
+                            validate_capacity_reservation_successor(
+                                before,
+                                after,
+                                observed_now_unix_seconds,
+                            )?,
+                        )?;
+                    }
+                    previous_index += 1;
+                    successor_index += 1;
+                }
+                std::cmp::Ordering::Less => {
+                    return Err(invalid(
+                        "capacity_shard.reservations",
+                        "a successor cannot remove a retained reservation row",
+                    ));
+                }
+                std::cmp::Ordering::Greater => {
+                    set_capacity_transition_effect(
+                        &mut effect,
+                        validate_new_reserved_capacity_reservation(
+                            after,
+                            observed_now_unix_seconds,
+                        )?,
+                    )?;
+                    successor_index += 1;
+                }
+            },
+            (Some(_), None) => {
+                return Err(invalid(
+                    "capacity_shard.reservations",
+                    "a successor cannot remove a retained reservation row",
+                ));
+            }
+            (None, Some(after)) => {
+                set_capacity_transition_effect(
+                    &mut effect,
+                    validate_new_reserved_capacity_reservation(after, observed_now_unix_seconds)?,
+                )?;
+                successor_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    let effect = effect.ok_or_else(|| {
+        invalid(
+            "capacity_shard.successor",
+            "a revision advance requires exactly one reservation transition",
+        )
+    })?;
+    validate_capacity_successor_accounts(previous, successor, &effect)
+}
+
+#[derive(Clone, Debug)]
+enum CapacityTransitionEffect {
+    AddReserved {
+        tenant_id: Vec<u8>,
+        tenant_slice_bytes: u64,
+    },
+    PreserveAccount {
+        tenant_id: Vec<u8>,
+    },
+    ReleaseAccount {
+        tenant_id: Vec<u8>,
+    },
+}
+
+fn set_capacity_transition_effect(
+    current: &mut Option<CapacityTransitionEffect>,
+    candidate: CapacityTransitionEffect,
+) -> Result<(), ControlValidationError> {
+    if current.replace(candidate).is_some() {
+        return Err(invalid(
+            "capacity_shard.reservations",
+            "a successor must contain exactly one reservation transition",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_new_reserved_capacity_reservation(
+    reservation: &CapacityReservation,
+    observed_now_unix_seconds: u64,
+) -> Result<CapacityTransitionEffect, ControlValidationError> {
+    let Some(CapacityReservationPayload::Reserved(reserved)) = reservation.state_payload.as_ref()
+    else {
+        return Err(invalid(
+            "capacity_shard.reservations",
+            "a new row must start in RESERVED",
+        ));
+    };
+    if reservation.state != CapacityReservationState::Reserved as i32
+        || reserved.created_at_unix_seconds > observed_now_unix_seconds
+        || observed_now_unix_seconds >= reserved.expires_at_unix_seconds
+    {
+        return Err(invalid(
+            "capacity_reservation.reserved",
+            "creation requires created_at <= observed now < expires_at",
+        ));
+    }
+    Ok(CapacityTransitionEffect::AddReserved {
+        tenant_id: reservation.tenant_id.to_vec(),
+        tenant_slice_bytes: reservation.tenant_slice_bytes,
+    })
+}
+
+fn validate_capacity_reservation_successor(
+    previous: &CapacityReservation,
+    successor: &CapacityReservation,
+    observed_now_unix_seconds: u64,
+) -> Result<CapacityTransitionEffect, ControlValidationError> {
+    if previous.reservation_id != successor.reservation_id
+        || previous.identity != successor.identity
+        || previous.tenant_id != successor.tenant_id
+        || previous.allocation_epoch != successor.allocation_epoch
+        || previous.byte_count != successor.byte_count
+        || previous.tenant_slice_bytes != successor.tenant_slice_bytes
+    {
+        return Err(invalid(
+            "capacity_reservation.successor",
+            "cannot change immutable reservation fields",
+        ));
+    }
+    let previous_state = CapacityReservationState::try_from(previous.state)
+        .map_err(|_| invalid("capacity_reservation.state", "is unknown"))?;
+    let successor_state = CapacityReservationState::try_from(successor.state)
+        .map_err(|_| invalid("capacity_reservation.state", "is unknown"))?;
+    if previous_state == successor_state {
+        return Err(invalid(
+            "capacity_reservation.successor",
+            "a same-state retry must be byte-exact",
+        ));
+    }
+
+    let tenant_id = previous.tenant_id.to_vec();
+    match (
+        previous_state,
+        successor_state,
+        previous.state_payload.as_ref(),
+        successor.state_payload.as_ref(),
+    ) {
+        (
+            CapacityReservationState::Reserved,
+            CapacityReservationState::Committing,
+            Some(CapacityReservationPayload::Reserved(_)),
+            Some(CapacityReservationPayload::Committing(_)),
+        ) => Ok(CapacityTransitionEffect::PreserveAccount { tenant_id }),
+        (
+            CapacityReservationState::Reserved,
+            CapacityReservationState::Aborted,
+            Some(CapacityReservationPayload::Reserved(reserved)),
+            Some(CapacityReservationPayload::Aborted(aborted)),
+        ) => {
+            let Some(AbortedProof::Expired(expired)) = aborted.proof.as_ref() else {
+                return Err(invalid(
+                    "capacity_reservation.aborted.proof",
+                    "RESERVED can abort only with its exact expiry proof",
+                ));
+            };
+            if expired.created_at_unix_seconds != reserved.created_at_unix_seconds
+                || expired.expires_at_unix_seconds != reserved.expires_at_unix_seconds
+                || expired.observed_now_unix_seconds != observed_now_unix_seconds
+                || observed_now_unix_seconds < reserved.expires_at_unix_seconds
+            {
+                return Err(invalid(
+                    "capacity_reservation.aborted.expired",
+                    "must repeat the exact window and bind the caller-observed expiry time",
+                ));
+            }
+            Ok(CapacityTransitionEffect::ReleaseAccount { tenant_id })
+        }
+        (
+            CapacityReservationState::Committing,
+            CapacityReservationState::Charged,
+            Some(CapacityReservationPayload::Committing(committing)),
+            Some(CapacityReservationPayload::Charged(charged)),
+        ) if committing.commit == charged.commit => {
+            Ok(CapacityTransitionEffect::PreserveAccount { tenant_id })
+        }
+        (
+            CapacityReservationState::Committing,
+            CapacityReservationState::Aborted,
+            Some(CapacityReservationPayload::Committing(committing)),
+            Some(CapacityReservationPayload::Aborted(aborted)),
+        ) => {
+            let Some(AbortedProof::ConflictingCommit(conflict)) = aborted.proof.as_ref() else {
+                return Err(invalid(
+                    "capacity_reservation.aborted.proof",
+                    "COMMITTING can abort only with a conflicting-commit proof",
+                ));
+            };
+            if committing.commit != conflict.commit {
+                return Err(invalid(
+                    "capacity_reservation.aborted.conflicting_commit.commit",
+                    "must repeat the exact COMMITTING binding",
+                ));
+            }
+            Ok(CapacityTransitionEffect::ReleaseAccount { tenant_id })
+        }
+        _ => Err(invalid(
+            "capacity_reservation.successor",
+            "is not a legal reservation transition",
+        )),
+    }
+}
+
+fn validate_capacity_successor_accounts(
+    previous: &CapacityShard,
+    successor: &CapacityShard,
+    effect: &CapacityTransitionEffect,
+) -> Result<(), ControlValidationError> {
+    let mut expected = previous.tenant_accounts.clone();
+    match effect {
+        CapacityTransitionEffect::PreserveAccount { tenant_id } => {
+            if expected != successor.tenant_accounts {
+                return Err(invalid(
+                    "capacity_shard.tenant_accounts",
+                    "must remain byte-exact for this transition",
+                ));
+            }
+            if !successor
+                .tenant_accounts
+                .iter()
+                .any(|account| account.tenant_id.as_ref() == tenant_id)
+            {
+                return Err(invalid(
+                    "capacity_shard.tenant_accounts",
+                    "transition tenant account is missing",
+                ));
+            }
+        }
+        CapacityTransitionEffect::AddReserved {
+            tenant_id,
+            tenant_slice_bytes,
+        } => match expected.binary_search_by(|account| account.tenant_id.as_ref().cmp(tenant_id)) {
+            Ok(index) => {
+                if expected[index].current_slice_bytes != *tenant_slice_bytes {
+                    return Err(invalid(
+                        "capacity_shard.tenant_accounts",
+                        "new reservation slice differs from the current tenant account",
+                    ));
+                }
+            }
+            Err(index) => expected.insert(
+                index,
+                CapacityTenantAccount {
+                    tenant_id: tenant_id.clone().into(),
+                    current_slice_bytes: *tenant_slice_bytes,
+                },
+            ),
+        },
+        CapacityTransitionEffect::ReleaseAccount { tenant_id } => {
+            let still_used = successor.reservations.iter().any(|reservation| {
+                reservation.tenant_id.as_ref() == tenant_id
+                    && reservation.state != CapacityReservationState::Aborted as i32
+            });
+            if !still_used {
+                let index = expected
+                    .binary_search_by(|account| account.tenant_id.as_ref().cmp(tenant_id))
+                    .map_err(|_| {
+                        invalid(
+                            "capacity_shard.tenant_accounts",
+                            "released reservation tenant account is missing",
+                        )
+                    })?;
+                expected.remove(index);
+            }
+        }
+    }
+    if expected != successor.tenant_accounts {
+        return Err(invalid(
+            "capacity_shard.tenant_accounts",
+            "contains a change outside the selected reservation transition",
+        ));
+    }
+    Ok(())
+}
+
+/// Exact-bind one CHARGED reservation proof to a strict-loaded landed
+/// `RepoControl` body and the provider metadata observed for that exact load.
+pub fn validate_capacity_charged_repo_control(
+    reservation: &CapacityReservation,
+    landed: &RepoControl,
+    observed_object: &LandedControlRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_terminal_capacity_reservation(reservation, prefix)?;
+    let Some(CapacityReservationPayload::Charged(charged)) = reservation.state_payload.as_ref()
+    else {
+        return Err(invalid("capacity_reservation.state", "must be CHARGED"));
+    };
+    let commit = charged
+        .commit
+        .as_ref()
+        .ok_or_else(|| missing("capacity_reservation.charged.commit"))?;
+    let kind = MutationKind::try_from(commit.kind)
+        .map_err(|_| invalid("capacity_commit.kind", "is unknown"))?;
+    let writer_epoch = if kind == MutationKind::WriterTakeover {
+        commit.writer_epoch.checked_add(1).ok_or_else(|| {
+            invalid(
+                "capacity_commit.writer_epoch",
+                "cannot advance past u64::MAX",
+            )
+        })?
+    } else {
+        commit.writer_epoch
+    };
+    validate_exact_landed_capacity_repo_control(
+        reservation,
+        landed,
+        charged
+            .landed_control
+            .as_ref()
+            .ok_or_else(|| missing("capacity_reservation.charged.landed_control"))?,
+        observed_object,
+        &commit.mutation_id,
+        writer_epoch,
+        prefix,
+    )
+}
+
+/// Exact-bind one conflicting-commit ABORTED proof to the strict-loaded
+/// conflicting `RepoControl` and its observed provider metadata.
+///
+/// The proof schema does not carry the conflicting mutation kind. It therefore
+/// proves only conflicts whose landed control remains at the expected
+/// authorizing writer epoch; a competing writer takeover fails closed.
+pub fn validate_capacity_conflicting_repo_control(
+    reservation: &CapacityReservation,
+    conflicting: &RepoControl,
+    observed_object: &LandedControlRef,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_terminal_capacity_reservation(reservation, prefix)?;
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_ref()
+    else {
+        return Err(invalid(
+            "capacity_reservation.state",
+            "must be ABORTED with a conflicting-commit proof",
+        ));
+    };
+    let Some(AbortedProof::ConflictingCommit(conflict)) = aborted.proof.as_ref() else {
+        return Err(invalid(
+            "capacity_reservation.aborted.proof",
+            "must be the conflicting-commit arm",
+        ));
+    };
+    let commit = conflict
+        .commit
+        .as_ref()
+        .ok_or_else(|| missing("capacity_reservation.aborted.conflicting_commit.commit"))?;
+    validate_exact_landed_capacity_repo_control(
+        reservation,
+        conflicting,
+        conflict.conflicting_control.as_ref().ok_or_else(|| {
+            missing("capacity_reservation.aborted.conflicting_commit.conflicting_control")
+        })?,
+        observed_object,
+        &conflict.conflicting_mutation_id,
+        commit.writer_epoch,
+        prefix,
+    )
+}
+
+fn validate_terminal_capacity_reservation(
+    reservation: &CapacityReservation,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    let identity = reservation
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("capacity_reservation.identity"))?;
+    let shard = Sha256::digest(&identity.repository_uuid)[0];
+    validate_capacity_reservation(reservation, shard, reservation.allocation_epoch, prefix)?;
+    Ok(())
+}
+
+fn validate_exact_landed_capacity_repo_control(
+    reservation: &CapacityReservation,
+    control: &RepoControl,
+    expected_object: &LandedControlRef,
+    observed_object: &LandedControlRef,
+    expected_mutation_id: &[u8],
+    expected_writer_epoch: u64,
+    prefix: &DeploymentPrefix,
+) -> Result<(), ControlValidationError> {
+    validate_repo_control(control)?;
+    let identity = reservation
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("capacity_reservation.identity"))?;
+    if control.identity.as_ref() != Some(identity) {
+        return Err(invalid(
+            "capacity_repo_control.identity",
+            "does not equal the reservation repository identity",
+        ));
+    }
+    validate_capacity_landed_control(
+        expected_object,
+        identity,
+        prefix,
+        "capacity_reservation.landed_control",
+    )?;
+    validate_capacity_landed_control(
+        observed_object,
+        identity,
+        prefix,
+        "capacity_reservation.observed_landed_control",
+    )?;
+    if expected_object != observed_object {
+        return Err(invalid(
+            "capacity_reservation.landed_control",
+            "does not equal the exact provider binding observed on load",
+        ));
+    }
+    if control.repo_control_key != expected_object.repo_control_key {
+        return Err(invalid(
+            "capacity_repo_control.repo_control_key",
+            "does not equal the exact landed-control key",
+        ));
+    }
+    if control.last_internal_mutation_id.as_ref() != expected_mutation_id {
+        return Err(invalid(
+            "capacity_repo_control.last_internal_mutation_id",
+            "does not equal the proof mutation ID",
+        ));
+    }
+    if control
+        .writer
+        .as_ref()
+        .ok_or_else(|| missing("capacity_repo_control.writer"))?
+        .epoch
+        != expected_writer_epoch
+    {
+        return Err(invalid(
+            "capacity_repo_control.writer.epoch",
+            "does not equal the proof writer epoch",
+        ));
+    }
+    let encoded = control.encode_to_vec();
+    if expected_object.size != encoded.len() as u64 {
+        return Err(invalid(
+            "capacity_reservation.landed_control.size",
+            "does not equal the canonical repo_control body size",
+        ));
+    }
+    let digest: [u8; 32] = Sha256::digest(&encoded).into();
+    if expected_object.digest.as_ref() != digest {
+        return Err(invalid(
+            "capacity_reservation.landed_control.digest",
+            "does not equal the canonical repo_control body digest",
         ));
     }
     Ok(())

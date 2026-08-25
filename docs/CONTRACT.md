@@ -73,12 +73,31 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   uses a closed predecessor: `CREATE` requires explicit `NONE`; every other
   non-settlement mutation requires the exact prior control CAS token and
   object version. `ABORTED` has separate expiry and conflicting-commit proof
-  arms. Commit mutation IDs are unique per repository across retained rows.
-  The pure current-shard-view validator additionally binds the current control
-  epoch and shard budget and requires every tenant account to equal the exact
-  current page slice. It does not compare a mutable current shard version with
-  the historical STABLE epoch-start version. Its admission wrapper requires
+  arms. Commit mutation IDs are unique per repository across retained rows. A
+  public successor validator accepts only a byte-exact retry or one legal
+  reservation transition with shard revision `+1`. It freezes the shard,
+  epoch, budget, immutable reservation fields, untouched rows, and unaffected
+  accounts. The caller supplies observed `now`: creation requires
+  `created_at <= now < expires_at`, and expiry repeats the original window and
+  records that exact `now >= expires_at`. Terminal rows cannot change.
+
+  The retained-shard-budget object validator exact-binds an epoch-start body
+  to the matching `CapacityShardBudget.shard_object` for both STABLE and the
+  retained prior plan in either PREPARING phase. A separate mutable-shard
+  object validator exact-binds the current body to caller-observed provider
+  metadata, then compares shard, current control epoch, and budget without
+  equating that metadata to the historical epoch-start proof. The pure
+  current-shard-view validator composes the mutable object gate and requires
+  every tenant account to equal the exact current page slice. Every current-
+  epoch non-`ABORTED` reservation must repeat that exact slice; older terminal
+  proof rows keep their historical slice. The admission wrapper requires
   STABLE; the general view supports only terminal drainage while PREPARING.
+  Before CHARGED or conflicting-commit ABORTED is accepted, the future
+  controller must run the state-specific loaded-`RepoControl` gate. It matches
+  the persisted and observed provider binding, canonical body key/digest/size,
+  repository identity, proof mutation ID, and applicable writer epoch. The
+  conflicting proof has no conflicting mutation kind, so a competing writer
+  takeover cannot be proven and fails closed in this schema.
 
   Redistribution has only `STABLE`, `PREPARING/DRAINING`, and
   `PREPARING/APPLYING` cells. DRAINING retains the exact prior stable plan and

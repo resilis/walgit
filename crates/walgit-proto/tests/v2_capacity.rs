@@ -1,3 +1,5 @@
+mod support;
+
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -83,19 +85,58 @@ fn capacity_enum_numbers_and_wire_bytes_are_frozen() {
 fn persisted_capacity_roots_have_stable_exact_digests() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
     let values = [
-        encode_tenant_capacity_catalog_page(&tenant_page()).unwrap(),
-        encode_capacity_shard(&shard_with(vec![reserved_reservation()]), &prefix).unwrap(),
-        encode_capacity_control(&stable_control(&prefix), &prefix).unwrap(),
-        encode_capacity_control(
-            &preparing_control(&prefix, RedistributionPhase::Applying),
-            &prefix,
-        )
-        .unwrap(),
+        (
+            "tenant-page",
+            encode_tenant_capacity_catalog_page(&tenant_page()).unwrap(),
+        ),
+        (
+            "reserved",
+            encode_capacity_shard(&shard_with(vec![reserved_reservation()]), &prefix).unwrap(),
+        ),
+        (
+            "committing",
+            encode_capacity_shard(&shard_with(vec![committing_reservation()]), &prefix).unwrap(),
+        ),
+        (
+            "charged",
+            encode_capacity_shard(&shard_with(vec![charged_reservation(&prefix)]), &prefix)
+                .unwrap(),
+        ),
+        (
+            "expired",
+            encode_capacity_shard(&shard_with(vec![expired_reservation()]), &prefix).unwrap(),
+        ),
+        (
+            "conflicting",
+            encode_capacity_shard(&shard_with(vec![conflicting_reservation(&prefix)]), &prefix)
+                .unwrap(),
+        ),
+        (
+            "stable",
+            encode_capacity_control(&stable_control(&prefix), &prefix).unwrap(),
+        ),
+        (
+            "draining",
+            encode_capacity_control(
+                &preparing_control(&prefix, RedistributionPhase::Draining),
+                &prefix,
+            )
+            .unwrap(),
+        ),
+        (
+            "applying",
+            encode_capacity_control(
+                &preparing_control(&prefix, RedistributionPhase::Applying),
+                &prefix,
+            )
+            .unwrap(),
+        ),
     ];
     let actual = values
         .iter()
-        .map(|value| {
+        .map(|(name, value)| {
             (
+                *name,
                 value.len(),
                 hex::encode(<[u8; 32]>::from(Sha256::digest(value))),
             )
@@ -105,18 +146,47 @@ fn persisted_capacity_roots_have_stable_exact_digests() {
         actual,
         vec![
             (
+                "tenant-page",
                 1_680,
                 "ee19542f241d3ce3d8a5193196bd6d7693befe3de97b61c0bb0a0d7c4ac44df0".to_owned(),
             ),
             (
+                "reserved",
                 208,
                 "e4f4ffe964945231024f5a04153a9d053ea06a7ea72001d15e10818b241b5b2a".to_owned(),
             ),
             (
+                "committing",
+                244,
+                "5be3f35b96e3661e260e324e4677646d3b307b9875788fbcde878456c0b8cc6c".to_owned(),
+            ),
+            (
+                "charged",
+                404,
+                "ba7f6424bd29a877b2c6340bec025a9fa4104a2fa714bcc659c706a98216052b".to_owned(),
+            ),
+            (
+                "expired",
+                198,
+                "13e321bf6f8e5a6f4269c8357895d4a8fcad85fa6bf9774d5cb33b408edcd002".to_owned(),
+            ),
+            (
+                "conflicting",
+                410,
+                "ad418e0b33cf2cff783727befc134040bdd9a65c6b99cbed30d8ed7e6338e02e".to_owned(),
+            ),
+            (
+                "stable",
                 26_577,
                 "abb33ed78ae9a6ad7e3cd662078c2c111554824f319fa9a6a5590a1ea1e0656b".to_owned(),
             ),
             (
+                "draining",
+                28_680,
+                "8c8d64774be91cf4d08ed090ace156f5c0d92628b29c6b491f3072e1d8cc9d28".to_owned(),
+            ),
+            (
+                "applying",
                 55_833,
                 "a68775ab3ecacc07c055d584719f3c21b2aad9eb68633ac9a913bc6f59656290".to_owned(),
             ),
@@ -477,17 +547,22 @@ fn redistribution_preserves_historical_rows_and_uses_current_tenant_accounts() {
 fn current_shard_view_binds_control_budget_epoch_and_exact_catalog_accounts() {
     let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
     let shard = shard_with(vec![reserved_reservation()]);
+    let shard_object = exact_shard_ref(&shard, &prefix);
     let page = tenant_page_with_slice(shard.shard as usize, 1_000);
     let mut control = stable_control(&prefix);
     control.tenant_catalog = Some(tenant_page_ref(&prefix, &page));
     validate_capacity_shard_catalog(&shard, &page, &prefix).unwrap();
-    validate_capacity_current_shard_view(&control, &page, &shard, &prefix).unwrap();
-    validate_capacity_admission_view(&control, &page, &shard, &prefix).unwrap();
+    validate_capacity_current_shard_view(&control, &page, &shard, &shard_object, &prefix).unwrap();
+    validate_capacity_admission_view(&control, &page, &shard, &shard_object, &prefix).unwrap();
 
     let mut preparing = preparing_control(&prefix, RedistributionPhase::Draining);
     preparing.tenant_catalog = Some(tenant_page_ref(&prefix, &page));
-    validate_capacity_current_shard_view(&preparing, &page, &shard, &prefix).unwrap();
-    assert!(validate_capacity_admission_view(&preparing, &page, &shard, &prefix).is_err());
+    validate_capacity_current_shard_view(&preparing, &page, &shard, &shard_object, &prefix)
+        .unwrap();
+    assert!(
+        validate_capacity_admission_view(&preparing, &page, &shard, &shard_object, &prefix)
+            .is_err()
+    );
 
     for current_slice in [999, 1_001] {
         let wrong_page = tenant_page_with_slice(shard.shard as usize, current_slice);
@@ -512,16 +587,33 @@ fn current_shard_view_binds_control_budget_epoch_and_exact_catalog_accounts() {
     let mut wrong_epoch = shard.clone();
     wrong_epoch.allocation_epoch += 1;
     wrong_epoch.reservations[0].allocation_epoch += 1;
-    assert!(validate_capacity_current_shard_view(&control, &page, &wrong_epoch, &prefix).is_err());
+    let wrong_epoch_object = exact_shard_ref(&wrong_epoch, &prefix);
+    assert!(
+        validate_capacity_current_shard_view(
+            &control,
+            &page,
+            &wrong_epoch,
+            &wrong_epoch_object,
+            &prefix,
+        )
+        .is_err()
+    );
     let budget_page = tenant_page_with_slice(shard.shard as usize, 999);
     let mut budget_control = control.clone();
     budget_control.tenant_catalog = Some(tenant_page_ref(&prefix, &budget_page));
     let mut wrong_budget = shard.clone();
     wrong_budget.budget_bytes = 999;
     wrong_budget.tenant_accounts[0].current_slice_bytes = 999;
+    let wrong_budget_object = exact_shard_ref(&wrong_budget, &prefix);
     assert!(
-        validate_capacity_current_shard_view(&budget_control, &budget_page, &wrong_budget, &prefix)
-            .is_err()
+        validate_capacity_current_shard_view(
+            &budget_control,
+            &budget_page,
+            &wrong_budget,
+            &wrong_budget_object,
+            &prefix,
+        )
+        .is_err()
     );
 
     let mut historical = charged_reservation(&prefix);
@@ -532,6 +624,261 @@ fn current_shard_view_binds_control_budget_epoch_and_exact_catalog_accounts() {
     redistributed.tenant_accounts[0].current_slice_bytes = 100;
     let current_page = tenant_page_with_slice(redistributed.shard as usize, 100);
     validate_capacity_shard_catalog(&redistributed, &current_page, &prefix).unwrap();
+}
+
+#[test]
+fn retained_and_mutable_shard_object_gates_keep_provider_proofs_distinct() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    let historical = shard_at_epoch(Vec::new(), 1);
+    let historical_object = exact_shard_ref(&historical, &prefix);
+    for mut control in [
+        stable_control(&prefix),
+        preparing_control(&prefix, RedistributionPhase::Draining),
+        preparing_control(&prefix, RedistributionPhase::Applying),
+    ] {
+        control.shard_budgets[historical.shard as usize].shard_object =
+            Some(historical_object.clone());
+        validate_capacity_retained_shard_budget_object(&control, &historical, &prefix).unwrap();
+
+        let mut current = historical.clone();
+        current.control_revision += 1;
+        let mut current_object = exact_shard_ref(&current, &prefix);
+        current_object.object_version_id = Bytes::from_static(b"newer-current-version");
+        assert_ne!(
+            current_object.object_version_id,
+            historical_object.object_version_id
+        );
+        validate_capacity_current_shard_object(&control, &current, &current_object, &prefix)
+            .unwrap();
+        assert!(
+            validate_capacity_retained_shard_budget_object(&control, &current, &prefix).is_err()
+        );
+
+        let mut wrong_body_ref = current_object.clone();
+        let mut wrong_digest = wrong_body_ref.digest.to_vec();
+        wrong_digest[0] ^= 1;
+        wrong_body_ref.digest = Bytes::from(wrong_digest);
+        assert!(
+            validate_capacity_current_shard_object(&control, &current, &wrong_body_ref, &prefix)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn current_epoch_reservations_must_repeat_the_exact_account_and_page_slice() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    for reservation in [reserved_reservation(), committing_reservation()] {
+        let mut shard = shard_with(vec![reservation]);
+        shard.tenant_accounts[0].current_slice_bytes = 999;
+        let page = tenant_page_with_slice(shard.shard as usize, 999);
+        let mut control = stable_control(&prefix);
+        control.tenant_catalog = Some(tenant_page_ref(&prefix, &page));
+        let object = exact_shard_ref(&shard, &prefix);
+        assert!(validate_capacity_shard(&shard, &prefix).is_ok());
+        assert!(validate_capacity_shard_catalog(&shard, &page, &prefix).is_err());
+        assert!(
+            validate_capacity_current_shard_view(&control, &page, &shard, &object, &prefix)
+                .is_err()
+        );
+    }
+
+    let mut historical = charged_reservation(&prefix);
+    historical.allocation_epoch = 1;
+    historical.tenant_slice_bytes = 1_000;
+    let mut current = shard_at_epoch(vec![historical], 2);
+    current.tenant_accounts[0].current_slice_bytes = 999;
+    let page = tenant_page_with_slice(current.shard as usize, 999);
+    validate_capacity_shard_catalog(&current, &page, &prefix).unwrap();
+}
+
+#[test]
+fn shard_successor_closes_time_revision_and_state_transitions() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    let empty = shard_at_epoch(Vec::new(), 1);
+    validate_capacity_shard_successor(&empty, &empty, 1_000, &prefix).unwrap();
+
+    let mut reserved = shard_with(vec![reserved_reservation()]);
+    reserved.control_revision = 2;
+    validate_capacity_shard_successor(&empty, &reserved, 1_000, &prefix).unwrap();
+    assert!(validate_capacity_shard_successor(&empty, &reserved, 999, &prefix).is_err());
+    assert!(validate_capacity_shard_successor(&empty, &reserved, 1_900, &prefix).is_err());
+
+    let mut committing = reserved.clone();
+    committing.control_revision = 3;
+    committing.reservations[0] = committing_reservation();
+    validate_capacity_shard_successor(&reserved, &committing, 1_100, &prefix).unwrap();
+
+    let mut charged = committing.clone();
+    charged.control_revision = 4;
+    charged.reservations[0] = charged_reservation(&prefix);
+    validate_capacity_shard_successor(&committing, &charged, 1_100, &prefix).unwrap();
+
+    let mut conflicting = shard_with(vec![conflicting_reservation(&prefix)]);
+    conflicting.control_revision = 4;
+    validate_capacity_shard_successor(&committing, &conflicting, 1_100, &prefix).unwrap();
+
+    let mut expired = shard_with(vec![expired_reservation()]);
+    expired.control_revision = 3;
+    validate_capacity_shard_successor(&reserved, &expired, 1_900, &prefix).unwrap();
+
+    let mut wrong_window = expired.clone();
+    let Some(CapacityReservationPayload::Aborted(aborted)) =
+        wrong_window.reservations[0].state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::Expired(proof)) = aborted.proof.as_mut() else {
+        panic!("expired proof")
+    };
+    proof.observed_now_unix_seconds = 1_901;
+    assert!(validate_capacity_shard_successor(&reserved, &wrong_window, 1_900, &prefix).is_err());
+
+    let mut changed_commit = charged.clone();
+    let Some(CapacityReservationPayload::Charged(payload)) =
+        changed_commit.reservations[0].state_payload.as_mut()
+    else {
+        panic!("charged payload")
+    };
+    payload.commit.as_mut().unwrap().mutation_id = uuid(CONFLICTING_MUTATION_ID);
+    assert!(
+        validate_capacity_shard_successor(&committing, &changed_commit, 1_100, &prefix).is_err()
+    );
+
+    let mut terminal_changed = charged.clone();
+    terminal_changed.control_revision += 1;
+    let Some(CapacityReservationPayload::Charged(payload)) =
+        terminal_changed.reservations[0].state_payload.as_mut()
+    else {
+        panic!("charged payload")
+    };
+    payload.landed_control.as_mut().unwrap().object_version_id =
+        Bytes::from_static(b"different-version");
+    assert!(
+        validate_capacity_shard_successor(&charged, &terminal_changed, 1_100, &prefix).is_err()
+    );
+
+    let mut revision_gap = committing;
+    revision_gap.control_revision += 1;
+    assert!(validate_capacity_shard_successor(&reserved, &revision_gap, 1_100, &prefix).is_err());
+}
+
+#[test]
+fn terminal_repo_control_proofs_bind_exact_body_provider_mutation_and_writer() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+
+    let mut charged = charged_reservation(&prefix);
+    let mut landed = repo_control_for_reservation(&charged, MUTATION_ID, 1, &prefix);
+    let observed = exact_landed_control_ref(&landed, b"landed-v1");
+    let Some(CapacityReservationPayload::Charged(payload)) = charged.state_payload.as_mut() else {
+        panic!("charged payload")
+    };
+    payload.landed_control = Some(observed.clone());
+    validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).unwrap();
+
+    landed.last_internal_mutation_id = uuid(CONFLICTING_MUTATION_ID);
+    assert!(validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).is_err());
+    landed.last_internal_mutation_id = uuid(MUTATION_ID);
+    landed.writer.as_mut().unwrap().epoch = 2;
+    assert!(validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).is_err());
+    landed.writer.as_mut().unwrap().epoch = 1;
+    landed.inline_settings = Bytes::from_static(b"body-changed");
+    assert!(validate_capacity_charged_repo_control(&charged, &landed, &observed, &prefix).is_err());
+
+    let landed = repo_control_for_reservation(&charged, MUTATION_ID, 1, &prefix);
+    let mut wrong_identity = landed.clone();
+    wrong_identity.identity.as_mut().unwrap().project_id = Bytes::from_static(b"other-project");
+    assert!(
+        validate_capacity_charged_repo_control(&charged, &wrong_identity, &observed, &prefix)
+            .is_err()
+    );
+    let mut wrong_provider = observed.clone();
+    wrong_provider.object_version_id = Bytes::from_static(b"wrong-provider-version");
+    assert!(
+        validate_capacity_charged_repo_control(&charged, &landed, &wrong_provider, &prefix)
+            .is_err()
+    );
+    let mut wrong_digest = observed.clone();
+    let mut digest = wrong_digest.digest.to_vec();
+    digest[0] ^= 1;
+    wrong_digest.digest = Bytes::from(digest);
+    let mut wrong_digest_reservation = charged.clone();
+    let Some(CapacityReservationPayload::Charged(payload)) =
+        wrong_digest_reservation.state_payload.as_mut()
+    else {
+        panic!("charged payload")
+    };
+    payload.landed_control = Some(wrong_digest.clone());
+    assert!(
+        validate_capacity_charged_repo_control(
+            &wrong_digest_reservation,
+            &landed,
+            &wrong_digest,
+            &prefix,
+        )
+        .is_err()
+    );
+    let mut wrong_size = observed.clone();
+    wrong_size.size += 1;
+    let mut wrong_size_reservation = charged.clone();
+    let Some(CapacityReservationPayload::Charged(payload)) =
+        wrong_size_reservation.state_payload.as_mut()
+    else {
+        panic!("charged payload")
+    };
+    payload.landed_control = Some(wrong_size.clone());
+    assert!(
+        validate_capacity_charged_repo_control(
+            &wrong_size_reservation,
+            &landed,
+            &wrong_size,
+            &prefix,
+        )
+        .is_err()
+    );
+
+    let mut takeover = charged.clone();
+    {
+        let Some(CapacityReservationPayload::Charged(payload)) = takeover.state_payload.as_mut()
+        else {
+            panic!("charged payload")
+        };
+        payload.commit.as_mut().unwrap().kind = MutationKind::WriterTakeover as i32;
+    }
+    let takeover_control = repo_control_for_reservation(&takeover, MUTATION_ID, 2, &prefix);
+    let takeover_ref = exact_landed_control_ref(&takeover_control, b"takeover-v1");
+    let Some(CapacityReservationPayload::Charged(payload)) = takeover.state_payload.as_mut() else {
+        panic!("charged payload")
+    };
+    payload.landed_control = Some(takeover_ref.clone());
+    validate_capacity_charged_repo_control(&takeover, &takeover_control, &takeover_ref, &prefix)
+        .unwrap();
+
+    let mut conflict = conflicting_reservation(&prefix);
+    let conflicting_control =
+        repo_control_for_reservation(&conflict, CONFLICTING_MUTATION_ID, 1, &prefix);
+    let conflicting_ref = exact_landed_control_ref(&conflicting_control, b"conflict-v1");
+    set_conflicting_control(&mut conflict, conflicting_ref.clone());
+    validate_capacity_conflicting_repo_control(
+        &conflict,
+        &conflicting_control,
+        &conflicting_ref,
+        &prefix,
+    )
+    .unwrap();
+
+    let wrong_epoch = repo_control_for_reservation(&conflict, CONFLICTING_MUTATION_ID, 2, &prefix);
+    let wrong_epoch_ref = exact_landed_control_ref(&wrong_epoch, b"conflict-v2");
+    set_conflicting_control(&mut conflict, wrong_epoch_ref.clone());
+    assert!(
+        validate_capacity_conflicting_repo_control(
+            &conflict,
+            &wrong_epoch,
+            &wrong_epoch_ref,
+            &prefix,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -801,6 +1148,149 @@ fn strict_capacity_roots_reject_unknown_duplicate_wrong_wire_and_corruption() {
     assert!(preflight_capacity_control(&dual_oneof).is_err());
 }
 
+#[test]
+fn capacity_raw_preflight_freezes_oneof_arms_root_sizes_and_repeated_counts() {
+    let prefix = DeploymentPrefix::parse(PREFIX).unwrap();
+    for reservation in [
+        reserved_reservation(),
+        committing_reservation(),
+        charged_reservation(&prefix),
+        expired_reservation(),
+        conflicting_reservation(&prefix),
+    ] {
+        preflight_capacity_shard(&shard_with(vec![reservation]).encode_to_vec()).unwrap();
+    }
+    for control in [
+        stable_control(&prefix),
+        preparing_control(&prefix, RedistributionPhase::Draining),
+        preparing_control(&prefix, RedistributionPhase::Applying),
+    ] {
+        preflight_capacity_control(&control.encode_to_vec()).unwrap();
+    }
+
+    for (maximum, preflight) in [
+        (
+            MAX_TENANT_CAPACITY_CATALOG_BYTES,
+            preflight_tenant_capacity_catalog_page as fn(&[u8]) -> Result<(), ControlCodecError>,
+        ),
+        (MAX_CAPACITY_SHARD_BYTES, preflight_capacity_shard),
+        (MAX_CAPACITY_CONTROL_BYTES, preflight_capacity_control),
+    ] {
+        assert!(!matches!(
+            preflight(&vec![0; maximum]),
+            Err(ControlCodecError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            preflight(&vec![0; maximum + 1]),
+            Err(ControlCodecError::MessageTooLarge {
+                maximum: actual,
+                ..
+            }) if actual == maximum
+        ));
+    }
+
+    let allocation = raw_repeated_message(3, &[], 256);
+    let page = raw_repeated_message(2, &allocation, 1);
+    preflight_tenant_capacity_catalog_page(&page).unwrap();
+    assert!(
+        preflight_tenant_capacity_catalog_page(&raw_repeated_message(
+            2,
+            &raw_repeated_message(3, &[], 255),
+            1,
+        ))
+        .is_err()
+    );
+    assert!(
+        preflight_tenant_capacity_catalog_page(&raw_repeated_message(
+            2,
+            &raw_repeated_message(3, &[], 257),
+            1,
+        ))
+        .is_err()
+    );
+    let maximum_allocation_count = raw_repeated_message(2, &allocation, 4_096);
+    assert!(maximum_allocation_count.len() > MAX_TENANT_CAPACITY_CATALOG_BYTES);
+    assert!(matches!(
+        preflight_tenant_capacity_catalog_page(&maximum_allocation_count),
+        Err(ControlCodecError::MessageTooLarge {
+            maximum: MAX_TENANT_CAPACITY_CATALOG_BYTES,
+            ..
+        })
+    ));
+
+    preflight_capacity_shard(&raw_repeated_message(6, &[], 4_096)).unwrap();
+    assert!(preflight_capacity_shard(&raw_repeated_message(6, &[], 4_097)).is_err());
+    preflight_capacity_shard(&raw_repeated_message(7, &[], 4_096)).unwrap();
+    assert!(preflight_capacity_shard(&raw_repeated_message(7, &[], 4_097)).is_err());
+
+    let control_budgets = raw_repeated_message(8, &[], 256);
+    preflight_capacity_control(&control_budgets).unwrap();
+    assert!(preflight_capacity_control(&raw_repeated_message(8, &[], 255)).is_err());
+    assert!(preflight_capacity_control(&raw_repeated_message(8, &[], 257)).is_err());
+
+    let mut redistribution = raw_repeated_message(5, &[], 256);
+    redistribution.extend(raw_repeated_message(7, &[], 256));
+    let mut applying = control_budgets.clone();
+    push_length_delimited(&mut applying, 10, &redistribution);
+    preflight_capacity_control(&applying).unwrap();
+    let mut too_many_baselines = raw_repeated_message(5, &[], 256);
+    too_many_baselines.extend(raw_repeated_message(7, &[], 257));
+    let mut applying = control_budgets.clone();
+    push_length_delimited(&mut applying, 10, &too_many_baselines);
+    assert!(preflight_capacity_control(&applying).is_err());
+
+    let mut dual_reservation = reserved_reservation().encode_to_vec();
+    push_length_delimited(&mut dual_reservation, 9, &[]);
+    assert!(preflight_capacity_shard(&raw_repeated_message(7, &dual_reservation, 1)).is_err());
+
+    let mut dual_aborted = AbortedCapacityReservation {
+        proof: Some(aborted_capacity_reservation::Proof::Expired(
+            ExpiredCapacityReservation {
+                created_at_unix_seconds: 1_000,
+                expires_at_unix_seconds: 1_900,
+                observed_now_unix_seconds: 1_900,
+            },
+        )),
+    }
+    .encode_to_vec();
+    push_length_delimited(&mut dual_aborted, 2, &[]);
+    let mut raw_aborted_reservation = expired_reservation();
+    raw_aborted_reservation.state_payload = None;
+    let mut raw_aborted_reservation = raw_aborted_reservation.encode_to_vec();
+    push_length_delimited(&mut raw_aborted_reservation, 11, &dual_aborted);
+    assert!(
+        preflight_capacity_shard(&raw_repeated_message(7, &raw_aborted_reservation, 1)).is_err()
+    );
+
+    let mut dual_commit = commit_binding();
+    dual_commit.predecessor = None;
+    let mut dual_commit = dual_commit.encode_to_vec();
+    push_length_delimited(&mut dual_commit, 4, &[]);
+    push_length_delimited(
+        &mut dual_commit,
+        5,
+        &PriorControlBinding {
+            cas_token: Bytes::from_static(b"cas-1"),
+            object_version_id: Bytes::from_static(b"repo-v1"),
+        }
+        .encode_to_vec(),
+    );
+    let mut committing_payload = Vec::new();
+    push_length_delimited(&mut committing_payload, 1, &dual_commit);
+    let mut raw_committing_reservation = committing_reservation();
+    raw_committing_reservation.state_payload = None;
+    let mut raw_committing_reservation = raw_committing_reservation.encode_to_vec();
+    push_length_delimited(&mut raw_committing_reservation, 9, &committing_payload);
+    assert!(
+        preflight_capacity_shard(&raw_repeated_message(7, &raw_committing_reservation, 1)).is_err()
+    );
+
+    let mut dual_control = control_budgets;
+    push_length_delimited(&mut dual_control, 9, &[]);
+    push_length_delimited(&mut dual_control, 10, &redistribution);
+    assert!(preflight_capacity_control(&dual_control).is_err());
+}
+
 fn stable_control(prefix: &DeploymentPrefix) -> CapacityControl {
     let page = tenant_page();
     CapacityControl {
@@ -1029,6 +1519,19 @@ fn conflicting_reservation(prefix: &DeploymentPrefix) -> CapacityReservation {
     )
 }
 
+fn set_conflicting_control(reservation: &mut CapacityReservation, control: LandedControlRef) {
+    let Some(CapacityReservationPayload::Aborted(aborted)) = reservation.state_payload.as_mut()
+    else {
+        panic!("aborted payload")
+    };
+    let Some(aborted_capacity_reservation::Proof::ConflictingCommit(proof)) =
+        aborted.proof.as_mut()
+    else {
+        panic!("conflict proof")
+    };
+    proof.conflicting_control = Some(control);
+}
+
 fn reservation(
     state: CapacityReservationState,
     payload: CapacityReservationPayload,
@@ -1088,6 +1591,39 @@ fn identity() -> RepositoryIdentity {
     }
 }
 
+fn repo_control_for_reservation(
+    reservation: &CapacityReservation,
+    mutation_id: &str,
+    writer_epoch: u64,
+    prefix: &DeploymentPrefix,
+) -> RepoControl {
+    let mut control = support::sample_control();
+    let identity = reservation.identity.clone().unwrap();
+    let routing = RoutingDigest::of(&identity.canonical_path).unwrap();
+    let shard = Sha256::digest(&identity.repository_uuid)[0];
+    control.identity = Some(identity);
+    control.repo_control_key = Bytes::from(repo_control_key(prefix, routing).unwrap());
+    control.last_internal_mutation_id = uuid(mutation_id);
+    control.writer.as_mut().unwrap().epoch = writer_epoch;
+    let capacity = control.capacity.as_mut().unwrap();
+    capacity.allocation_epoch = reservation.allocation_epoch;
+    capacity.shard = u32::from(shard);
+    capacity.shard_key = Bytes::from(capacity_shard_key(prefix, shard).unwrap());
+    capacity.shard_budget_bytes = 1_000;
+    capacity.tenant_slice_bytes = reservation.tenant_slice_bytes;
+    control
+}
+
+fn exact_landed_control_ref(control: &RepoControl, object_version_id: &[u8]) -> LandedControlRef {
+    let encoded = encode_repo_control(control).unwrap();
+    LandedControlRef {
+        repo_control_key: control.repo_control_key.clone(),
+        object_version_id: Bytes::copy_from_slice(object_version_id),
+        digest: Bytes::copy_from_slice(&Sha256::digest(&encoded)),
+        size: encoded.len() as u64,
+    }
+}
+
 fn different_identity_same_shard() -> RepositoryIdentity {
     let original = hex::decode(REPOSITORY_UUID).unwrap();
     let wanted = Sha256::digest(&original)[0];
@@ -1116,4 +1652,26 @@ fn different_identity_same_shard() -> RepositoryIdentity {
 
 fn uuid(value: &str) -> Bytes {
     Bytes::from(hex::decode(value).unwrap())
+}
+
+fn raw_repeated_message(field_number: u32, payload: &[u8], count: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..count {
+        push_length_delimited(&mut bytes, field_number, payload);
+    }
+    bytes
+}
+
+fn push_length_delimited(bytes: &mut Vec<u8>, field_number: u32, payload: &[u8]) {
+    push_varint(bytes, u64::from(field_number) << 3 | 2);
+    push_varint(bytes, payload.len() as u64);
+    bytes.extend_from_slice(payload);
+}
+
+fn push_varint(bytes: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        bytes.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
 }

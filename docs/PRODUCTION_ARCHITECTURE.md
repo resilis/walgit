@@ -1195,12 +1195,21 @@ original allocation epoch and tenant slice without rewriting. Therefore rows
 from older epochs remain exact receipt proofs after redistribution, and mixed
 historical slices are valid when their aggregate fits the current account.
 `ABORTED` does not charge and an `ABORTED`-only tenant has no account.
-After exact page and shard loads, the current-shard-view validator also requires
-the shard epoch and budget to equal the retained current control plan and every
-account to equal that tenant's exact slice for the selected shard. It does not
-compare the mutable current shard `ObjectVersionID` with the historical STABLE
-epoch-start proof. The admission-specific wrapper additionally requires
-`STABLE`; PREPARING can use the general view only for terminal drainage.
+The future controller uses two distinct exact shard-object gates. The retained-
+budget gate loads the body rooted by the matching
+`CapacityShardBudget.shard_object` and binds its shard, prior allocation epoch,
+and budget. It works for `STABLE` and for the retained prior plan in both
+`PREPARING/DRAINING` and `PREPARING/APPLYING`. The mutable-current gate instead
+binds the loaded body to caller-observed provider key, `ObjectVersionID`,
+digest, and size, then compares shard, retained current epoch, and budget. It
+does not compare that mutable metadata with the historical STABLE epoch-start
+proof. After exact page and current-shard loads, the current-shard-view
+validator composes the mutable gate, requires every account to equal that
+tenant's exact page slice for the selected shard, and requires every current-
+epoch non-`ABORTED` reservation to repeat the same slice. Historical terminal
+rows keep their earlier proof slice. The admission-specific wrapper
+additionally requires `STABLE`; PREPARING can use the general view only for
+terminal drainage.
 
 Redistribution uses the closed control states and phases
 `STABLE(e) -> PREPARING/DRAINING(e+1) -> PREPARING/APPLYING(e+1) ->
@@ -1239,8 +1248,10 @@ can use the same UUID in its independent namespace.
 A reservation moves through these states:
 
 1. `RESERVED` is provisional. It records explicit creation and expiry seconds,
-   with `created < expires` and a checked maximum lifetime of 900 seconds. No
-   validator reads a clock.
+   with `created < expires` and a checked maximum lifetime of 900 seconds. The
+   shard successor validator receives caller-observed `now` and accepts a new
+   row only when `created <= now < expires`; it rejects future-dated creation.
+   No validator reads a clock.
 2. `COMMITTING` is non-expiring and binds writer epoch, mutation ID, kind, and
    a closed predecessor. `CREATE` requires explicit `NONE`; every other
    non-settlement kind requires the prior control `CasToken` and
@@ -1251,6 +1262,25 @@ A reservation moves through these states:
    the original creation/expiry window and records an observed `now >= expiry`.
    Conflict repeats the exact commit binding and records the durable conflicting
    landed control and mutation that makes the expected CAS impossible.
+
+The public shard successor validator accepts a byte-exact retry without a new
+revision. Every real successor advances `control_revision` by exactly one and
+changes exactly one reservation through `RESERVED -> COMMITTING`,
+`RESERVED -> ABORTED(expired)`, `COMMITTING -> CHARGED`, or
+`COMMITTING -> ABORTED(conflict)`. It preserves the shard, allocation epoch,
+budget, immutable reservation fields, all untouched rows, and all unaffected
+accounts. Expiry repeats the exact reserved window and binds the supplied
+observed `now`. Terminal rows and same-state rows cannot change.
+
+CHARGED and conflicting-commit ABORTED require a second public composition
+gate after an exact strict `RepoControl` load. The caller supplies the observed
+provider binding. The gate requires it to equal the persisted
+`LandedControlRef`, hashes the canonical control body, and binds exact key,
+`ObjectVersionID`, digest, size, repository identity, last internal mutation,
+and writer epoch. CHARGED writer takeover binds landed epoch `E+1`; other
+CHARGED mutations bind `E`. A conflicting proof does not carry the conflicting
+mutation kind, so this schema proves only a landed conflict at the expected
+authorizing epoch `E`; a competing takeover remains fail-closed and deferred.
 
 A lost result after the control CAS is success. Reconciliation uses the
 control receipt and exact object version to finish `CHARGED`. It resumes a
