@@ -184,6 +184,206 @@ fn credential_control_has_the_exact_v5_9_tags_presence_and_bounds() {
     assert_eq!(option(&pool, revoked.options(), "walgit.v2.max_items"), 64);
 }
 
+#[test]
+fn mutation_receipt_schema_has_the_frozen_numeric_contract() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    let kinds = pool.get_enum_by_name("walgit.v2.MutationKind").unwrap();
+    let expected = [
+        ("MUTATION_KIND_UNSPECIFIED", 0),
+        ("MUTATION_KIND_CREATE", 1),
+        ("MUTATION_KIND_PUSH", 2),
+        ("MUTATION_KIND_REF_UPDATE", 3),
+        ("MUTATION_KIND_LFS_FINALIZE", 4),
+        ("MUTATION_KIND_POLICY", 5),
+        ("MUTATION_KIND_SETTINGS", 6),
+        ("MUTATION_KIND_GRANTS", 7),
+        ("MUTATION_KIND_LIFECYCLE", 8),
+        ("MUTATION_KIND_CHECKPOINT", 9),
+        ("MUTATION_KIND_COMPACTION", 10),
+        ("MUTATION_KIND_BUNDLE", 11),
+        ("MUTATION_KIND_FOLLOW", 12),
+        ("MUTATION_KIND_IMPORT", 13),
+        ("MUTATION_KIND_REPAIR", 14),
+        ("MUTATION_KIND_PIN", 15),
+        ("MUTATION_KIND_EVENT", 16),
+        ("MUTATION_KIND_RECLAMATION", 17),
+        ("MUTATION_KIND_WRITER_TAKEOVER", 18),
+        ("MUTATION_KIND_INTERNAL_SETTLEMENT", 19),
+    ];
+    assert_eq!(
+        kinds
+            .values()
+            .map(|value| (value.name().to_string(), value.number()))
+            .collect::<Vec<_>>(),
+        expected
+            .into_iter()
+            .map(|(name, number)| (name.to_string(), number))
+            .collect::<Vec<_>>()
+    );
+
+    let states = pool.get_enum_by_name("walgit.v2.ReceiptState").unwrap();
+    assert_eq!(
+        states
+            .values()
+            .map(|value| (value.name().to_string(), value.number()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("RECEIPT_STATE_UNSPECIFIED".to_string(), 0),
+            ("RECEIPT_STATE_UNRESOLVED".to_string(), 1),
+            ("RECEIPT_STATE_SETTLED".to_string(), 2),
+        ]
+    );
+
+    for message in [
+        "MutationReceipt",
+        "MutationResult",
+        "ReceiptCatalogRow",
+        "ReceiptCatalog",
+    ] {
+        assert!(
+            pool.get_message_by_name(&format!("walgit.v2.{message}"))
+                .is_some(),
+            "missing {message}"
+        );
+    }
+
+    assert_fields(&pool, "NoPriorControl", &[]);
+    assert_fields(
+        &pool,
+        "PriorControlBinding",
+        &[("cas_token", 1, "bytes"), ("object_version_id", 2, "bytes")],
+    );
+    assert_fields(&pool, "NoCapacityObligation", &[]);
+    assert_fields(
+        &pool,
+        "CapacityObligation",
+        &[
+            ("allocation_epoch", 1, "uint64"),
+            ("shard_key", 2, "bytes"),
+            ("shard_object_version_id", 3, "bytes"),
+            ("reservation_id", 4, "bytes"),
+            ("tenant_slice_bytes", 5, "uint64"),
+            ("mutation_id", 6, "bytes"),
+            ("byte_count", 7, "uint64"),
+        ],
+    );
+    assert_fields(&pool, "NoEventObligation", &[]);
+    assert_fields(
+        &pool,
+        "EventSubscriberBody",
+        &[("digest", 1, "bytes"), ("size", 2, "uint64")],
+    );
+    assert_fields(
+        &pool,
+        "EventObligation",
+        &[
+            ("event_id", 1, "bytes"),
+            ("wal_sequence", 2, "uint64"),
+            ("subscriber_set_digest", 3, "bytes"),
+            ("result_key", 4, "bytes"),
+            ("subscriber_bodies", 5, "message"),
+        ],
+    );
+    assert_fields(
+        &pool,
+        "MutationReceipt",
+        &[
+            ("schema_version", 1, "uint32"),
+            ("identity", 2, "message"),
+            ("mutation_id", 3, "bytes"),
+            ("kind", 4, "enum"),
+            ("writer_epoch", 5, "uint64"),
+            ("wal_sequence", 6, "uint64"),
+            ("request_digest", 7, "bytes"),
+            ("immutable_dependency_digests", 8, "bytes"),
+            ("no_prior_control", 9, "message"),
+            ("prior_control", 10, "message"),
+            ("no_capacity", 11, "message"),
+            ("capacity", 12, "message"),
+            ("no_event", 13, "message"),
+            ("event", 14, "message"),
+        ],
+    );
+    assert_fields(
+        &pool,
+        "LandedControlRef",
+        &[
+            ("repo_control_key", 1, "bytes"),
+            ("object_version_id", 2, "bytes"),
+            ("digest", 3, "bytes"),
+            ("size", 4, "uint64"),
+        ],
+    );
+    assert_fields(
+        &pool,
+        "MutationResult",
+        &[
+            ("schema_version", 1, "uint32"),
+            ("identity", 2, "message"),
+            ("mutation_id", 3, "bytes"),
+            ("kind", 4, "enum"),
+            ("landed_control", 5, "message"),
+            ("landed_control_revision", 6, "uint64"),
+            ("writer_epoch", 7, "uint64"),
+            ("wal_sequence", 8, "uint64"),
+        ],
+    );
+    assert_fields(
+        &pool,
+        "ReceiptCatalogRow",
+        &[
+            ("mutation_id", 1, "bytes"),
+            ("state", 2, "enum"),
+            ("receipt", 3, "message"),
+            ("result", 4, "message"),
+            ("settlement_mutation_id", 5, "bytes"),
+        ],
+    );
+    assert_fields(
+        &pool,
+        "ReceiptCatalog",
+        &[
+            ("schema_version", 1, "uint32"),
+            ("identity", 2, "message"),
+            ("rows", 3, "message"),
+        ],
+    );
+    let catalog = pool
+        .get_message_by_name("walgit.v2.ReceiptCatalog")
+        .unwrap();
+    assert_eq!(
+        option(&pool, catalog.options(), "walgit.v2.max_encoded_bytes"),
+        524_288
+    );
+}
+
+fn assert_fields(pool: &DescriptorPool, message: &str, expected: &[(&str, u32, &str)]) {
+    let message = pool
+        .get_message_by_name(&format!("walgit.v2.{message}"))
+        .unwrap();
+    let actual = message
+        .fields()
+        .map(|field| {
+            let kind = match field.kind() {
+                Kind::Uint32 => "uint32",
+                Kind::Uint64 => "uint64",
+                Kind::Bytes => "bytes",
+                Kind::Enum(_) => "enum",
+                Kind::Message(_) => "message",
+                other => panic!("unexpected field kind {other:?}"),
+            };
+            (field.name().to_owned(), field.number(), kind)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(name, number, kind)| ((*name).to_owned(), *number, *kind))
+            .collect::<Vec<_>>()
+    );
+}
+
 fn option(pool: &DescriptorPool, options: prost_reflect::DynamicMessage, name: &str) -> u64 {
     let extension = pool.get_extension_by_name(name).unwrap();
     assert!(options.has_extension(&extension));

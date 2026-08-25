@@ -1,0 +1,19 @@
+[package]
+name = "walgit-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+hex.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+walgit-identity.workspace = true
+walgit-proto.workspace = true
+walgit-store.workspace = true
+
+[dev-dependencies]
+ed25519-dalek.workspace = true
+prost.workspace = true
+tokio.workspace = true

@@ -71,6 +71,37 @@ enum ReclamationPhase {
   RECLAMATION_PHASE_VERIFYING = 4;
 }
 
+// Persisted numeric values are frozen. INTERNAL_SETTLEMENT is the only
+// receiptless repository-control CAS and is never valid in a receipt row.
+enum MutationKind {
+  MUTATION_KIND_UNSPECIFIED = 0;
+  MUTATION_KIND_CREATE = 1;
+  MUTATION_KIND_PUSH = 2;
+  MUTATION_KIND_REF_UPDATE = 3;
+  MUTATION_KIND_LFS_FINALIZE = 4;
+  MUTATION_KIND_POLICY = 5;
+  MUTATION_KIND_SETTINGS = 6;
+  MUTATION_KIND_GRANTS = 7;
+  MUTATION_KIND_LIFECYCLE = 8;
+  MUTATION_KIND_CHECKPOINT = 9;
+  MUTATION_KIND_COMPACTION = 10;
+  MUTATION_KIND_BUNDLE = 11;
+  MUTATION_KIND_FOLLOW = 12;
+  MUTATION_KIND_IMPORT = 13;
+  MUTATION_KIND_REPAIR = 14;
+  MUTATION_KIND_PIN = 15;
+  MUTATION_KIND_EVENT = 16;
+  MUTATION_KIND_RECLAMATION = 17;
+  MUTATION_KIND_WRITER_TAKEOVER = 18;
+  MUTATION_KIND_INTERNAL_SETTLEMENT = 19;
+}
+
+enum ReceiptState {
+  RECEIPT_STATE_UNSPECIFIED = 0;
+  RECEIPT_STATE_UNRESOLVED = 1;
+  RECEIPT_STATE_SETTLED = 2;
+}
+
 message RepositoryIdentity {
   option (max_encoded_bytes) = 2048;
 
@@ -215,6 +246,135 @@ message ReclamationState {
   bytes cursor = 2 [(min_bytes) = 0, (max_bytes) = 4096];
   uint64 pass_objects = 3;
   uint64 pass_bytes = 4;
+}
+
+message NoPriorControl {
+  option (max_encoded_bytes) = 1;
+}
+
+message PriorControlBinding {
+  option (max_encoded_bytes) = 4096;
+
+  bytes cas_token = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+}
+
+message NoCapacityObligation {
+  option (max_encoded_bytes) = 1;
+}
+
+message CapacityObligation {
+  option (max_encoded_bytes) = 8192;
+
+  uint64 allocation_epoch = 1;
+  bytes shard_key = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes shard_object_version_id = 3 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes reservation_id = 4 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 tenant_slice_bytes = 5;
+  bytes mutation_id = 6 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 byte_count = 7;
+}
+
+message NoEventObligation {
+  option (max_encoded_bytes) = 1;
+}
+
+message EventSubscriberBody {
+  option (max_encoded_bytes) = 4096;
+
+  bytes digest = 1 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 2;
+}
+
+message EventObligation {
+  option (max_encoded_bytes) = 65536;
+
+  bytes event_id = 1 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 wal_sequence = 2;
+  bytes subscriber_set_digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes result_key = 4 [(min_bytes) = 1, (max_bytes) = 1024];
+  repeated EventSubscriberBody subscriber_bodies = 5 [(min_items) = 0, (max_items) = 64];
+}
+
+// Every non-settlement mutation persists one core before its publishing CAS.
+// The three oneofs make NONE values explicit rather than empty identifiers.
+message MutationReceipt {
+  option (max_encoded_bytes) = 65536;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  bytes mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  MutationKind kind = 4;
+  uint64 writer_epoch = 5;
+  uint64 wal_sequence = 6;
+  bytes request_digest = 7 [(min_bytes) = 32, (max_bytes) = 32];
+  repeated bytes immutable_dependency_digests = 8 [
+    (min_bytes) = 32,
+    (max_bytes) = 32,
+    (min_items) = 0,
+    (max_items) = 64
+  ];
+
+  oneof predecessor {
+    NoPriorControl no_prior_control = 9;
+    PriorControlBinding prior_control = 10;
+  }
+  oneof capacity_obligation {
+    NoCapacityObligation no_capacity = 11;
+    CapacityObligation capacity = 12;
+  }
+  oneof event_obligation {
+    NoEventObligation no_event = 13;
+    EventObligation event = 14;
+  }
+}
+
+// Exact provider binding for the by-path repo_control authority. It is not a
+// TargetObjectRef because that message is reserved for identity-scoped leaves
+// under the by-id repository root.
+message LandedControlRef {
+  option (max_encoded_bytes) = 4096;
+
+  bytes repo_control_key = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 4;
+}
+
+// Proof of the successful landed repo_control version. This message never
+// contains a reference to its own key or provider metadata.
+message MutationResult {
+  option (max_encoded_bytes) = 65536;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  bytes mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  MutationKind kind = 4;
+  LandedControlRef landed_control = 5;
+  uint64 landed_control_revision = 6;
+  uint64 writer_epoch = 7;
+  uint64 wal_sequence = 8;
+}
+
+// Settlement preserves the receipt core and records both the exact settlement
+// mutation ID and exact result reference. Rows are strictly sorted by
+// mutation_id.
+message ReceiptCatalogRow {
+  option (max_encoded_bytes) = 65536;
+
+  bytes mutation_id = 1 [(min_bytes) = 16, (max_bytes) = 16];
+  ReceiptState state = 2;
+  MutationReceipt receipt = 3;
+  TargetObjectRef result = 4;
+  bytes settlement_mutation_id = 5 [(min_bytes) = 0, (max_bytes) = 16];
+}
+
+message ReceiptCatalog {
+  option (max_encoded_bytes) = 524288;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  repeated ReceiptCatalogRow rows = 3 [(min_items) = 0, (max_items) = 4096];
 }
 
 // The one future repository semantic authority. No V1 runtime path reads or

@@ -4,12 +4,18 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BucketSafetyBinding, CREDENTIAL_CONTROL_SCHEMA_VERSION, CapacityBinding, CatalogKind,
-    CatalogRoot, CredentialControl, GrantRole, Lifecycle, ObjectFormat, PackRoot,
-    REPO_CONTROL_SCHEMA_VERSION, ReclamationPhase, RepoControl, RepositoryGrant,
-    RepositoryIdentity, TargetObjectRef, VerificationRingRoot, Visibility, WalEntryKind, WalState,
+    CatalogRoot, CredentialControl, GrantRole, Lifecycle, MAX_MUTATION_RESULT_BYTES, MutationKind,
+    MutationReceipt, MutationResult, ObjectFormat, PackRoot, RECEIPT_SCHEMA_VERSION,
+    REPO_CONTROL_SCHEMA_VERSION, ReceiptCatalog, ReceiptCatalogRow, ReceiptState, ReclamationPhase,
+    RepoControl, RepositoryGrant, RepositoryIdentity, TargetObjectRef, VerificationRingRoot,
+    Visibility, WalEntryKind, WalState,
     keys::{
         CanonicalPathDigest, DeploymentPrefix, ParsedV2Key, RepositoryKeyIdentity, RoutingDigest,
         V2KeyKind, parse_key, repo_control_key,
+    },
+    mutation_receipt::{
+        CapacityObligation as CapacityObligationChoice, EventObligation as EventObligationChoice,
+        Predecessor,
     },
     repo_control::{GrantRepresentation, PackRepresentation},
     wal_tail_entry::RefRepresentation,
@@ -29,6 +35,268 @@ pub enum CredentialTransitionKind {
     RevokeKid,
     VerifierSetUpdate,
     AcknowledgementUpdate,
+}
+
+pub fn validate_mutation_receipt(receipt: &MutationReceipt) -> Result<(), ControlValidationError> {
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
+        return Err(invalid("receipt.schema_version", "must be exactly 1"));
+    }
+    let identity = receipt
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("receipt.identity"))?;
+    validate_identity(identity)?;
+    validate_uuid_v7("receipt.mutation_id", &receipt.mutation_id)?;
+    let kind =
+        MutationKind::try_from(receipt.kind).map_err(|_| invalid("receipt.kind", "is unknown"))?;
+    if matches!(
+        kind,
+        MutationKind::Unspecified | MutationKind::InternalSettlement
+    ) {
+        return Err(invalid("receipt.kind", "must be a non-settlement mutation"));
+    }
+    nonzero("receipt.writer_epoch", receipt.writer_epoch)?;
+    // Control-only mutations bind the exact current WAL head. That head can
+    // be zero before the repository's first WAL entry.
+    exact_len("receipt.request_digest", &receipt.request_digest, 32)?;
+    if receipt.immutable_dependency_digests.len() > 64 {
+        return Err(invalid(
+            "receipt.immutable_dependency_digests",
+            "exceeds 64 entries",
+        ));
+    }
+    for digest in &receipt.immutable_dependency_digests {
+        exact_len("receipt.immutable_dependency_digests", digest, 32)?;
+    }
+    if receipt
+        .immutable_dependency_digests
+        .windows(2)
+        .any(|pair| pair[0].as_ref() >= pair[1].as_ref())
+    {
+        return Err(invalid(
+            "receipt.immutable_dependency_digests",
+            "must be binary-sorted and unique",
+        ));
+    }
+    match (&receipt.predecessor, kind) {
+        (Some(Predecessor::NoPriorControl(_)), MutationKind::Create) => {}
+        (Some(Predecessor::PriorControl(binding)), MutationKind::Create) => {
+            let _ = binding;
+            return Err(invalid(
+                "receipt.predecessor",
+                "Create requires explicit NONE",
+            ));
+        }
+        (Some(Predecessor::PriorControl(binding)), _) => {
+            bounded_bytes("receipt.prior.cas_token", &binding.cas_token, 1, 256)?;
+            bounded_bytes(
+                "receipt.prior.object_version_id",
+                &binding.object_version_id,
+                1,
+                1024,
+            )?;
+        }
+        (Some(Predecessor::NoPriorControl(_)), _) => {
+            return Err(invalid(
+                "receipt.predecessor",
+                "non-Create requires an exact prior binding",
+            ));
+        }
+        (None, _) => return Err(missing("receipt.predecessor")),
+    }
+    match receipt.capacity_obligation.as_ref() {
+        Some(CapacityObligationChoice::NoCapacity(_)) => {}
+        Some(CapacityObligationChoice::Capacity(capacity)) => {
+            nonzero(
+                "receipt.capacity.allocation_epoch",
+                capacity.allocation_epoch,
+            )?;
+            validate_receipt_capacity_shard_key(identity, &capacity.shard_key)?;
+            bounded_bytes(
+                "receipt.capacity.shard_object_version_id",
+                &capacity.shard_object_version_id,
+                1,
+                1024,
+            )?;
+            validate_uuid_v7("receipt.capacity.reservation_id", &capacity.reservation_id)?;
+            nonzero(
+                "receipt.capacity.tenant_slice_bytes",
+                capacity.tenant_slice_bytes,
+            )?;
+            if capacity.mutation_id != receipt.mutation_id {
+                return Err(invalid(
+                    "receipt.capacity.mutation_id",
+                    "does not equal receipt mutation ID",
+                ));
+            }
+            nonzero("receipt.capacity.byte_count", capacity.byte_count)?;
+        }
+        None => return Err(missing("receipt.capacity_obligation")),
+    }
+    match receipt.event_obligation.as_ref() {
+        Some(EventObligationChoice::NoEvent(_)) => {}
+        Some(EventObligationChoice::Event(event)) => {
+            validate_uuid_v7("receipt.event.event_id", &event.event_id)?;
+            if event.wal_sequence != receipt.wal_sequence {
+                return Err(invalid(
+                    "receipt.event.wal_sequence",
+                    "does not equal receipt WAL sequence",
+                ));
+            }
+            exact_len(
+                "receipt.event.subscriber_set_digest",
+                &event.subscriber_set_digest,
+                32,
+            )?;
+            validate_receipt_event_result_key(identity, &event.event_id, &event.result_key)?;
+            if event.subscriber_bodies.len() > 64 {
+                return Err(invalid(
+                    "receipt.event.subscriber_bodies",
+                    "exceeds 64 entries",
+                ));
+            }
+            for body in &event.subscriber_bodies {
+                exact_len("receipt.event.body.digest", &body.digest, 32)?;
+                nonzero("receipt.event.body.size", body.size)?;
+            }
+            if event.subscriber_bodies.windows(2).any(|pair| {
+                (pair[0].digest.as_ref(), pair[0].size) >= (pair[1].digest.as_ref(), pair[1].size)
+            }) {
+                return Err(invalid(
+                    "receipt.event.subscriber_bodies",
+                    "must be binary-sorted and unique",
+                ));
+            }
+        }
+        None => return Err(missing("receipt.event_obligation")),
+    }
+    Ok(())
+}
+
+pub fn validate_mutation_result(result: &MutationResult) -> Result<(), ControlValidationError> {
+    if result.schema_version != RECEIPT_SCHEMA_VERSION {
+        return Err(invalid("result.schema_version", "must be exactly 1"));
+    }
+    let identity = result
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("result.identity"))?;
+    validate_identity(identity)?;
+    validate_uuid_v7("result.mutation_id", &result.mutation_id)?;
+    let kind =
+        MutationKind::try_from(result.kind).map_err(|_| invalid("result.kind", "is unknown"))?;
+    if matches!(
+        kind,
+        MutationKind::Unspecified | MutationKind::InternalSettlement
+    ) {
+        return Err(invalid("result.kind", "must be a non-settlement mutation"));
+    }
+    let landed = result
+        .landed_control
+        .as_ref()
+        .ok_or_else(|| missing("result.landed_control"))?;
+    validate_repo_control_target(landed, identity)?;
+    nonzero(
+        "result.landed_control_revision",
+        result.landed_control_revision,
+    )?;
+    nonzero("result.writer_epoch", result.writer_epoch)?;
+    // The result binds the exact landed WAL head. It can be zero before the
+    // repository's first WAL entry for any non-settlement mutation kind.
+    Ok(())
+}
+
+pub fn validate_receipt_catalog(catalog: &ReceiptCatalog) -> Result<(), ControlValidationError> {
+    if catalog.schema_version != RECEIPT_SCHEMA_VERSION {
+        return Err(invalid(
+            "receipt_catalog.schema_version",
+            "must be exactly 1",
+        ));
+    }
+    let identity = catalog
+        .identity
+        .as_ref()
+        .ok_or_else(|| missing("receipt_catalog.identity"))?;
+    validate_identity(identity)?;
+    if catalog.rows.len() > 4_096 {
+        return Err(invalid("receipt_catalog.rows", "exceeds 4096 entries"));
+    }
+    if catalog
+        .rows
+        .windows(2)
+        .any(|pair| pair[0].mutation_id.as_ref() >= pair[1].mutation_id.as_ref())
+    {
+        return Err(invalid(
+            "receipt_catalog.rows",
+            "must be binary-sorted and unique",
+        ));
+    }
+    let mut mutation_ids = HashSet::with_capacity(catalog.rows.len().saturating_mul(2));
+    for row in &catalog.rows {
+        validate_receipt_catalog_row(row, identity)?;
+        if !mutation_ids.insert(row.mutation_id.as_ref())
+            || (!row.settlement_mutation_id.is_empty()
+                && !mutation_ids.insert(row.settlement_mutation_id.as_ref()))
+        {
+            return Err(invalid(
+                "receipt_catalog.rows",
+                "receipt and settlement mutation IDs must be globally unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_receipt_catalog_row(
+    row: &ReceiptCatalogRow,
+    identity: &RepositoryIdentity,
+) -> Result<(), ControlValidationError> {
+    validate_uuid_v7("receipt_catalog.row.mutation_id", &row.mutation_id)?;
+    let receipt = row
+        .receipt
+        .as_ref()
+        .ok_or_else(|| missing("receipt_catalog.row.receipt"))?;
+    validate_mutation_receipt(receipt)?;
+    if receipt.identity.as_ref() != Some(identity) || receipt.mutation_id != row.mutation_id {
+        return Err(invalid(
+            "receipt_catalog.row.receipt",
+            "does not match the catalog row",
+        ));
+    }
+    let state = ReceiptState::try_from(row.state)
+        .map_err(|_| invalid("receipt_catalog.row.state", "is unknown"))?;
+    match state {
+        ReceiptState::Unresolved => {
+            if !row.settlement_mutation_id.is_empty() {
+                return Err(invalid(
+                    "receipt_catalog.row.settlement_mutation_id",
+                    "must be absent while UNRESOLVED",
+                ));
+            }
+            if row.result.is_some() {
+                return Err(invalid(
+                    "receipt_catalog.row.result",
+                    "must be absent while UNRESOLVED",
+                ));
+            }
+            Ok(())
+        }
+        ReceiptState::Settled => {
+            validate_uuid_v7(
+                "receipt_catalog.row.settlement_mutation_id",
+                &row.settlement_mutation_id,
+            )?;
+            let result = row
+                .result
+                .as_ref()
+                .ok_or_else(|| missing("receipt_catalog.row.result"))?;
+            validate_receipt_result_target(result, identity, &row.mutation_id)
+        }
+        ReceiptState::Unspecified => Err(invalid(
+            "receipt_catalog.row.state",
+            "must be UNRESOLVED or SETTLED",
+        )),
+    }
 }
 
 pub fn validate_credential_control(
@@ -1162,6 +1430,161 @@ fn validate_target_any_repository_leaf(
     Ok(parsed)
 }
 
+fn validate_repo_control_target(
+    target: &super::LandedControlRef,
+    identity: &RepositoryIdentity,
+) -> Result<(), ControlValidationError> {
+    bounded_ascii(
+        "result.landed_control.repo_control_key",
+        &target.repo_control_key,
+        1,
+        1024,
+    )?;
+    bounded_bytes(
+        "result.landed_control.object_version_id",
+        &target.object_version_id,
+        1,
+        1024,
+    )?;
+    exact_len("result.landed_control.digest", &target.digest, 32)?;
+    nonzero("result.landed_control.size", target.size)?;
+    let routing = RoutingDigest::of(&identity.canonical_path)
+        .map_err(|_| invalid("result.identity.canonical_path", "is too long"))?;
+    let suffix = format!(
+        "v2/repositories/by-path/{}/repo_control.pb",
+        routing.lower_hex()
+    );
+    let key = std::str::from_utf8(&target.repo_control_key)
+        .map_err(|_| invalid("result.landed_control.repo_control_key", "must be ASCII"))?;
+    let prefix = key.strip_suffix(&suffix).ok_or_else(|| {
+        invalid(
+            "result.landed_control.repo_control_key",
+            "is not the derived control key",
+        )
+    })?;
+    let prefix = DeploymentPrefix::parse(prefix).map_err(|_| {
+        invalid(
+            "result.landed_control.repo_control_key",
+            "has an invalid prefix",
+        )
+    })?;
+    if parse_key(&prefix, &target.repo_control_key)
+        .map_err(|_| {
+            invalid(
+                "result.landed_control.repo_control_key",
+                "is outside the V2 grammar",
+            )
+        })?
+        .kind
+        != V2KeyKind::RepoControl
+    {
+        return Err(invalid(
+            "result.landed_control.repo_control_key",
+            "is not a repo_control key",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_result_target(
+    target: &TargetObjectRef,
+    identity: &RepositoryIdentity,
+    mutation_id: &[u8],
+) -> Result<(), ControlValidationError> {
+    let mut repository_uuid = [0u8; 16];
+    repository_uuid.copy_from_slice(&identity.repository_uuid);
+    let suffix = format!(
+        "v2/repositories/by-id/{}/g{:016x}/receipts/results/{}.pb",
+        hex::encode(repository_uuid),
+        identity.generation,
+        hex::encode(mutation_id)
+    );
+    let key = std::str::from_utf8(&target.key)
+        .map_err(|_| invalid("receipt_catalog.row.result.key", "must be ASCII"))?;
+    let prefix = key
+        .strip_suffix(&suffix)
+        .ok_or_else(|| invalid("receipt_catalog.row.result.key", "is not deterministic"))?;
+    let prefix = DeploymentPrefix::parse(prefix)
+        .map_err(|_| invalid("receipt_catalog.row.result.key", "has an invalid prefix"))?;
+    let parsed = validate_target_any_repository_leaf(target, identity, &prefix)?;
+    if parsed.kind != V2KeyKind::ReceiptResult {
+        return Err(invalid(
+            "receipt_catalog.row.result.key",
+            "is not a receipt result key",
+        ));
+    }
+    if target.size == 0 || target.size > MAX_MUTATION_RESULT_BYTES as u64 {
+        return Err(invalid(
+            "receipt_catalog.row.result.size",
+            "must be in 1..=65536",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_capacity_shard_key(
+    identity: &RepositoryIdentity,
+    key: &[u8],
+) -> Result<(), ControlValidationError> {
+    bounded_ascii("receipt.capacity.shard_key", key, 1, 1024)?;
+    let shard = Sha256::digest(&identity.repository_uuid)[0];
+    let suffix = format!("v2/capacity/shards/{shard:02x}/capacity_shard.pb");
+    let key_text = std::str::from_utf8(key)
+        .map_err(|_| invalid("receipt.capacity.shard_key", "must be ASCII"))?;
+    let prefix = key_text
+        .strip_suffix(&suffix)
+        .ok_or_else(|| invalid("receipt.capacity.shard_key", "is not deterministic"))?;
+    let prefix = DeploymentPrefix::parse(prefix)
+        .map_err(|_| invalid("receipt.capacity.shard_key", "has an invalid prefix"))?;
+    let parsed = parse_key(&prefix, key)
+        .map_err(|_| invalid("receipt.capacity.shard_key", "is outside the V2 grammar"))?;
+    if parsed.kind != V2KeyKind::CapacityShard {
+        return Err(invalid(
+            "receipt.capacity.shard_key",
+            "is not the repository capacity shard key",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_receipt_event_result_key(
+    identity: &RepositoryIdentity,
+    event_id: &[u8],
+    key: &[u8],
+) -> Result<(), ControlValidationError> {
+    bounded_ascii("receipt.event.result_key", key, 1, 1024)?;
+    let mut repository_uuid = [0u8; 16];
+    repository_uuid.copy_from_slice(&identity.repository_uuid);
+    let suffix = format!(
+        "v2/repositories/by-id/{}/g{:016x}/events/results/{}.pb",
+        hex::encode(repository_uuid),
+        identity.generation,
+        hex::encode(event_id)
+    );
+    let key_text = std::str::from_utf8(key)
+        .map_err(|_| invalid("receipt.event.result_key", "must be ASCII"))?;
+    let prefix = key_text
+        .strip_suffix(&suffix)
+        .ok_or_else(|| invalid("receipt.event.result_key", "is not deterministic"))?;
+    let prefix = DeploymentPrefix::parse(prefix)
+        .map_err(|_| invalid("receipt.event.result_key", "has an invalid prefix"))?;
+    let parsed = parse_key(&prefix, key)
+        .map_err(|_| invalid("receipt.event.result_key", "is outside the V2 grammar"))?;
+    if parsed.kind != V2KeyKind::EventResult
+        || parsed.repository
+            != Some(RepositoryKeyIdentity {
+                repository_uuid,
+                generation: identity.generation,
+            })
+    {
+        return Err(invalid(
+            "receipt.event.result_key",
+            "does not match the repository identity and event ID",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_object_id(
     field: &'static str,
     value: &[u8],
@@ -1230,6 +1653,19 @@ fn bounded_bytes(
 ) -> Result<(), ControlValidationError> {
     if !(min..=max).contains(&value.len()) {
         return Err(invalid(field, "is outside its byte bound"));
+    }
+    Ok(())
+}
+
+fn bounded_ascii(
+    field: &'static str,
+    value: &[u8],
+    min: usize,
+    max: usize,
+) -> Result<(), ControlValidationError> {
+    bounded_bytes(field, value, min, max)?;
+    if !value.is_ascii() {
+        return Err(invalid(field, "must be ASCII"));
     }
     Ok(())
 }

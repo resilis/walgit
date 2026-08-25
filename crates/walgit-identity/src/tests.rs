@@ -120,6 +120,36 @@ fn create_and_capability_are_exactly_authenticated_but_not_authorized() {
         authenticated.grant(),
         (b"grant-issuer".as_slice(), b"grant-subject".as_slice())
     );
+    assert_eq!(
+        authenticated.tenant_id(),
+        expected_capability.common.tenant_id
+    );
+    assert_eq!(
+        authenticated.project_id(),
+        expected_capability.common.project_id
+    );
+    assert_eq!(
+        authenticated.repository_uuid(),
+        &expected_capability.common.repository_uuid
+    );
+    assert_eq!(authenticated.generation(), 1);
+    assert_eq!(
+        authenticated.canonical_path(),
+        expected_capability.common.canonical_path
+    );
+    let canonical_path_digest: [u8; 32] =
+        Sha256::digest(expected_capability.common.canonical_path).into();
+    assert_eq!(
+        authenticated.canonical_path_digest(),
+        &canonical_path_digest
+    );
+    assert_eq!(
+        authenticated.routing_digest(),
+        &expected_capability.common.routing_digest
+    );
+    assert_eq!(authenticated.control_key(), repo_control_key_bytes());
+    assert_eq!(authenticated.control_version_id(), b"control-version");
+    assert_eq!(authenticated.cutover_generation(), 7);
 
     assert!(
         authority
