@@ -261,6 +261,7 @@ pub struct SafeGcsView {
 pub struct SafeS3View {
     pub endpoint: Option<String>,
     pub region: String,
+    pub credential_mode: super::S3CredentialMode,
     pub access_key_env: String,
     pub secret_key_env: String,
     pub session_token_env: String,
@@ -498,6 +499,7 @@ impl SafeConfigView {
                 s3: SafeS3View {
                     endpoint: diagnostic_url(&config.store.s3.endpoint),
                     region: config.store.s3.region.clone(),
+                    credential_mode: config.store.s3.credential_mode,
                     access_key_env: config.store.s3.access_key_env.clone(),
                     secret_key_env: config.store.s3.secret_key_env.clone(),
                     session_token_env: config.store.s3.session_token_env.clone(),
