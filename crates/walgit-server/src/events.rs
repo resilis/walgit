@@ -211,7 +211,12 @@ impl Sink for WebhookSink {
         if let Some(secret) = &self.secret {
             req = req.header("x-walgit-signature", Self::signature(secret, &body));
         }
-        let resp = req.body(body).send().await?;
+        let resp = req.body(body).send().await.map_err(|error| {
+            anyhow::anyhow!(
+                "webhook request failed: {}",
+                crate::redact_request_url(error)
+            )
+        })?;
         anyhow::ensure!(
             resp.status().is_success(),
             "webhook returned {}",

@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use tokio::sync::Mutex;
 use walgit_config::{ACCESS_TOKEN_PREFIX, AuthMode, StaticToken};
 
@@ -42,6 +43,10 @@ pub const FORWARDED_AUTHORIZATION_HEADER: &str = "x-walgit-authorization";
 pub const SESSION_COOKIE: &str = "walgit_session";
 /// Clock skew tolerated on ID tokens.
 const ID_TOKEN_LEEWAY_SECS: u64 = 30;
+/// Domain separation keeps static-token digests distinct from every other SHA-256
+/// use in the process. The NUL terminator makes accidental textual extension
+/// unambiguous.
+const STATIC_TOKEN_HASH_DOMAIN: &[u8] = b"walgit.static-token.sha256.v1\0";
 
 fn unix_now() -> Option<u64> {
     std::time::SystemTime::now()
@@ -149,12 +154,27 @@ impl HttpOidcSource {
             .get(&url)
             .send()
             .await
-            .map_err(|e| format!("OIDC discovery {url}: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "OIDC discovery request failed: {}",
+                    crate::redact_request_url(e)
+                )
+            })?
             .error_for_status()
-            .map_err(|e| format!("OIDC discovery {url}: {e}"))?
+            .map_err(|e| {
+                format!(
+                    "OIDC discovery response failed: {}",
+                    crate::redact_request_url(e)
+                )
+            })?
             .json()
             .await
-            .map_err(|e| format!("OIDC discovery {url}: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "OIDC discovery decode failed: {}",
+                    crate::redact_request_url(e)
+                )
+            })?;
         let doc = Arc::new(doc);
         *self.discovery.lock().await = Some(doc.clone());
         Ok(doc)
@@ -206,7 +226,7 @@ impl JwksSource for HttpOidcSource {
             .get(&url)
             .send()
             .await
-            .map_err(|e| format!("JWKS request failed: {e}"))?;
+            .map_err(|e| format!("JWKS request failed: {}", crate::redact_request_url(e)))?;
         let max_age = response
             .headers()
             .get(reqwest::header::CACHE_CONTROL)
@@ -215,10 +235,15 @@ impl JwksSource for HttpOidcSource {
             .unwrap_or(Duration::from_secs(300));
         let document: JwksDocument = response
             .error_for_status()
-            .map_err(|e| format!("JWKS response failed: {e}"))?
+            .map_err(|e| format!("JWKS response failed: {}", crate::redact_request_url(e)))?
             .json()
             .await
-            .map_err(|e| format!("JWKS response decode failed: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "JWKS response decode failed: {}",
+                    crate::redact_request_url(e)
+                )
+            })?;
         let keys = document
             .keys
             .into_iter()
@@ -356,7 +381,8 @@ async fn refresh_cache(
 pub struct Authenticator {
     mode: AuthMode,
     anonymous_read: bool,
-    tokens: Vec<StaticToken>,
+    /// Resolved once at construction. Plaintext static tokens are never retained.
+    tokens: Vec<HashedStaticToken>,
     issuer: String,
     allowed_domains: Vec<String>,
     allowed_emails: Vec<String>,
@@ -375,27 +401,75 @@ pub struct Authenticator {
     oauth_client_secret: Option<String>,
 }
 
+struct HashedStaticToken {
+    principal: String,
+    digest: [u8; 32],
+    write: bool,
+}
+
+fn static_token_digest(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hash = Sha256::new();
+    hash.update(STATIC_TOKEN_HASH_DOMAIN);
+    hash.update(token.as_bytes());
+    hash.finalize().into()
+}
+
+fn process_env(name: &str) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(
+        !name.is_empty() && !name.contains(['=', '\0']),
+        "invalid environment variable name"
+    );
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("environment variable value is not Unicode")
+        }
+    }
+}
+
 impl Authenticator {
-    pub fn new(cfg: &walgit_config::Config) -> Arc<Self> {
+    pub fn new(cfg: &walgit_config::Config) -> anyhow::Result<Arc<Self>> {
         let source = Arc::new(HttpOidcSource {
             client: reqwest::Client::new(),
             issuer: cfg.server.auth.issuer.trim_end_matches('/').to_string(),
             discovery: Mutex::new(None),
         });
-        Self::build(cfg, source.clone(), Some(source))
+        Self::build(cfg, source.clone(), Some(source), process_env)
+    }
+
+    /// Validate static-token resolution exactly as server startup does, without
+    /// constructing OIDC clients or performing network I/O.
+    pub fn validate_static_tokens(cfg: &walgit_config::Config) -> anyhow::Result<()> {
+        resolve_tokens(&cfg.server.auth.tokens, process_env).map(drop)
     }
 
     /// Construct an authenticator with an injectable JWKS source (tests: no network; the
     /// browser sign-in endpoints are unavailable).
-    pub fn with_key_source(cfg: &walgit_config::Config, keys: Arc<dyn JwksSource>) -> Arc<Self> {
-        Self::build(cfg, keys, None)
+    pub fn with_key_source(
+        cfg: &walgit_config::Config,
+        keys: Arc<dyn JwksSource>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(cfg, keys, None, process_env)
+    }
+
+    #[cfg(test)]
+    fn with_key_source_and_env(
+        cfg: &walgit_config::Config,
+        keys: Arc<dyn JwksSource>,
+        resolve_env: impl Fn(&str) -> anyhow::Result<Option<String>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(cfg, keys, None, resolve_env)
     }
 
     fn build(
         cfg: &walgit_config::Config,
         keys: Arc<dyn JwksSource>,
         discovery: Option<Arc<HttpOidcSource>>,
-    ) -> Arc<Self> {
+        resolve_env: impl Fn(&str) -> anyhow::Result<Option<String>>,
+    ) -> anyhow::Result<Arc<Self>> {
         let auth = &cfg.server.auth;
         let oauth_client_id = auth.oauth_client_id.clone().filter(|s| !s.is_empty());
         let mut audiences = auth.audiences.clone();
@@ -404,10 +478,10 @@ impl Authenticator {
         {
             audiences.push(id.clone());
         }
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             mode: auth.mode,
             anonymous_read: auth.anonymous_read,
-            tokens: resolve_tokens(&auth.tokens),
+            tokens: resolve_tokens(&auth.tokens, resolve_env)?,
             issuer: auth.issuer.trim_end_matches('/').to_string(),
             allowed_domains: auth
                 .allowed_domains
@@ -440,7 +514,7 @@ impl Authenticator {
             access_token_ttl: auth.access_token_ttl,
             oauth_client_id,
             oauth_client_secret: auth.oauth_client_secret.clone().filter(|s| !s.is_empty()),
-        })
+        }))
     }
 
     /// Whether anonymous callers may read.
@@ -633,12 +707,8 @@ impl Authenticator {
 
     /// A static token or an issued access token, from a bearer or a Basic password.
     fn opaque_token_principal(&self, tok: &str) -> Option<Result<Principal, AuthError>> {
-        if let Some(st) = self.tokens.iter().find(|t| t.token == tok) {
-            return Some(Ok(Principal {
-                name: st.principal.clone(),
-                write: st.write,
-                anonymous: false,
-            }));
+        if let Some(principal) = self.static_token_principal(tok) {
+            return Some(Ok(principal));
         }
         if tok.starts_with(ACCESS_TOKEN_PREFIX) {
             return Some(match self.access_token_claims(tok) {
@@ -647,6 +717,37 @@ impl Authenticator {
             });
         }
         None
+    }
+
+    fn static_token_principal(&self, token: &str) -> Option<Principal> {
+        self.static_token_principal_with(token, || {})
+    }
+
+    /// Hash the presented token once, compare its fixed-width digest with every
+    /// configured digest, and only select a principal after the full loop.
+    fn static_token_principal_with(
+        &self,
+        token: &str,
+        mut compared: impl FnMut(),
+    ) -> Option<Principal> {
+        let presented = static_token_digest(token);
+        let mut any_match = Choice::from(0);
+        let mut matched_index = 0u64;
+        for (index, configured) in self.tokens.iter().enumerate() {
+            let is_match = configured.digest.ct_eq(&presented);
+            matched_index = u64::conditional_select(&matched_index, &(index as u64), is_match);
+            any_match |= is_match;
+            compared();
+        }
+        if !bool::from(any_match) {
+            return None;
+        }
+        let configured = &self.tokens[matched_index as usize];
+        Some(Principal {
+            name: configured.principal.clone(),
+            write: configured.write,
+            anonymous: false,
+        })
     }
 
     async fn authenticate_inner(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
@@ -919,24 +1020,39 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn resolve_tokens(tokens: &[StaticToken]) -> Vec<StaticToken> {
-    tokens
-        .iter()
-        .map(|t| {
-            let token = t
-                .token_env
-                .as_ref()
-                .and_then(|v| std::env::var(v).ok())
-                .unwrap_or_else(|| t.token.clone());
-            StaticToken {
-                principal: t.principal.clone(),
-                token,
-                token_env: None,
-                write: t.write,
-            }
-        })
-        .filter(|t| !t.token.is_empty())
-        .collect()
+fn resolve_tokens(
+    tokens: &[StaticToken],
+    resolve_env: impl Fn(&str) -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<Vec<HashedStaticToken>> {
+    let mut resolved = Vec::with_capacity(tokens.len());
+    let mut seen = std::collections::HashSet::with_capacity(tokens.len());
+    for (index, configured) in tokens.iter().enumerate() {
+        let plaintext = match configured.token_env.as_deref() {
+            Some(name) => resolve_env(name)
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "server.auth.tokens[{index}].token_env {name:?} could not be resolved"
+                    )
+                })?
+                .unwrap_or_else(|| configured.token.clone()),
+            None => configured.token.clone(),
+        };
+        anyhow::ensure!(
+            !plaintext.is_empty(),
+            "server.auth.tokens[{index}] resolves to an empty token"
+        );
+        let digest = static_token_digest(&plaintext);
+        anyhow::ensure!(
+            seen.insert(digest),
+            "server.auth.tokens[{index}] resolves to a duplicate token"
+        );
+        resolved.push(HashedStaticToken {
+            principal: configured.principal.clone(),
+            digest,
+            write: configured.write,
+        });
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -1086,6 +1202,132 @@ mod tests {
         }
     }
 
+    #[test]
+    fn static_token_matching_checks_every_digest_for_every_position_and_miss() {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.tokens = vec![
+            static_token("first", "alpha-token", true),
+            static_token("middle", "bravo-token", false),
+            static_token("last", "charlie-token", true),
+        ];
+        let auth = Authenticator::with_key_source_and_env(&cfg, source(), |_| Ok(None)).unwrap();
+
+        for (presented, expected) in [
+            ("alpha-token", Some("first")),
+            ("bravo-token", Some("middle")),
+            ("charlie-token", Some("last")),
+            ("charlie-tokem", None), // same-length near miss
+            ("x", None),             // unequal length
+            ("not-configured", None),
+        ] {
+            let comparisons = AtomicUsize::new(0);
+            let principal = auth.static_token_principal_with(presented, || {
+                comparisons.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(
+                principal.as_ref().map(|p| p.name.as_str()),
+                expected,
+                "presented token position case failed"
+            );
+            assert_eq!(
+                comparisons.load(Ordering::Relaxed),
+                cfg.server.auth.tokens.len(),
+                "every configured digest must be compared"
+            );
+        }
+    }
+
+    #[test]
+    fn static_tokens_resolve_once_and_reject_empty_or_duplicate_values() {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.tokens = vec![
+            static_token("literal", "literal-token", true),
+            StaticToken {
+                principal: "environment".into(),
+                token: "fallback-token".into(),
+                token_env: Some("ROBOT_TOKEN".into()),
+                write: false,
+            },
+        ];
+        let resolve_calls = AtomicUsize::new(0);
+        let auth = Authenticator::with_key_source_and_env(&cfg, source(), |name| {
+            resolve_calls.fetch_add(1, Ordering::Relaxed);
+            Ok((name == "ROBOT_TOKEN").then(|| "resolved-token".to_string()))
+        })
+        .unwrap();
+        assert_eq!(resolve_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            auth.static_token_principal("literal-token").unwrap().name,
+            "literal"
+        );
+        assert_eq!(
+            auth.static_token_principal("resolved-token").unwrap().name,
+            "environment"
+        );
+        assert!(auth.static_token_principal("fallback-token").is_none());
+        assert_eq!(
+            resolve_calls.load(Ordering::Relaxed),
+            1,
+            "environment-backed tokens resolve only during construction"
+        );
+
+        let secret = "must-not-appear-in-errors";
+        cfg.server.auth.tokens[1].token = secret.into();
+        let err =
+            Authenticator::with_key_source_and_env(&cfg, source(), |_| Ok(Some(String::new())))
+                .err()
+                .expect("empty resolved token must fail")
+                .to_string();
+        assert!(err.contains("empty"), "{err}");
+        assert!(
+            !err.contains(secret),
+            "resolved token leaked in error: {err}"
+        );
+
+        cfg.server.auth.tokens[1].token_env = None;
+        cfg.server.auth.tokens[1].token = "literal-token".into();
+        let err = Authenticator::with_key_source_and_env(&cfg, source(), |_| Ok(None))
+            .err()
+            .expect("duplicate literal token must fail")
+            .to_string();
+        assert!(err.contains("duplicate"), "{err}");
+
+        cfg.server.auth.tokens[1].token_env = Some("COLLISION".into());
+        cfg.server.auth.tokens[1].token = "different-fallback".into();
+        let err = Authenticator::with_key_source_and_env(&cfg, source(), |name| {
+            Ok((name == "COLLISION").then(|| "literal-token".to_string()))
+        })
+        .err()
+        .expect("literal/env collision must fail")
+        .to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(
+            !err.contains("literal-token"),
+            "resolved token leaked in error: {err}"
+        );
+
+        cfg.server.auth.tokens = vec![StaticToken {
+            principal: "broken-environment".into(),
+            token: "resolver-error-fallback-must-not-be-used".into(),
+            token_env: Some("BROKEN_TOKEN_ENV".into()),
+            write: true,
+        }];
+        let err = Authenticator::with_key_source_and_env(&cfg, source(), |_| {
+            anyhow::bail!("environment value is not Unicode")
+        })
+        .err()
+        .expect("resolution errors must fail construction")
+        .to_string();
+        assert!(err.contains("server.auth.tokens[0]"), "{err}");
+        assert!(err.contains("BROKEN_TOKEN_ENV"), "{err}");
+        assert!(
+            !err.contains("resolver-error-fallback-must-not-be-used"),
+            "fallback token leaked or was accepted after a resolver error: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn token_mode_accepts_bearer_and_basic_and_rejects_the_rest() {
         let mut cfg = walgit_config::Config::default();
@@ -1095,7 +1337,7 @@ mod tests {
             static_token("alice", "s3cret", true),
             static_token("ci", "r0bot", false),
         ];
-        let auth = Authenticator::new(&cfg);
+        let auth = Authenticator::new(&cfg).unwrap();
         let p = auth.authenticate(&bearer("s3cret")).await.unwrap();
         assert_eq!((p.name.as_str(), p.write), ("alice", true));
         let p = auth
@@ -1123,7 +1365,7 @@ mod tests {
         cfg.server.auth.mode = AuthMode::Token;
         cfg.server.auth.tokens = vec![static_token("front", "secret", true)];
         cfg.server.auth.trusted_forwarders = vec!["front".into()];
-        let auth = Authenticator::new(&cfg);
+        let auth = Authenticator::new(&cfg).unwrap();
         let mut headers = bearer("secret");
         headers.insert("x-walgit-principal", "user@example.com".parse().unwrap());
         assert_eq!(
@@ -1132,14 +1374,14 @@ mod tests {
         );
 
         cfg.server.auth.trusted_forwarders.clear();
-        let auth = Authenticator::new(&cfg);
+        let auth = Authenticator::new(&cfg).unwrap();
         assert_eq!(auth.authenticate(&headers).await.unwrap().name, "front");
     }
 
     #[tokio::test]
     async fn id_token_accept_and_reject_paths() {
         let source = source();
-        let auth = Authenticator::with_key_source(&config(), source.clone());
+        let auth = Authenticator::with_key_source(&config(), source.clone()).unwrap();
         let h = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, true));
         let principal = auth.authenticate(&h).await.unwrap();
         assert_eq!(principal.name, "dev@example.com");
@@ -1213,7 +1455,7 @@ mod tests {
         )
         .unwrap();
 
-        let auth = Authenticator::with_key_source(&config(), source);
+        let auth = Authenticator::with_key_source(&config(), source).unwrap();
         let principal = auth.authenticate(&bearer(&token)).await.unwrap();
         assert_eq!(principal.name, "dev@example.com");
     }
@@ -1225,7 +1467,7 @@ mod tests {
         cfg.server.auth.oauth_client_id = Some("web-client".into());
         cfg.server.auth.oauth_client_secret = Some("x".into());
         cfg.server.auth.session_secret = Some(SECRET.into());
-        let auth = Authenticator::with_key_source(&cfg, source());
+        let auth = Authenticator::with_key_source(&cfg, source()).unwrap();
         for aud in ["a", "b", "web-client"] {
             let h = bearer(&token("dev@example.com", ISSUER, aud, 4_000_000_000, true));
             assert!(auth.authenticate(&h).await.is_ok(), "aud {aud}");
@@ -1239,7 +1481,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_token_and_jwks_failure() {
-        let auth = Authenticator::with_key_source(&config(), source());
+        let auth = Authenticator::with_key_source(&config(), source()).unwrap();
         assert!(matches!(
             auth.authenticate(&HeaderMap::new()).await,
             Err(AuthError::Unauthorized)
@@ -1248,7 +1490,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             response: Mutex::new(Err("offline".into())),
         });
-        let auth = Authenticator::with_key_source(&config(), failing);
+        let auth = Authenticator::with_key_source(&config(), failing).unwrap();
         let h = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, true));
         assert!(matches!(
             auth.authenticate(&h).await,
@@ -1262,7 +1504,7 @@ mod tests {
         cfg.server.auth.allowed_domains.clear();
         cfg.server.auth.allowed_emails = vec!["svc@other.com".into()];
         cfg.server.auth.write_domains = Some(vec!["other.com".into()]);
-        let auth = Authenticator::with_key_source(&cfg, source());
+        let auth = Authenticator::with_key_source(&cfg, source()).unwrap();
         let h = bearer(&token("svc@other.com", ISSUER, AUD, 4_000_000_000, true));
         assert!(auth.authenticate(&h).await.unwrap().write);
         let h = bearer(&token("else@other.com", ISSUER, AUD, 4_000_000_000, true));
@@ -1276,7 +1518,7 @@ mod tests {
     async fn stale_jwks_cache_survives_refresh_failure() {
         let source = source();
         source.response.lock().await.as_mut().unwrap().max_age = Duration::ZERO;
-        let auth = Authenticator::with_key_source(&config(), source.clone());
+        let auth = Authenticator::with_key_source(&config(), source.clone()).unwrap();
         let h = bearer(&token("dev@example.com", ISSUER, AUD, 4_000_000_000, true));
         assert!(auth.authenticate(&h).await.is_ok());
         *source.response.lock().await = Err("offline".into());
@@ -1287,7 +1529,7 @@ mod tests {
     async fn static_tokens_work_in_oidc_mode_too() {
         let mut cfg = config();
         cfg.server.auth.tokens = vec![static_token("deploy-bot", "r0bot", true)];
-        let auth = Authenticator::with_key_source(&cfg, source());
+        let auth = Authenticator::with_key_source(&cfg, source()).unwrap();
         assert_eq!(
             auth.authenticate(&bearer("r0bot")).await.unwrap().name,
             "deploy-bot"
@@ -1306,7 +1548,7 @@ mod tests {
         let mut cfg = config();
         cfg.server.auth.session_secret = Some(SECRET.into());
         cfg.server.auth.access_token_ttl = Duration::from_secs(3600);
-        let auth = Authenticator::with_key_source(&cfg, source());
+        let auth = Authenticator::with_key_source(&cfg, source()).unwrap();
         let tok = auth.access_token("dev@example.com").unwrap();
         assert!(tok.starts_with(ACCESS_TOKEN_PREFIX));
         let (exp, email) = auth.access_token_claims(&tok).unwrap();
@@ -1356,7 +1598,7 @@ mod tests {
 
         // Policy is re-applied at use: a principal that lost its domain is Forbidden.
         cfg.server.auth.allowed_domains = vec!["elsewhere.org".into()];
-        let stricter = Authenticator::with_key_source(&cfg, source());
+        let stricter = Authenticator::with_key_source(&cfg, source()).unwrap();
         assert!(matches!(
             stricter.authenticate(&bearer(&tok)).await,
             Err(AuthError::Forbidden)
@@ -1364,7 +1606,7 @@ mod tests {
 
         // Without a session secret nothing is minted and every wgt_ token is Invalid.
         cfg.server.auth.session_secret = None;
-        let none = Authenticator::with_key_source(&cfg, source());
+        let none = Authenticator::with_key_source(&cfg, source()).unwrap();
         assert!(none.access_token("dev@example.com").is_none());
         assert!(matches!(
             none.authenticate(&bearer(&tok)).await,
@@ -1384,7 +1626,7 @@ mod session_tests {
             Some("0123456789abcdef0123456789abcdef-session-secret".into());
         cfg.server.auth.session_ttl = Duration::from_secs(ttl_secs);
         cfg.server.auth.allowed_domains = vec!["example.com".into()];
-        Authenticator::new(&cfg)
+        Authenticator::new(&cfg).unwrap()
     }
 
     fn headers_with(cookie: &str) -> HeaderMap {

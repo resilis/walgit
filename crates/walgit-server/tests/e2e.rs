@@ -2219,6 +2219,189 @@ async fn repo_settings_api_roundtrip() -> TestResult {
     Ok(())
 }
 
+/// Attacker-authored settings TOML never appears in PUT errors or validation
+/// results on either public API lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_toml_errors_are_source_free_on_both_api_lanes() -> TestResult {
+    const MALFORMED_SENTINEL: &str = "api-settings-malformed-path-sentinel";
+    const TYPE_SENTINEL: &str = "api-settings-type-value-sentinel";
+
+    let server = Server::start().await?;
+    server.put_repo("t", "safe-errors").await?;
+    let client = reqwest::Client::new();
+    let cases = [
+        (
+            format!("[upstream]\ngit = \"https://example.test/{MALFORMED_SENTINEL}\n"),
+            "settings: invalid TOML",
+            MALFORMED_SENTINEL,
+        ),
+        (
+            format!("[bundles]\nmin_commits = \"{TYPE_SENTINEL}\"\n"),
+            "settings: invalid effective configuration",
+            TYPE_SENTINEL,
+        ),
+    ];
+
+    for lane in ["api", "api-browser"] {
+        let base = format!("{}/t/safe-errors/{lane}/settings", server.base_url);
+        for (document, safe_error, sentinel) in &cases {
+            let response = client.put(&base).body(document.clone()).send().await?;
+            assert_eq!(response.status(), 400, "PUT {lane}");
+            let body = response.text().await?;
+            assert!(body.contains(safe_error), "PUT {lane}: {body}");
+            assert!(!body.contains(sentinel), "PUT {lane} leaked source: {body}");
+            assert!(!body.contains("git =") && !body.contains("min_commits ="));
+            assert!(!body.contains("panicked"), "PUT {lane}: {body}");
+
+            let response = client
+                .post(format!("{base}/validate"))
+                .body(document.clone())
+                .send()
+                .await?
+                .error_for_status()?;
+            let body = response.text().await?;
+            let result: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(result["ok"], false, "validate {lane}: {body}");
+            assert_eq!(result["errors"][0], *safe_error, "validate {lane}: {body}");
+            assert!(
+                !body.contains(sentinel),
+                "validate {lane} leaked source: {body}"
+            );
+            assert!(!body.contains("git =") && !body.contains("min_commits ="));
+            assert!(!body.contains("panicked"), "validate {lane}: {body}");
+        }
+    }
+    Ok(())
+}
+
+/// Every settings response lane serializes the closed walgit-config projection,
+/// never the runtime Config that also carries host credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_views_are_exact_and_secret_free_on_both_api_lanes() -> TestResult {
+    use std::collections::BTreeSet;
+
+    const STATIC_SECRET: &str = "server-settings-static-secret-sentinel";
+    const SESSION_SECRET: &str = "server-settings-session-secret-sentinel-0123456789abcdef";
+    const OAUTH_SECRET: &str = "server-settings-oauth-secret-sentinel";
+    const BROKER_SECRET: &str = "server-settings-broker-secret-sentinel";
+    const WEBHOOK_SECRET: &str = "server-settings-webhook-secret-sentinel";
+
+    let server = Server::start_with_tweak(|cfg| {
+        cfg.server.auth.tokens = vec![walgit_config::StaticToken {
+            principal: "diagnostic-bot".into(),
+            token: STATIC_SECRET.into(),
+            token_env: None,
+            write: true,
+        }];
+        cfg.server.auth.session_secret = Some(SESSION_SECRET.into());
+        cfg.server.auth.oauth_client_secret = Some(OAUTH_SECRET.into());
+        cfg.wal.push_broker_token = Some(BROKER_SECRET.into());
+        cfg.events.webhook_secret = Some(WEBHOOK_SECRET.into());
+        cfg.upstream.token_env = Some("UPSTREAM_TOKEN".into());
+    })
+    .await?;
+    server.put_repo("t", "projection").await?;
+    let client = reqwest::Client::new();
+    let sentinels = [
+        STATIC_SECRET,
+        SESSION_SECRET,
+        OAUTH_SECRET,
+        BROKER_SECRET,
+        WEBHOOK_SECRET,
+    ];
+
+    for lane in ["api", "api-browser"] {
+        let base = format!("{}/t/projection/{lane}/settings", server.base_url);
+        let effective = client
+            .get(format!("{base}/effective"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let table: toml::Table = effective.parse()?;
+        assert_eq!(
+            table.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["bundles", "compaction", "maintenance", "upstream"]),
+            "wrong effective settings paths on {lane}: {effective}"
+        );
+        for sentinel in sentinels {
+            assert!(
+                !effective.contains(sentinel),
+                "{lane} effective leaked {sentinel}"
+            );
+        }
+
+        let describe_text = client
+            .get(format!("{base}/describe"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let describe: serde_json::Value = serde_json::from_str(&describe_text)?;
+        assert_eq!(
+            describe
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "bundles",
+                "compaction",
+                "fields",
+                "head_seq",
+                "maintenance",
+                "repo",
+                "sections",
+                "settings",
+                "strategies",
+                "upstream",
+            ]),
+            "wrong describe paths on {lane}: {describe_text}"
+        );
+        assert!(describe["fields"].as_array().unwrap().iter().all(|field| {
+            field["key"].as_str().is_some_and(|key| {
+                ["bundles.", "maintenance.", "compaction.", "upstream."]
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
+        }));
+        for sentinel in sentinels {
+            assert!(
+                !describe_text.contains(sentinel),
+                "{lane} describe leaked {sentinel}"
+            );
+        }
+
+        let validate_text = client
+            .post(format!("{base}/validate"))
+            .body("[bundles]\nmin_commits = 4\n")
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let validate: serde_json::Value = serde_json::from_str(&validate_text)?;
+        assert_eq!(validate["ok"], true, "{lane}: {validate_text}");
+        assert!(validate["fields"].as_array().unwrap().iter().all(|field| {
+            field["key"].as_str().is_some_and(|key| {
+                ["bundles.", "maintenance.", "compaction.", "upstream."]
+                    .iter()
+                    .any(|prefix| key.starts_with(prefix))
+            })
+        }));
+        for sentinel in sentinels {
+            assert!(
+                !validate_text.contains(sentinel),
+                "{lane} validate leaked {sentinel}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Settings tab backend: describe (strategies with next fire + human schedule,
 /// fields with sources), validate (preview, errors), policy validate + dry-run
 /// against the last pushes.
