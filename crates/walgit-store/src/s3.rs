@@ -2,8 +2,9 @@
 //!
 //! Uses `aws-sdk-s3` for all operations. GET responses are streamed via
 //! presigned URLs + `reqwest` because the SDK's `GetObjectOutput::body()`
-//! returns `&ByteStream` with no owned-body extractor. All other operations
-//! (PUT, HEAD, DELETE, LIST) use the SDK directly.
+//! returns `&ByteStream` with no owned-body extractor. The control lane and
+//! every bounded bulk lane own separate SDK and reqwest connection pools. All
+//! other operations (PUT, HEAD, DELETE, LIST) use the selected SDK directly.
 //!
 //! ## Object identity tokens
 //!
@@ -39,6 +40,7 @@
 
 use std::io::Cursor;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
@@ -51,19 +53,35 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    BoxStream, CasToken, ComposeSource, GetOptions, GetResult, MAX_VERSION_PAGE_SIZE, ObjectMeta,
-    ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode, PutOptions,
-    Result, StoreError, VersionCursor, VersionPage,
+    BoxStream, ByteStream, CasToken, ComposeSource, GetOptions, GetResult, MAX_VERSION_PAGE_SIZE,
+    ObjectMeta, ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode,
+    PutOptions, Result, StoreError, VersionCursor, VersionPage,
 };
 
 /// S3-compatible object store.
 pub struct S3Store {
-    client: S3Client,
+    /// Dedicated connection pool for control metadata and coordination.
+    control: S3Client,
+    /// Independent connection pools for pack, bundle, LFS, and ranged data.
+    bulk: Vec<S3Client>,
+    bulk_next: std::sync::atomic::AtomicUsize,
     bucket: String,
-    /// reqwest client for streaming GETs via presigned URLs.
-    http: reqwest::Client,
+    physical_prefix: String,
+    /// Dedicated presigned-GET pool for control objects.
+    control_http: reqwest::Client,
+    /// Independent presigned-GET pools paired with `bulk`.
+    bulk_http: Vec<reqwest::Client>,
+    bulk_permits: Arc<tokio::sync::Semaphore>,
+    bulk_permits_total: usize,
+    permit_wait_warn: Duration,
     multipart_threshold: u64,
     multipart_part_size: u64,
+}
+
+struct S3DataLane {
+    client: S3Client,
+    http: reqwest::Client,
+    bulk_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl S3Store {
@@ -104,26 +122,54 @@ impl S3Store {
             config_loader = config_loader.credentials_provider(credentials);
         }
         let shared_config = config_loader.load().await;
-        let mut s3_config = closed_s3_config_builder(&shared_config, cfg);
+        let build_client = || {
+            let mut builder =
+                closed_s3_config_builder(&shared_config, cfg, independent_aws_http_client());
+            if let Some(credentials) = explicit_credentials.clone() {
+                builder = builder.credentials_provider(credentials);
+            }
+            S3Client::from_conf(builder.build())
+        };
 
-        if let Some(credentials) = explicit_credentials {
-            s3_config = s3_config.credentials_provider(credentials);
+        let control = build_client();
+        let control_http = independent_data_http_client()?;
+        let mut bulk = Vec::with_capacity(cfg.s3.bulk_clients);
+        let mut bulk_http = Vec::with_capacity(cfg.s3.bulk_clients);
+        for _ in 0..cfg.s3.bulk_clients {
+            bulk.push(build_client());
+            bulk_http.push(independent_data_http_client()?);
         }
-
-        let client = S3Client::from_conf(s3_config.build());
-        let http = reqwest::Client::builder().build()?;
 
         let multipart_part_size = multipart_part_size(1, cfg.multipart_part_size.as_u64())?;
 
         let store = S3Store {
-            client,
+            control,
+            bulk,
+            bulk_next: std::sync::atomic::AtomicUsize::new(0),
             bucket: cfg.bucket.clone(),
-            http,
+            physical_prefix: crate::traffic::normalized_store_prefix(&cfg.prefix),
+            control_http,
+            bulk_http,
+            bulk_permits: Arc::new(tokio::sync::Semaphore::new(cfg.s3.bulk_concurrency)),
+            bulk_permits_total: cfg.s3.bulk_concurrency,
+            permit_wait_warn: Duration::from_secs(1),
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size,
         };
         store.verify_versioning().await?;
         Ok(store)
+    }
+
+    /// Set the warning threshold for observable bulk-lane queue waits.
+    pub fn with_permit_wait_warn(mut self, duration: Duration) -> Self {
+        self.permit_wait_warn = duration;
+        self
+    }
+
+    fn next_bulk_index(&self) -> usize {
+        self.bulk_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.bulk.len()
     }
 
     /// `bytes=start-(end-1)` for a half-open range (S3 Range is inclusive).
@@ -133,11 +179,67 @@ impl S3Store {
 
     // ---- GET via presigned URL + reqwest (true streaming) ---------------
 
-    async fn presigned_get(&self, key: &str, opts: &GetOptions) -> Result<reqwest::Response> {
+    async fn data_lane(&self, key: &str, ranged: bool, force_bulk: bool) -> Result<S3DataLane> {
+        if force_bulk
+            || ranged
+            || matches!(
+                crate::traffic::classify_data_key(key, &self.physical_prefix),
+                crate::traffic::DataTraffic::Bulk
+            )
+        {
+            let index = self.next_bulk_index();
+            let started = std::time::Instant::now();
+            let permit = self
+                .bulk_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    StoreError::other(anyhow::anyhow!("s3 bulk admission is unavailable"))
+                })?;
+            let queued = started.elapsed();
+            if queued.as_millis() > 0 {
+                tracing::Span::current().record("queued_ms", queued.as_millis() as u64);
+            }
+            metrics::histogram!("walgit_store_bulk_queue_seconds").record(queued.as_secs_f64());
+            if queued > Duration::ZERO {
+                metrics::histogram!("walgit_lock_wait_seconds", "lock" => "s3_bulk_permit")
+                    .record(queued.as_secs_f64());
+            }
+            if queued >= self.permit_wait_warn {
+                tracing::warn!(
+                    lock = "s3_bulk_permit",
+                    wait_ms = queued.as_millis() as u64,
+                    "lock wait"
+                );
+            }
+            metrics::gauge!("walgit_store_bulk_inflight")
+                .set((self.bulk_permits_total - self.bulk_permits.available_permits()) as f64);
+            Ok(S3DataLane {
+                client: self.bulk[index].clone(),
+                http: self.bulk_http[index].clone(),
+                bulk_permit: Some(permit),
+            })
+        } else {
+            Ok(S3DataLane {
+                client: self.control.clone(),
+                http: self.control_http.clone(),
+                bulk_permit: None,
+            })
+        }
+    }
+
+    async fn presigned_get(
+        &self,
+        client: &S3Client,
+        http: &reqwest::Client,
+        key: &str,
+        opts: &GetOptions,
+    ) -> Result<reqwest::Response> {
         let presigning = PresigningConfig::expires_in(Duration::from_secs(60))
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning config: {e}")))?;
 
-        let mut builder = self.client.get_object().bucket(&self.bucket).key(key);
+        let mut builder = client.get_object().bucket(&self.bucket).key(key);
 
         if let Some(v) = &opts.if_none_match {
             builder = builder.if_none_match(v.as_str());
@@ -157,7 +259,7 @@ impl S3Store {
             .await
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning get: {e}")))?;
 
-        let mut req = self.http.get(presigned.uri());
+        let mut req = http.get(presigned.uri());
         for (name, value) in presigned.headers() {
             req = req.header(name, value);
         }
@@ -171,6 +273,7 @@ impl S3Store {
         key: &str,
         resp: reqwest::Response,
         requested_version_id: Option<&ObjectVersionId>,
+        bulk_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<GetResult> {
         let status = resp.status();
         let etag = resp
@@ -216,10 +319,12 @@ impl S3Store {
                     version,
                     object_version_id: Some(object_version_id),
                 };
-                let body = resp
-                    .bytes_stream()
-                    .map(|r| r.map_err(|e| sanitized_reqwest_error("get body", e)))
-                    .boxed();
+                let body = retain_bulk_permit(
+                    resp.bytes_stream()
+                        .map(|item| item.map_err(|e| sanitized_reqwest_error("get body", e)))
+                        .boxed(),
+                    bulk_permit,
+                );
                 Ok(GetResult::Object { meta, body })
             }
             304 => Ok(GetResult::NotModified {
@@ -238,17 +343,51 @@ impl S3Store {
     }
 }
 
+fn retain_bulk_permit(
+    body: ByteStream,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> ByteStream {
+    futures::stream::unfold((body, permit), |(mut body, permit)| async move {
+        match body.next().await {
+            Some(Ok(bytes)) => Some((Ok(bytes), (body, permit))),
+            Some(Err(error)) => {
+                drop(permit);
+                Some((Err(error), (body, None)))
+            }
+            None => None,
+        }
+    })
+    .boxed()
+}
+
 fn closed_s3_config_builder(
     shared_config: &aws_config::SdkConfig,
     cfg: &walgit_config::StoreConfig,
+    http_client: aws_sdk_s3::config::SharedHttpClient,
 ) -> aws_sdk_s3::config::Builder {
     aws_sdk_s3::config::Builder::from(shared_config)
+        .http_client(http_client)
         .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
         .endpoint_url(&cfg.s3.endpoint)
         .use_fips(false)
         .use_dual_stack(false)
         .force_path_style(cfg.s3.force_path_style)
         .behavior_version_latest()
+}
+
+fn independent_aws_http_client() -> aws_sdk_s3::config::SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .build_https()
+}
+
+fn independent_data_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(64)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
 }
 
 const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -776,13 +915,18 @@ impl ObjectStore for S3Store {
     }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
-        let resp = self.presigned_get(key, &opts).await?;
-        Self::get_result_from_response(key, resp, opts.object_version_id.as_ref())
+        let S3DataLane {
+            client,
+            http,
+            bulk_permit,
+        } = self.data_lane(key, opts.range.is_some(), false).await?;
+        let resp = self.presigned_get(&client, &http, key, &opts).await?;
+        Self::get_result_from_response(key, resp, opts.object_version_id.as_ref(), bulk_permit)
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let resp = self
-            .client
+            .control
             .head_object()
             .bucket(&self.bucket)
             .key(key)
@@ -830,7 +974,9 @@ impl ObjectStore for S3Store {
         // before the provider can make a shortened object visible.
         let bytes = read_declared_body(&mut reader, len).await?;
 
-        let mut builder = self
+        let lane = self.data_lane(key, false, false).await?;
+
+        let mut builder = lane
             .client
             .put_object()
             .bucket(&self.bucket)
@@ -874,7 +1020,7 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
-        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
+        let mut request = self.control.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
             request = request.if_match(want.as_str());
         }
@@ -909,7 +1055,7 @@ impl ObjectStore for S3Store {
         version_id: &ObjectVersionId,
     ) -> Result<Option<ObjectMeta>> {
         let result = self
-            .client
+            .control
             .head_object()
             .bucket(&self.bucket)
             .key(key)
@@ -969,7 +1115,7 @@ impl ObjectStore for S3Store {
 
     async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
         let response = self
-            .client
+            .control
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
@@ -1003,7 +1149,7 @@ impl ObjectStore for S3Store {
             ));
         }
         let mut request = self
-            .client
+            .control
             .list_object_versions()
             .bucket(&self.bucket)
             .prefix(prefix)
@@ -1068,7 +1214,7 @@ impl ObjectStore for S3Store {
 
     async fn verify_versioning(&self) -> Result<()> {
         let response = self
-            .client
+            .control
             .get_bucket_versioning()
             .bucket(&self.bucket)
             .send()
@@ -1082,7 +1228,7 @@ impl ObjectStore for S3Store {
         prefix: &str,
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let client = self.client.clone();
+        let client = self.control.clone();
         let bucket = self.bucket.clone();
         let prefix = prefix.to_owned();
         let start_after = start_after.map(|s| s.to_owned());
@@ -1159,7 +1305,7 @@ impl ObjectStore for S3Store {
         let mut continuation_token: Option<String> = None;
         loop {
             let mut builder = self
-                .client
+                .control
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix)
@@ -1261,8 +1407,9 @@ impl ObjectStore for S3Store {
         // sees a partially uploaded layout that later exceeds 10,000 parts.
         let part_target = multipart_part_size(total, self.multipart_part_size)?;
         let plans = compose_part_plan(&sizes, part_target)?;
+        let lane = self.data_lane(dest, false, true).await?;
 
-        let mut create = self
+        let mut create = lane
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
@@ -1273,10 +1420,9 @@ impl ObjectStore for S3Store {
         if opts.immutable {
             create = create.cache_control("public, max-age=31536000, immutable");
         }
-        let upload = create
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error("create multipart", dest, e))?;
+        let upload_result = create.send().await;
+        drop(lane);
+        let upload = upload_result.map_err(|e| classify_sdk_error("create multipart", dest, e))?;
         let upload_id = upload
             .upload_id()
             .ok_or_else(|| {
@@ -1293,7 +1439,8 @@ impl ObjectStore for S3Store {
                     ComposePartPlan::Copy(range) => {
                         let source = &sources[range.source];
                         let range_end = range.start + range.len - 1;
-                        let part = self
+                        let lane = self.data_lane(dest, false, true).await?;
+                        let part_result = lane
                             .client
                             .upload_part_copy()
                             .bucket(&self.bucket)
@@ -1304,7 +1451,9 @@ impl ObjectStore for S3Store {
                             .copy_source_range(format!("bytes={}-{}", range.start, range_end))
                             .copy_source_if_match(source.cas_token.as_str())
                             .send()
-                            .await
+                            .await;
+                        drop(lane);
+                        let part = part_result
                             .map_err(|e| classify_sdk_error("upload part copy", &source.key, e))?;
                         let etag = part
                             .copy_part_result()
@@ -1348,7 +1497,8 @@ impl ObjectStore for S3Store {
                                 "s3 compose upload part length changed after planning".into(),
                             ));
                         }
-                        let part = self
+                        let lane = self.data_lane(dest, false, true).await?;
+                        let part_result = lane
                             .client
                             .upload_part()
                             .bucket(&self.bucket)
@@ -1358,8 +1508,10 @@ impl ObjectStore for S3Store {
                             .body(S3ByteStream::from(Bytes::from(buf)))
                             .content_length(len as i64)
                             .send()
-                            .await
-                            .map_err(|e| classify_sdk_error("upload part", dest, e))?;
+                            .await;
+                        drop(lane);
+                        let part =
+                            part_result.map_err(|e| classify_sdk_error("upload part", dest, e))?;
                         parts.push(
                             aws_sdk_s3::types::CompletedPart::builder()
                                 .e_tag(part.e_tag().unwrap_or("").to_owned())
@@ -1379,7 +1531,8 @@ impl ObjectStore for S3Store {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
-        let complete = self
+        let lane = self.data_lane(dest, false, true).await?;
+        let complete = lane
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
@@ -1387,7 +1540,9 @@ impl ObjectStore for S3Store {
             .upload_id(&upload_id)
             .multipart_upload(completed);
         let complete = apply_complete_condition(complete, &opts.mode);
-        let resp = match complete.send().await {
+        let complete_result = complete.send().await;
+        drop(lane);
+        let resp = match complete_result {
             Ok(r) => r,
             Err(e) => {
                 self.abort_multipart_after_failure(dest, &upload_id).await;
@@ -1418,7 +1573,7 @@ impl ObjectStore for S3Store {
         let presigning = PresigningConfig::expires_in(ttl)
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning config: {e}")))?;
         let presigned = self
-            .client
+            .control
             .get_object()
             .bucket(&self.bucket)
             .key(key)
@@ -1481,7 +1636,8 @@ impl S3Store {
         opts: &PutOptions,
     ) -> Result<ObjectMeta> {
         let part_size = multipart_part_size(len, self.multipart_part_size)?;
-        let mut create = self
+        let lane = self.data_lane(key, false, true).await?;
+        let mut create = lane
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
@@ -1494,10 +1650,9 @@ impl S3Store {
             create = create.cache_control("public, max-age=31536000, immutable");
         }
 
-        let upload = create
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error("create multipart", key, e))?;
+        let upload_result = create.send().await;
+        drop(lane);
+        let upload = upload_result.map_err(|e| classify_sdk_error("create multipart", key, e))?;
 
         let upload_id = upload
             .upload_id()
@@ -1522,7 +1677,8 @@ impl S3Store {
             };
             let actual = buf.len() as u64;
 
-            let part = match self
+            let lane = self.data_lane(key, false, true).await?;
+            let part_result = lane
                 .client
                 .upload_part()
                 .bucket(&self.bucket)
@@ -1532,8 +1688,9 @@ impl S3Store {
                 .body(S3ByteStream::from(buf))
                 .content_length(actual as i64)
                 .send()
-                .await
-            {
+                .await;
+            drop(lane);
+            let part = match part_result {
                 Ok(p) => p,
                 Err(e) => {
                     self.abort_multipart_after_failure(key, &upload_id).await;
@@ -1563,7 +1720,8 @@ impl S3Store {
             .set_parts(Some(uploaded_parts))
             .build();
 
-        let complete = self
+        let lane = self.data_lane(key, false, true).await?;
+        let complete = lane
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
@@ -1571,7 +1729,9 @@ impl S3Store {
             .upload_id(&upload_id)
             .multipart_upload(completed);
         let complete = apply_complete_condition(complete, &opts.mode);
-        let resp = match complete.send().await {
+        let complete_result = complete.send().await;
+        drop(lane);
+        let resp = match complete_result {
             Ok(r) => r,
             Err(e) => {
                 self.abort_multipart_after_failure(key, &upload_id).await;
@@ -1595,7 +1755,8 @@ impl S3Store {
     }
 
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
-        self.client
+        let lane = self.data_lane(key, false, true).await?;
+        lane.client
             .abort_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
@@ -1648,8 +1809,172 @@ impl S3Store {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::*;
+
+    fn lane_test_store(bulk_clients: usize, bulk_concurrency: usize) -> S3Store {
+        let cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "lane-test-bucket".into(),
+            ..Default::default()
+        };
+        let shared_config = aws_config::SdkConfig::builder()
+            .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
+            .build();
+        let build_client = || {
+            S3Client::from_conf(
+                closed_s3_config_builder(&shared_config, &cfg, independent_aws_http_client())
+                    .credentials_provider(Credentials::new(
+                        "test-access",
+                        "test-secret",
+                        None,
+                        None,
+                        "lane-test",
+                    ))
+                    .build(),
+            )
+        };
+        S3Store {
+            control: build_client(),
+            bulk: (0..bulk_clients).map(|_| build_client()).collect(),
+            bulk_next: std::sync::atomic::AtomicUsize::new(0),
+            bucket: cfg.bucket,
+            physical_prefix: String::new(),
+            control_http: independent_data_http_client().unwrap(),
+            bulk_http: (0..bulk_clients)
+                .map(|_| independent_data_http_client().unwrap())
+                .collect(),
+            bulk_permits: Arc::new(tokio::sync::Semaphore::new(bulk_concurrency)),
+            bulk_permits_total: bulk_concurrency,
+            permit_wait_warn: Duration::from_secs(1),
+            multipart_threshold: cfg.multipart_threshold.as_u64(),
+            multipart_part_size: cfg.multipart_part_size.as_u64(),
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_bulk_admission_never_blocks_control_selection() {
+        let store = Arc::new(lane_test_store(2, 1));
+        let held = store
+            .data_lane("repos/o/r/wal/a.pack", false, false)
+            .await
+            .expect("first bulk lane");
+        assert!(held.bulk_permit.is_some());
+        assert_eq!(store.bulk_permits.available_permits(), 0);
+
+        let waiting_store = store.clone();
+        let mut waiting = tokio::spawn(async move {
+            waiting_store
+                .data_lane("repos/o/r/wal/b.pack", false, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "a second bulk operation must remain queued"
+        );
+
+        for control_key in ["repos/o/r/manifest.pb", "repos/o/r/events/cursor.json"] {
+            let control = tokio::time::timeout(
+                Duration::from_millis(50),
+                store.data_lane(control_key, false, false),
+            )
+            .await
+            .expect("control selection must not wait")
+            .expect("control lane");
+            assert!(control.bulk_permit.is_none(), "{control_key}");
+        }
+
+        drop(held);
+        let resumed = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("queued bulk operation resumes")
+            .expect("bulk selection task")
+            .expect("second bulk lane");
+        assert!(resumed.bulk_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn closed_bulk_admission_fails_without_control_fallback() {
+        let store = lane_test_store(1, 1);
+        store.bulk_permits.close();
+        let result = store.data_lane("repos/o/r/wal/a.pack", false, false).await;
+        assert!(matches!(result, Err(StoreError::Other(_))));
+
+        let control = store
+            .data_lane("repos/o/r/manifest.pb", false, false)
+            .await
+            .expect("closed bulk admission does not close control");
+        assert!(control.bulk_permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_bulk_waiter_does_not_consume_admission() {
+        let store = Arc::new(lane_test_store(1, 1));
+        let held = store
+            .data_lane("repos/o/r/wal/a.pack", false, false)
+            .await
+            .unwrap();
+        let waiting_store = store.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_store
+                .data_lane("repos/o/r/wal/b.pack", false, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        match waiting.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("queued bulk operation completed before cancellation"),
+        }
+        drop(held);
+        assert_eq!(store.bulk_permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn bulk_clients_are_selected_round_robin_within_bounds() {
+        let store = lane_test_store(3, 1);
+        let selected: Vec<usize> = (0..8).map(|_| store.next_bulk_index()).collect();
+        assert_eq!(selected, [0, 1, 2, 0, 1, 2, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn bulk_get_body_holds_permit_until_eof_or_drop() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let mut body = retain_bulk_permit(
+            Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"chunk"))])),
+            Some(permit),
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"chunk")
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert!(body.next().await.is_none());
+        assert_eq!(permits.available_permits(), 1);
+
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let mut body = retain_bulk_permit(
+            Box::pin(futures::stream::iter([Err(StoreError::InvalidArgument(
+                "stream failed".into(),
+            ))])),
+            Some(permit),
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(permits.available_permits(), 1);
+
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let body = retain_bulk_permit(Box::pin(futures::stream::pending()), Some(permit));
+        assert_eq!(permits.available_permits(), 0);
+        drop(body);
+        assert_eq!(permits.available_permits(), 1);
+    }
 
     #[test]
     fn explicit_credentials_never_fall_back_when_selected() {
@@ -1761,15 +2086,16 @@ mod tests {
         cfg.s3.region = "trusted-region-1".into();
         cfg.s3.force_path_style = true;
 
-        let service_config = closed_s3_config_builder(&shared_config, &cfg)
-            .credentials_provider(Credentials::new(
-                "test-access",
-                "test-secret",
-                None,
-                None,
-                "endpoint-authority-test",
-            ))
-            .build();
+        let service_config =
+            closed_s3_config_builder(&shared_config, &cfg, independent_aws_http_client())
+                .credentials_provider(Credentials::new(
+                    "test-access",
+                    "test-secret",
+                    None,
+                    None,
+                    "endpoint-authority-test",
+                ))
+                .build();
         let request = S3Client::from_conf(service_config)
             .get_object()
             .bucket(&cfg.bucket)

@@ -80,6 +80,8 @@ access_key_env = ""              # default_chain requires all three names empty.
 secret_key_env = ""              # use credential_mode = "explicit_env" and name both access/secret variables.
 session_token_env = ""           # explicit_env may also require one named temporary session-token variable.
 force_path_style = false          # true for most self-hosted S3 implementations
+bulk_clients = 4                  # 1..=16 independent SDK + HTTP pools for pack/bundle/LFS/raw-temp bytes and ranged reads
+bulk_concurrency = 32             # 1..=256 bulk operations per process; control traffic never acquires these permits
 # explicit_env never falls back to ambient AWS identity when a named variable is absent, empty, or non-Unicode.
 # The explicit endpoint uses exact canonical origin syntax with no path or trailing slash, so ambient AWS endpoint
 # overrides cannot select the provider.

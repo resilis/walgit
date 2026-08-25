@@ -60,6 +60,14 @@ production approval. No PR1 image is production-deployable.
   multipart operations. The design continues to support a 64 GiB receive, a
   16 GiB LFS object, and 30 GiB or larger packs and bundles. It has no 4 GiB
   product limit.
+- S3 control data uses one dedicated AWS SDK transport and presigned-GET HTTP
+  pool. Pack, bundle, LFS, temporary raw payload, unknown data, and every
+  ranged read use independent bulk SDK and HTTP pools. The closed classifier
+  defaults malformed, future, and wrong-prefix data keys to bulk. Bulk
+  requests use bounded per-provider-call permits, and a streamed GET retains
+  its permit through EOF, error, cancellation, or drop. Bulk never falls back
+  to the control lane. Separate application transports do not reserve host
+  NIC bandwidth or provider-account quota.
 - Credential selection is a closed `default_chain | explicit_env` mode.
   `default_chain` accepts no custom variable names and delegates to the
   refreshable AWS SDK chain, including standard AWS environment variables and

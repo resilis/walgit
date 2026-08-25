@@ -63,6 +63,8 @@ credential_mode = "explicit_env"
 access_key_env = "AWS_ACCESS_KEY_ID"       # compose.yaml fixes walgit-dev / walgit-dev-secret for rustfs
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = true
+bulk_clients = 4                    # 1..=16 independent SDK + HTTP pools for bulk and ranged data
+bulk_concurrency = 32               # 1..=256 concurrent bulk provider requests
 # Bucket versioning is mandatory. WalGit verifies it during startup.
 # A GCS bucket instead (Application Default Credentials):
 # backend = "gcs"

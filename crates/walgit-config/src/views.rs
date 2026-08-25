@@ -266,6 +266,8 @@ pub struct SafeS3View {
     pub secret_key_env: String,
     pub session_token_env: String,
     pub force_path_style: bool,
+    pub bulk_clients: usize,
+    pub bulk_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -504,6 +506,8 @@ impl SafeConfigView {
                     secret_key_env: config.store.s3.secret_key_env.clone(),
                     session_token_env: config.store.s3.session_token_env.clone(),
                     force_path_style: config.store.s3.force_path_style,
+                    bulk_clients: config.store.s3.bulk_clients,
+                    bulk_concurrency: config.store.s3.bulk_concurrency,
                 },
                 max_retries: config.store.max_retries,
                 multipart_threshold: config.store.multipart_threshold,

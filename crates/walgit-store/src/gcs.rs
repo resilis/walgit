@@ -148,6 +148,7 @@ pub struct GcsStore {
     /// `StorageControl` instances queue a 200-byte GET behind a 7.5 GB
     /// download (measured: control calls 3–11 s while 32 stripes stream).
     bulk_http: Vec<reqwest::Client>,
+    physical_prefix: String,
     creds: Option<google_cloud_auth::credentials::Credentials>,
     bucket: String,
     /// Global cap on concurrent bulk requests per process (leaves headroom).
@@ -222,6 +223,7 @@ impl GcsStore {
             bulk,
             bulk_next: std::sync::atomic::AtomicUsize::new(0),
             bulk_http,
+            physical_prefix: crate::traffic::normalized_store_prefix(&cfg.prefix),
             creds,
             bucket: cfg.bucket.clone(),
             bulk_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -238,25 +240,11 @@ impl GcsStore {
         Ok(store)
     }
 
-    /// Bulk keys: pack data and side-files, bundles, LFS (everything that is
-    /// large or read by range); the rest is control plane.
-    fn is_bulk_key(key: &str) -> bool {
-        // Pack data + side-files, bundle *files* (not `bundles/list.pb`), LFS
-        // objects. Everything else — manifest, log, checkpoints, leases,
-        // bundle list, policy — is control plane and must never wait for a
-        // bulk permit (prod 2026-08-20: `bundles/list.pb` (753 B) classified
-        // bulk sat 455–472 s behind 32 stripes on the bulk semaphore while
-        // info/refs waited for it).
-        let name = key.rsplit('/').next().unwrap_or(key);
-        if name.ends_with(".pb") || name.ends_with(".json") {
-            return false;
-        }
-        key.contains("/wal/")
-            || key.starts_with("wal/")
-            || key.contains("/bundles/")
-            || key.starts_with("bundles/")
-            || key.contains("/lfs/")
-            || key.starts_with("lfs/")
+    fn is_bulk_key(&self, key: &str) -> bool {
+        matches!(
+            crate::traffic::classify_data_key(key, &self.physical_prefix),
+            crate::traffic::DataTraffic::Bulk
+        )
     }
 
     /// What a resume needs (pools/creds are Arc'd inside; cheap).
@@ -278,7 +266,7 @@ impl GcsStore {
         key: &str,
         ranged: bool,
     ) -> (&Storage, Option<tokio::sync::OwnedSemaphorePermit>) {
-        if ranged || Self::is_bulk_key(key) {
+        if ranged || self.is_bulk_key(key) {
             let i = self
                 .bulk_next
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -585,7 +573,7 @@ impl GcsStore {
         range: Option<std::ops::Range<u64>>,
         generation: Option<i64>,
     ) -> Result<ByteStream> {
-        if self.creds.is_some() && (range.is_some() || Self::is_bulk_key(key)) {
+        if self.creds.is_some() && (range.is_some() || self.is_bulk_key(key)) {
             return Ok(self.bulk_http_read(key, range, generation, None).await?.2);
         }
         let (client, permit) = self.data_client(key, range.is_some()).await;
@@ -751,7 +739,7 @@ impl ObjectStore for GcsStore {
 
         // Direct read (no if_none_match, or if_none_match with non-numeric
         // version that can never match a GCS generation).
-        if self.creds.is_some() && (opts.range.is_some() || Self::is_bulk_key(key)) {
+        if self.creds.is_some() && (opts.range.is_some() || self.is_bulk_key(key)) {
             let if_gen = match &opts.if_match {
                 Some(v) => match parse_generation(v) {
                     Some(g) => Some(g),
@@ -1845,35 +1833,6 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod bulk_key_tests {
-    use super::GcsStore;
-
-    #[test]
-    fn control_plane_keys_are_never_bulk() {
-        for k in [
-            "prefix/repos/o/r/manifest.pb",
-            "prefix/repos/o/r/log/0000000000000001.pb",
-            "prefix/repos/o/r/checkpoints/0000000000000001/refs.pb",
-            "prefix/repos/o/r/leases/compact.pb",
-            "prefix/repos/o/r/bundles/list.pb",
-            "prefix/repos/o/r/policy.json",
-            "prefix/repos/o/r/cache/api/v1/abc.json",
-        ] {
-            assert!(!GcsStore::is_bulk_key(k), "{k} must be control plane");
-        }
-        for k in [
-            "prefix/repos/o/r/wal/abc.pack",
-            "prefix/repos/o/r/wal/abc.idx",
-            "prefix/repos/o/r/wal/abc.commit-graph",
-            "prefix/repos/o/r/bundles/weekly/2026-abc.bundle",
-            "prefix/repos/o/r/lfs/objects/ab/cd/abcd",
-        ] {
-            assert!(GcsStore::is_bulk_key(k), "{k} must be bulk");
-        }
-    }
 }
 
 #[cfg(test)]
