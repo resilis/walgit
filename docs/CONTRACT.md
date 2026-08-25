@@ -151,6 +151,12 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `list_versions` pagination over objects and provider delete markers. `ComposeSource` pins each input by key,
   size, CAS token, and object-version ID. `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, and
   `util::{collect,once,file_stream,backoff,retry}` preserve the shared implementation surface.
+  The dormant S3 provider-proof boundary adds distinct opaque version and multipart cursors plus strict
+  single-page evidence DTOs. Each method issues exactly one ungrouped S3 request for at most 1,000 entries,
+  preserves exact marker presence and bytes, and fails closed on an incomplete or inconsistent response.
+  `Prefixed` adds the configured physical prefix once and removes it exactly once from evidence item keys; it
+  never rewrites opaque cursors. Other backends return `UnsupportedCapability`. This boundary does not activate
+  a scanner, controller, cleanup workflow, runtime route, or provider-pass claim.
 - `walgit-store::v2_control`: dormant strict persistence for the V2 repository
   authority. `ControlStore` receives a store that is already scoped to the
   configured `DeploymentPrefix`. It validates the full persisted

@@ -53,9 +53,11 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    BoxStream, ByteStream, CasToken, ComposeSource, GetOptions, GetResult, MAX_VERSION_PAGE_SIZE,
-    ObjectMeta, ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode,
-    PutOptions, Result, StoreError, VersionCursor, VersionPage,
+    BoxStream, ByteStream, CasToken, ComposeSource, GetOptions, GetResult,
+    MAX_S3_EVIDENCE_FIELD_BYTES, MAX_S3_EVIDENCE_PAGE_SIZE, MAX_VERSION_PAGE_SIZE, ObjectMeta,
+    ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode, PutOptions,
+    Result, S3MultipartEvidenceCursor, S3MultipartEvidenceItem, S3MultipartEvidencePage,
+    S3VersionEvidenceCursor, S3VersionEvidencePage, StoreError, VersionCursor, VersionPage,
 };
 
 /// S3-compatible object store.
@@ -248,6 +250,7 @@ impl S3Store {
             builder = builder.if_match(v.as_str());
         }
         if let Some(version_id) = &opts.object_version_id {
+            validate_requested_s3_version_id(version_id)?;
             builder = builder.version_id(version_id.as_str());
         }
         if let Some(r) = &opts.range {
@@ -846,9 +849,326 @@ fn successful_write_meta(
 
 fn usable_s3_version_id(version_id: Option<&str>) -> Option<ObjectVersionId> {
     version_id
-        .map(str::trim)
-        .filter(|id| !id.is_empty() && *id != "null")
+        .filter(|id| !id.is_empty() && id.len() <= MAX_S3_EVIDENCE_FIELD_BYTES && *id != "null")
         .map(ObjectVersionId::new)
+}
+
+fn validate_requested_s3_version_id(version_id: &ObjectVersionId) -> Result<()> {
+    if usable_s3_version_id(Some(version_id.as_str())).is_none() {
+        return Err(StoreError::InvalidArgument(
+            "S3 ObjectVersionId is empty, null, or exceeds 1024 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_s3_evidence(reason: &'static str) -> StoreError {
+    StoreError::InvalidArgument(format!("invalid S3 evidence page: {reason}"))
+}
+
+fn validate_s3_evidence_value(
+    value: &str,
+    allow_empty: bool,
+    reject_null: bool,
+    reason: &'static str,
+) -> Result<()> {
+    if value.len() > MAX_S3_EVIDENCE_FIELD_BYTES
+        || (!allow_empty && value.is_empty())
+        || (reject_null && value == "null")
+    {
+        return Err(invalid_s3_evidence(reason));
+    }
+    Ok(())
+}
+
+fn validate_optional_marker(value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        validate_s3_evidence_value(value, true, false, "marker is too long")?;
+    }
+    Ok(())
+}
+
+fn marker_echo_matches(request: Option<&str>, response: Option<&str>) -> bool {
+    request == response || matches!((request, response), (None, Some("")) | (Some(""), None))
+}
+
+fn validate_s3_evidence_request(prefix: &str, limit: usize) -> Result<()> {
+    validate_s3_evidence_value(prefix, true, false, "prefix is too long")?;
+    if !(1..=MAX_S3_EVIDENCE_PAGE_SIZE).contains(&limit) {
+        return Err(invalid_s3_evidence("page size is outside 1..=1000"));
+    }
+    Ok(())
+}
+
+fn validate_s3_version_cursor(cursor: &S3VersionEvidenceCursor) -> Result<()> {
+    validate_optional_marker(cursor.key_marker())?;
+    validate_optional_marker(cursor.version_id_marker())
+}
+
+fn validate_s3_multipart_cursor(cursor: &S3MultipartEvidenceCursor) -> Result<()> {
+    validate_optional_marker(cursor.key_marker())?;
+    validate_optional_marker(cursor.upload_id_marker())
+}
+
+fn decode_s3_version_evidence_page(
+    bucket: &str,
+    prefix: &str,
+    request_cursor: &S3VersionEvidenceCursor,
+    limit: usize,
+    response: &aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput,
+) -> Result<S3VersionEvidencePage> {
+    validate_s3_evidence_request(prefix, limit)?;
+    validate_s3_version_cursor(request_cursor)?;
+    if response.name() != Some(bucket) {
+        return Err(invalid_s3_evidence("bucket echo is missing or mismatched"));
+    }
+    if response.prefix() != Some(prefix) {
+        return Err(invalid_s3_evidence("prefix echo is missing or mismatched"));
+    }
+    if response.max_keys() != Some(limit as i32) {
+        return Err(invalid_s3_evidence(
+            "page-size echo is missing or mismatched",
+        ));
+    }
+    if response.delimiter().is_some() || !response.common_prefixes().is_empty() {
+        return Err(invalid_s3_evidence(
+            "response used grouped-prefix semantics",
+        ));
+    }
+    if response.encoding_type().is_some() {
+        return Err(invalid_s3_evidence("response used key encoding"));
+    }
+    validate_optional_marker(response.key_marker())?;
+    validate_optional_marker(response.version_id_marker())?;
+    if !marker_echo_matches(request_cursor.key_marker(), response.key_marker())
+        || !marker_echo_matches(
+            request_cursor.version_id_marker(),
+            response.version_id_marker(),
+        )
+    {
+        return Err(invalid_s3_evidence("request cursor echo is mismatched"));
+    }
+
+    let count = response
+        .versions()
+        .len()
+        .checked_add(response.delete_markers().len())
+        .ok_or_else(|| invalid_s3_evidence("entry count overflowed"))?;
+    if count > limit {
+        return Err(invalid_s3_evidence(
+            "entry count exceeds requested page size",
+        ));
+    }
+    let mut versions = Vec::with_capacity(count);
+    for version in response.versions() {
+        let key = version
+            .key()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted key"))?;
+        validate_s3_evidence_value(key, false, false, "version object key is invalid")?;
+        if !key.starts_with(prefix) {
+            return Err(invalid_s3_evidence(
+                "version object escaped the requested prefix",
+            ));
+        }
+        let version_id = version
+            .version_id()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted VersionId"))?;
+        validate_s3_evidence_value(
+            version_id,
+            false,
+            true,
+            "version object VersionId is invalid",
+        )?;
+        let size = version
+            .size()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted size"))?;
+        if size < 0 {
+            return Err(invalid_s3_evidence("version object size is negative"));
+        }
+        let is_latest = version
+            .is_latest()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted IsLatest"))?;
+        versions.push(ObjectVersion {
+            key: key.to_owned(),
+            object_version_id: ObjectVersionId::new(version_id),
+            cas_token: version
+                .e_tag()
+                .map(|etag| CasToken::new(etag.trim_matches('"').to_owned())),
+            size: size as u64,
+            kind: ObjectVersionKind::Object,
+            is_latest,
+        });
+    }
+    for marker in response.delete_markers() {
+        let key = marker
+            .key()
+            .ok_or_else(|| invalid_s3_evidence("delete marker omitted key"))?;
+        validate_s3_evidence_value(key, false, false, "delete marker key is invalid")?;
+        if !key.starts_with(prefix) {
+            return Err(invalid_s3_evidence(
+                "delete marker escaped the requested prefix",
+            ));
+        }
+        let version_id = marker
+            .version_id()
+            .ok_or_else(|| invalid_s3_evidence("delete marker omitted VersionId"))?;
+        validate_s3_evidence_value(
+            version_id,
+            false,
+            true,
+            "delete marker VersionId is invalid",
+        )?;
+        let is_latest = marker
+            .is_latest()
+            .ok_or_else(|| invalid_s3_evidence("delete marker omitted IsLatest"))?;
+        versions.push(ObjectVersion {
+            key: key.to_owned(),
+            object_version_id: ObjectVersionId::new(version_id),
+            cas_token: None,
+            size: 0,
+            kind: ObjectVersionKind::DeleteMarker,
+            is_latest,
+        });
+    }
+
+    let is_truncated = response
+        .is_truncated()
+        .ok_or_else(|| invalid_s3_evidence("response omitted IsTruncated"))?;
+    validate_optional_marker(response.next_key_marker())?;
+    validate_optional_marker(response.next_version_id_marker())?;
+    let response_next_cursor = S3VersionEvidenceCursor {
+        key_marker: response.next_key_marker().map(str::to_owned),
+        version_id_marker: response.next_version_id_marker().map(str::to_owned),
+    };
+    if is_truncated {
+        if response_next_cursor.key_marker.is_none()
+            || response_next_cursor.version_id_marker.is_none()
+        {
+            return Err(invalid_s3_evidence(
+                "truncated response omitted a next marker",
+            ));
+        }
+        if response_next_cursor == *request_cursor {
+            return Err(invalid_s3_evidence(
+                "truncated response repeated its request cursor",
+            ));
+        }
+    } else if response_next_cursor.key_marker.is_some()
+        || response_next_cursor.version_id_marker.is_some()
+    {
+        return Err(invalid_s3_evidence(
+            "terminal response included a next marker",
+        ));
+    }
+
+    Ok(S3VersionEvidencePage {
+        versions,
+        request_cursor: request_cursor.clone(),
+        response_next_cursor,
+        is_truncated,
+    })
+}
+
+fn decode_s3_multipart_evidence_page(
+    bucket: &str,
+    prefix: &str,
+    request_cursor: &S3MultipartEvidenceCursor,
+    limit: usize,
+    response: &aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput,
+) -> Result<S3MultipartEvidencePage> {
+    validate_s3_evidence_request(prefix, limit)?;
+    validate_s3_multipart_cursor(request_cursor)?;
+    if response.bucket() != Some(bucket) {
+        return Err(invalid_s3_evidence("bucket echo is missing or mismatched"));
+    }
+    if response.prefix() != Some(prefix) {
+        return Err(invalid_s3_evidence("prefix echo is missing or mismatched"));
+    }
+    if response.max_uploads() != Some(limit as i32) {
+        return Err(invalid_s3_evidence(
+            "page-size echo is missing or mismatched",
+        ));
+    }
+    if response.delimiter().is_some() || !response.common_prefixes().is_empty() {
+        return Err(invalid_s3_evidence(
+            "response used grouped-prefix semantics",
+        ));
+    }
+    if response.encoding_type().is_some() {
+        return Err(invalid_s3_evidence("response used key encoding"));
+    }
+    validate_optional_marker(response.key_marker())?;
+    validate_optional_marker(response.upload_id_marker())?;
+    if !marker_echo_matches(request_cursor.key_marker(), response.key_marker())
+        || !marker_echo_matches(
+            request_cursor.upload_id_marker(),
+            response.upload_id_marker(),
+        )
+    {
+        return Err(invalid_s3_evidence("request cursor echo is mismatched"));
+    }
+    if response.uploads().len() > limit {
+        return Err(invalid_s3_evidence(
+            "entry count exceeds requested page size",
+        ));
+    }
+    let mut uploads = Vec::with_capacity(response.uploads().len());
+    for upload in response.uploads() {
+        let key = upload
+            .key()
+            .ok_or_else(|| invalid_s3_evidence("multipart upload omitted key"))?;
+        validate_s3_evidence_value(key, false, false, "multipart upload key is invalid")?;
+        if !key.starts_with(prefix) {
+            return Err(invalid_s3_evidence(
+                "multipart upload escaped the requested prefix",
+            ));
+        }
+        let upload_id = upload
+            .upload_id()
+            .ok_or_else(|| invalid_s3_evidence("multipart upload omitted upload ID"))?;
+        validate_s3_evidence_value(upload_id, false, false, "multipart upload ID is invalid")?;
+        uploads.push(S3MultipartEvidenceItem {
+            key: key.to_owned(),
+            upload_id: upload_id.to_owned(),
+        });
+    }
+
+    let is_truncated = response
+        .is_truncated()
+        .ok_or_else(|| invalid_s3_evidence("response omitted IsTruncated"))?;
+    validate_optional_marker(response.next_key_marker())?;
+    validate_optional_marker(response.next_upload_id_marker())?;
+    let response_next_cursor = S3MultipartEvidenceCursor {
+        key_marker: response.next_key_marker().map(str::to_owned),
+        upload_id_marker: response.next_upload_id_marker().map(str::to_owned),
+    };
+    if is_truncated {
+        if response_next_cursor.key_marker.is_none()
+            || response_next_cursor.upload_id_marker.is_none()
+        {
+            return Err(invalid_s3_evidence(
+                "truncated response omitted a next marker",
+            ));
+        }
+        if response_next_cursor == *request_cursor {
+            return Err(invalid_s3_evidence(
+                "truncated response repeated its request cursor",
+            ));
+        }
+    } else if response_next_cursor.key_marker.is_some()
+        || response_next_cursor.upload_id_marker.is_some()
+    {
+        return Err(invalid_s3_evidence(
+            "terminal response included a next marker",
+        ));
+    }
+
+    Ok(S3MultipartEvidencePage {
+        uploads,
+        request_cursor: request_cursor.clone(),
+        response_next_cursor,
+        is_truncated,
+    })
 }
 
 fn require_current_s3_version_id(
@@ -1054,6 +1374,7 @@ impl ObjectStore for S3Store {
         key: &str,
         version_id: &ObjectVersionId,
     ) -> Result<Option<ObjectMeta>> {
+        validate_requested_s3_version_id(version_id)?;
         let result = self
             .control
             .head_object()
@@ -1114,6 +1435,7 @@ impl ObjectStore for S3Store {
     }
 
     async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        validate_requested_s3_version_id(version_id)?;
         let response = self
             .control
             .delete_object()
@@ -1148,68 +1470,77 @@ impl ObjectStore for S3Store {
                 "version cursor belongs to another backend".into(),
             ));
         }
+        let evidence_cursor = cursor.map_or_else(S3VersionEvidenceCursor::initial, |cursor| {
+            S3VersionEvidenceCursor {
+                key_marker: cursor.key_marker.clone(),
+                version_id_marker: cursor
+                    .version_id_marker
+                    .as_ref()
+                    .map(|version| version.as_str().to_owned()),
+            }
+        });
+        let page = self
+            .list_s3_version_evidence_page(prefix, &evidence_cursor, limit)
+            .await?;
+        let next = page.is_truncated.then(|| VersionCursor {
+            key_marker: page.response_next_cursor.key_marker.clone(),
+            version_id_marker: page
+                .response_next_cursor
+                .version_id_marker
+                .as_deref()
+                .map(ObjectVersionId::new),
+            page_token: None,
+        });
+        Ok(VersionPage {
+            versions: page.versions,
+            next,
+        })
+    }
+
+    async fn list_s3_version_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3VersionEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3VersionEvidencePage> {
+        validate_s3_evidence_request(prefix, limit)?;
+        validate_s3_version_cursor(cursor)?;
         let mut request = self
             .control
             .list_object_versions()
             .bucket(&self.bucket)
             .prefix(prefix)
             .max_keys(limit as i32);
-        if let Some(cursor) = cursor {
-            request = request.set_key_marker(cursor.key_marker.clone());
-            request = request.set_version_id_marker(
-                cursor
-                    .version_id_marker
-                    .as_ref()
-                    .map(|version| version.as_str().to_owned()),
-            );
-        }
-        let response = request
+        request = request.set_key_marker(cursor.key_marker.clone());
+        request = request.set_version_id_marker(cursor.version_id_marker.clone());
+        let response = request.send().await.map_err(|error| {
+            classify_sdk_error("list S3 version evidence", "<evidence-prefix>", error)
+        })?;
+        decode_s3_version_evidence_page(&self.bucket, prefix, cursor, limit, &response)
+    }
+
+    async fn list_s3_multipart_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3MultipartEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3MultipartEvidencePage> {
+        validate_s3_evidence_request(prefix, limit)?;
+        validate_s3_multipart_cursor(cursor)?;
+        let response = self
+            .control
+            .list_multipart_uploads()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_uploads(limit as i32)
+            .set_key_marker(cursor.key_marker.clone())
+            .set_upload_id_marker(cursor.upload_id_marker.clone())
             .send()
             .await
-            .map_err(|error| classify_sdk_error("list versions", prefix, error))?;
-        let mut versions =
-            Vec::with_capacity(response.versions().len() + response.delete_markers().len());
-        for version in response.versions() {
-            let version_id = version.version_id().ok_or_else(|| {
-                StoreError::InvalidArgument(
-                    "s3 version listing returned an object without VersionId".into(),
-                )
+            .map_err(|error| {
+                classify_sdk_error("list S3 multipart evidence", "<evidence-prefix>", error)
             })?;
-            versions.push(ObjectVersion {
-                key: version.key().unwrap_or_default().to_owned(),
-                object_version_id: ObjectVersionId::new(version_id),
-                cas_token: version
-                    .e_tag()
-                    .map(|etag| CasToken::new(etag.trim_matches('"').to_owned())),
-                size: version.size().unwrap_or(0).max(0) as u64,
-                kind: ObjectVersionKind::Object,
-                is_latest: version.is_latest().unwrap_or(false),
-            });
-        }
-        for marker in response.delete_markers() {
-            let version_id = marker.version_id().ok_or_else(|| {
-                StoreError::InvalidArgument(
-                    "s3 version listing returned a delete marker without VersionId".into(),
-                )
-            })?;
-            versions.push(ObjectVersion {
-                key: marker.key().unwrap_or_default().to_owned(),
-                object_version_id: ObjectVersionId::new(version_id),
-                cas_token: None,
-                size: 0,
-                kind: ObjectVersionKind::DeleteMarker,
-                is_latest: marker.is_latest().unwrap_or(false),
-            });
-        }
-        let next = response
-            .is_truncated()
-            .unwrap_or(false)
-            .then(|| VersionCursor {
-                key_marker: response.next_key_marker().map(str::to_owned),
-                version_id_marker: response.next_version_id_marker().map(ObjectVersionId::new),
-                page_token: None,
-            });
-        Ok(VersionPage { versions, next })
+        decode_s3_multipart_evidence_page(&self.bucket, prefix, cursor, limit, &response)
     }
 
     async fn verify_versioning(&self) -> Result<()> {
@@ -2121,12 +2452,22 @@ mod tests {
             "ComposeObject completion",
             "CompleteMultipartUpload",
         ] {
-            for missing in [None, Some(""), Some("   "), Some("null")] {
+            for missing in [None, Some(""), Some("null")] {
                 assert!(matches!(
                     successful_write_meta(operation, "key", 4, Some("\"etag\""), missing),
                     Err(StoreError::AmbiguousWrite { .. })
                 ));
             }
+            assert!(matches!(
+                successful_write_meta(
+                    operation,
+                    "key",
+                    4,
+                    Some("\"etag\""),
+                    Some(&"x".repeat(1_025)),
+                ),
+                Err(StoreError::AmbiguousWrite { .. })
+            ));
             let meta =
                 successful_write_meta(operation, "key", 4, Some("\"etag\""), Some("version-id"))
                     .expect("version-addressed successful write");
@@ -2144,7 +2485,7 @@ mod tests {
             "VersionId on successful current GET",
             "VersionId on successful current HEAD",
         ] {
-            for missing in [None, Some(""), Some("   "), Some("null"), Some(" null ")] {
+            for missing in [None, Some(""), Some("null")] {
                 assert!(matches!(
                     require_current_s3_version_id(capability, missing),
                     Err(StoreError::UnsupportedCapability { .. })
@@ -2154,7 +2495,13 @@ mod tests {
                 require_current_s3_version_id(capability, Some(" version-id "))
                     .expect("usable version ID")
                     .as_str(),
-                "version-id"
+                " version-id "
+            );
+            assert_eq!(
+                require_current_s3_version_id(capability, Some(" null "))
+                    .expect("only exact null is invalid")
+                    .as_str(),
+                " null "
             );
         }
     }
@@ -2662,5 +3009,428 @@ mod tests {
 
         let allowed = sdk_error_diagnostic("get", "service", Some(403), "AccessDenied").to_string();
         assert!(allowed.contains("code=AccessDenied"), "{allowed}");
+    }
+
+    const EVIDENCE_BUCKET: &str = "evidence-bucket";
+    const EVIDENCE_PREFIX: &str = "deployment/";
+
+    fn version_output(
+        cursor: &S3VersionEvidenceCursor,
+        truncated: bool,
+        next: S3VersionEvidenceCursor,
+    ) -> aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput {
+        aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput::builder()
+            .name(EVIDENCE_BUCKET)
+            .prefix(EVIDENCE_PREFIX)
+            .max_keys(10)
+            .set_key_marker(cursor.key_marker.clone())
+            .set_version_id_marker(cursor.version_id_marker.clone())
+            .set_next_key_marker(next.key_marker)
+            .set_next_version_id_marker(next.version_id_marker)
+            .is_truncated(truncated)
+            .versions(
+                aws_sdk_s3::types::ObjectVersion::builder()
+                    .key(format!("{EVIDENCE_PREFIX}object"))
+                    .version_id(" version-id ")
+                    .size(7)
+                    .is_latest(true)
+                    .build(),
+            )
+            .delete_markers(
+                aws_sdk_s3::types::DeleteMarkerEntry::builder()
+                    .key(format!("{EVIDENCE_PREFIX}deleted"))
+                    .version_id("delete-id")
+                    .is_latest(false)
+                    .build(),
+            )
+            .build()
+    }
+
+    fn multipart_output(
+        cursor: &S3MultipartEvidenceCursor,
+        truncated: bool,
+        next: S3MultipartEvidenceCursor,
+    ) -> aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput {
+        aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput::builder()
+            .bucket(EVIDENCE_BUCKET)
+            .prefix(EVIDENCE_PREFIX)
+            .max_uploads(10)
+            .set_key_marker(cursor.key_marker.clone())
+            .set_upload_id_marker(cursor.upload_id_marker.clone())
+            .set_next_key_marker(next.key_marker)
+            .set_next_upload_id_marker(next.upload_id_marker)
+            .is_truncated(truncated)
+            .uploads(
+                aws_sdk_s3::types::MultipartUpload::builder()
+                    .key(format!("{EVIDENCE_PREFIX}upload"))
+                    .upload_id("upload-id")
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn version_evidence_decodes_initial_terminal_page_without_normalizing_ids() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let response = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        let page = decode_s3_version_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &cursor,
+            10,
+            &response,
+        )
+        .expect("strict version page");
+
+        assert_eq!(page.versions().len(), 2);
+        assert_eq!(
+            page.versions()[0].object_version_id.as_str(),
+            " version-id "
+        );
+        assert_eq!(page.request_cursor().key_marker(), None);
+        assert_eq!(page.response_next_cursor().key_marker(), None);
+        assert!(!page.is_truncated());
+    }
+
+    #[test]
+    fn evidence_pages_preserve_present_empty_and_support_two_pages() {
+        let initial = S3VersionEvidenceCursor::initial();
+        let next = S3VersionEvidenceCursor {
+            key_marker: Some(String::new()),
+            version_id_marker: Some(String::new()),
+        };
+        let first = version_output(&initial, true, next.clone());
+        let first =
+            decode_s3_version_evidence_page(EVIDENCE_BUCKET, EVIDENCE_PREFIX, &initial, 10, &first)
+                .expect("first page");
+        assert_eq!(first.response_next_cursor().key_marker(), Some(""));
+        assert_eq!(first.response_next_cursor().version_id_marker(), Some(""));
+
+        let mut second = version_output(&next, false, S3VersionEvidenceCursor::initial());
+        second.key_marker = None;
+        second.version_id_marker = None;
+        let second =
+            decode_s3_version_evidence_page(EVIDENCE_BUCKET, EVIDENCE_PREFIX, &next, 10, &second)
+                .expect("absent echoes are equivalent only to issued empty markers");
+        assert_eq!(second.request_cursor().key_marker(), Some(""));
+        assert_eq!(second.response_next_cursor().key_marker(), None);
+    }
+
+    #[test]
+    fn multipart_evidence_decodes_two_pages_and_preserves_ids() {
+        let initial = S3MultipartEvidenceCursor::initial();
+        let next = S3MultipartEvidenceCursor {
+            key_marker: Some("next-key".into()),
+            upload_id_marker: Some("next-upload".into()),
+        };
+        let first = multipart_output(&initial, true, next.clone());
+        let first = decode_s3_multipart_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &initial,
+            10,
+            &first,
+        )
+        .expect("first multipart page");
+        assert_eq!(first.uploads()[0].upload_id(), "upload-id");
+        assert_eq!(first.response_next_cursor(), &next);
+
+        let second = multipart_output(&next, false, S3MultipartEvidenceCursor::initial());
+        let second =
+            decode_s3_multipart_evidence_page(EVIDENCE_BUCKET, EVIDENCE_PREFIX, &next, 10, &second)
+                .expect("second multipart page");
+        assert!(!second.is_truncated());
+    }
+
+    #[test]
+    fn evidence_decoders_fail_closed_on_pagination_shape() {
+        let cursor = S3VersionEvidenceCursor {
+            key_marker: Some("request-key".into()),
+            version_id_marker: Some("request-version".into()),
+        };
+        let next = S3VersionEvidenceCursor {
+            key_marker: Some("next-key".into()),
+            version_id_marker: Some("next-version".into()),
+        };
+
+        let mut missing_truncation = version_output(&cursor, true, next.clone());
+        missing_truncation.is_truncated = None;
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &missing_truncation,
+            )
+            .is_err()
+        );
+
+        let mut missing_next = version_output(&cursor, true, next.clone());
+        missing_next.next_version_id_marker = None;
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &missing_next,
+            )
+            .is_err()
+        );
+
+        let extra_next = version_output(&cursor, false, next.clone());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &extra_next,
+            )
+            .is_err()
+        );
+
+        let repeated = version_output(&cursor, true, cursor.clone());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &repeated,
+            )
+            .is_err()
+        );
+
+        let mut wrong_echo = version_output(&cursor, true, next);
+        wrong_echo.key_marker = Some("different".into());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &wrong_echo,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_decoders_enforce_envelope_entries_and_bounds_without_leaks() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let mut response = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        response.name = Some("secret-wrong-bucket".into());
+        let error = decode_s3_version_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &cursor,
+            10,
+            &response,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("secret-wrong-bucket"), "{error}");
+        assert!(!error.contains(EVIDENCE_PREFIX), "{error}");
+
+        let mut escaped = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        escaped.versions.as_mut().unwrap()[0].key = Some("secret-escape".into());
+        let error = decode_s3_version_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &cursor,
+            10,
+            &escaped,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("secret-escape"), "{error}");
+
+        let mut combined_overflow =
+            version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        combined_overflow.max_keys = Some(1);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                1,
+                &combined_overflow,
+            )
+            .is_err()
+        );
+
+        let mut missing = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        let version = &mut missing.versions.as_mut().unwrap()[0];
+        version.size = None;
+        version.is_latest = None;
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &missing,
+            )
+            .is_err()
+        );
+
+        for bad_id in [String::new(), "null".into(), "x".repeat(1_025)] {
+            let mut invalid = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+            invalid.versions.as_mut().unwrap()[0].version_id = Some(bad_id);
+            assert!(
+                decode_s3_version_evidence_page(
+                    EVIDENCE_BUCKET,
+                    EVIDENCE_PREFIX,
+                    &cursor,
+                    10,
+                    &invalid,
+                )
+                .is_err()
+            );
+        }
+        let mut negative = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        negative.versions.as_mut().unwrap()[0].size = Some(-1);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &negative,
+            )
+            .is_err()
+        );
+
+        assert!(validate_s3_evidence_request(&"p".repeat(1_024), 1).is_ok());
+        assert!(validate_s3_evidence_request(&"p".repeat(1_025), 1).is_err());
+        assert!(validate_s3_evidence_request("", 0).is_err());
+        assert!(validate_s3_evidence_request("", 1_001).is_err());
+    }
+
+    #[test]
+    fn evidence_entry_fields_accept_1024_bytes_and_reject_1025() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let prefix = "p".repeat(1_023);
+        let key = format!("{prefix}k");
+        let id = "v".repeat(1_024);
+        let mut response = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        response.prefix = Some(prefix.clone());
+        response.versions.as_mut().unwrap()[0].key = Some(key.clone());
+        response.versions.as_mut().unwrap()[0].version_id = Some(id.clone());
+        response.delete_markers.as_mut().unwrap()[0].key = Some(key.clone());
+        response.delete_markers.as_mut().unwrap()[0].version_id = Some(id);
+        decode_s3_version_evidence_page(EVIDENCE_BUCKET, &prefix, &cursor, 10, &response)
+            .expect("1024-byte keys and IDs are valid");
+
+        response.versions.as_mut().unwrap()[0].key = Some("k".repeat(1_025));
+        assert!(
+            decode_s3_version_evidence_page(EVIDENCE_BUCKET, &prefix, &cursor, 10, &response,)
+                .is_err()
+        );
+
+        let multipart_cursor = S3MultipartEvidenceCursor::initial();
+        for bad_id in [String::new(), "u".repeat(1_025)] {
+            let mut response = multipart_output(
+                &multipart_cursor,
+                false,
+                S3MultipartEvidenceCursor::initial(),
+            );
+            response.uploads.as_mut().unwrap()[0].upload_id = Some(bad_id);
+            assert!(
+                decode_s3_multipart_evidence_page(
+                    EVIDENCE_BUCKET,
+                    EVIDENCE_PREFIX,
+                    &multipart_cursor,
+                    10,
+                    &response,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_envelope_rejects_grouping_encoding_and_mismatched_limits() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let base = || version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+
+        let mut wrong_limit = base();
+        wrong_limit.max_keys = Some(9);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &wrong_limit,
+            )
+            .is_err()
+        );
+
+        let mut delimited = base();
+        delimited.delimiter = Some("/".into());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &delimited,
+            )
+            .is_err()
+        );
+
+        let mut grouped = base();
+        grouped.common_prefixes = Some(vec![
+            aws_sdk_s3::types::CommonPrefix::builder()
+                .prefix("secret-group")
+                .build(),
+        ]);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &grouped,
+            )
+            .is_err()
+        );
+
+        let mut encoded = base();
+        encoded.encoding_type = Some(aws_sdk_s3::types::EncodingType::Url);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &encoded,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_debug_is_redacted() {
+        let cursor = S3MultipartEvidenceCursor {
+            key_marker: Some("secret-key-marker".into()),
+            upload_id_marker: Some("secret-upload-marker".into()),
+        };
+        let item = S3MultipartEvidenceItem {
+            key: "secret-key".into(),
+            upload_id: "secret-upload".into(),
+        };
+        let debug = format!("{cursor:?} {item:?}");
+        for secret in [
+            "secret-key-marker",
+            "secret-upload-marker",
+            "secret-key",
+            "secret-upload",
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
     }
 }

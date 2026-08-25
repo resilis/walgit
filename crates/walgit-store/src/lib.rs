@@ -183,6 +183,169 @@ pub struct VersionPage {
 }
 
 pub const MAX_VERSION_PAGE_SIZE: usize = 1_000;
+pub const MAX_S3_EVIDENCE_FIELD_BYTES: usize = 1_024;
+pub const MAX_S3_EVIDENCE_PAGE_SIZE: usize = 1_000;
+
+/// Opaque request/response pagination state for one S3 object-version page.
+/// Presence is evidence: `None` and `Some("")` stay distinct.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3VersionEvidenceCursor {
+    key_marker: Option<String>,
+    version_id_marker: Option<String>,
+}
+
+impl S3VersionEvidenceCursor {
+    pub fn initial() -> Self {
+        Self {
+            key_marker: None,
+            version_id_marker: None,
+        }
+    }
+    pub fn key_marker(&self) -> Option<&str> {
+        self.key_marker.as_deref()
+    }
+    pub fn version_id_marker(&self) -> Option<&str> {
+        self.version_id_marker.as_deref()
+    }
+}
+
+impl fmt::Debug for S3VersionEvidenceCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3VersionEvidenceCursor")
+            .field("key_marker_present", &self.key_marker.is_some())
+            .field(
+                "version_id_marker_present",
+                &self.version_id_marker.is_some(),
+            )
+            .finish()
+    }
+}
+
+/// Opaque request/response pagination state for one S3 multipart-upload page.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3MultipartEvidenceCursor {
+    key_marker: Option<String>,
+    upload_id_marker: Option<String>,
+}
+
+impl S3MultipartEvidenceCursor {
+    pub fn initial() -> Self {
+        Self {
+            key_marker: None,
+            upload_id_marker: None,
+        }
+    }
+    pub fn key_marker(&self) -> Option<&str> {
+        self.key_marker.as_deref()
+    }
+    pub fn upload_id_marker(&self) -> Option<&str> {
+        self.upload_id_marker.as_deref()
+    }
+}
+
+impl fmt::Debug for S3MultipartEvidenceCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3MultipartEvidenceCursor")
+            .field("key_marker_present", &self.key_marker.is_some())
+            .field("upload_id_marker_present", &self.upload_id_marker.is_some())
+            .finish()
+    }
+}
+
+/// One deliberately incomplete S3 multipart upload admitted as proof input.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3MultipartEvidenceItem {
+    key: String,
+    upload_id: String,
+}
+
+impl S3MultipartEvidenceItem {
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+}
+
+impl fmt::Debug for S3MultipartEvidenceItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3MultipartEvidenceItem")
+            .field("key", &"<redacted>")
+            .field("upload_id", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One strictly decoded physical S3 object-version evidence page.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3VersionEvidencePage {
+    versions: Vec<ObjectVersion>,
+    request_cursor: S3VersionEvidenceCursor,
+    response_next_cursor: S3VersionEvidenceCursor,
+    is_truncated: bool,
+}
+
+impl S3VersionEvidencePage {
+    pub fn versions(&self) -> &[ObjectVersion] {
+        &self.versions
+    }
+    pub fn request_cursor(&self) -> &S3VersionEvidenceCursor {
+        &self.request_cursor
+    }
+    pub fn response_next_cursor(&self) -> &S3VersionEvidenceCursor {
+        &self.response_next_cursor
+    }
+    pub fn is_truncated(&self) -> bool {
+        self.is_truncated
+    }
+}
+
+impl fmt::Debug for S3VersionEvidencePage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3VersionEvidencePage")
+            .field("version_count", &self.versions.len())
+            .field("request_cursor", &self.request_cursor)
+            .field("response_next_cursor", &self.response_next_cursor)
+            .field("is_truncated", &self.is_truncated)
+            .finish()
+    }
+}
+
+/// One strictly decoded physical S3 multipart-upload evidence page.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3MultipartEvidencePage {
+    uploads: Vec<S3MultipartEvidenceItem>,
+    request_cursor: S3MultipartEvidenceCursor,
+    response_next_cursor: S3MultipartEvidenceCursor,
+    is_truncated: bool,
+}
+
+impl S3MultipartEvidencePage {
+    pub fn uploads(&self) -> &[S3MultipartEvidenceItem] {
+        &self.uploads
+    }
+    pub fn request_cursor(&self) -> &S3MultipartEvidenceCursor {
+        &self.request_cursor
+    }
+    pub fn response_next_cursor(&self) -> &S3MultipartEvidenceCursor {
+        &self.response_next_cursor
+    }
+    pub fn is_truncated(&self) -> bool {
+        self.is_truncated
+    }
+}
+
+impl fmt::Debug for S3MultipartEvidencePage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3MultipartEvidencePage")
+            .field("upload_count", &self.uploads.len())
+            .field("request_cursor", &self.request_cursor)
+            .field("response_next_cursor", &self.response_next_cursor)
+            .field("is_truncated", &self.is_truncated)
+            .finish()
+    }
+}
 
 pub enum GetResult {
     NotModified { version: CasToken },
@@ -376,6 +539,33 @@ pub trait ObjectStore: Send + Sync + 'static {
         Err(StoreError::UnsupportedCapability {
             backend: self.backend(),
             capability: "version-enumeration",
+        })
+    }
+
+    /// Decode exactly one S3 object-version evidence page. This dormant
+    /// provider-proof primitive is not a generic listing or a hot-path API.
+    async fn list_s3_version_evidence_page(
+        &self,
+        _prefix: &str,
+        _cursor: &S3VersionEvidenceCursor,
+        _limit: usize,
+    ) -> Result<S3VersionEvidencePage> {
+        Err(StoreError::UnsupportedCapability {
+            backend: self.backend(),
+            capability: "s3-version-evidence-page",
+        })
+    }
+
+    /// Decode exactly one S3 incomplete-multipart-upload evidence page.
+    async fn list_s3_multipart_evidence_page(
+        &self,
+        _prefix: &str,
+        _cursor: &S3MultipartEvidenceCursor,
+        _limit: usize,
+    ) -> Result<S3MultipartEvidencePage> {
+        Err(StoreError::UnsupportedCapability {
+            backend: self.backend(),
+            capability: "s3-multipart-evidence-page",
         })
     }
 
@@ -782,6 +972,52 @@ impl ObjectStore for Prefixed {
         }
         Ok(page)
     }
+    async fn list_s3_version_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3VersionEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3VersionEvidencePage> {
+        let mut page = self
+            .inner
+            .list_s3_version_evidence_page(&self.full(prefix), cursor, limit)
+            .await?;
+        for version in &mut page.versions {
+            version.key = version
+                .key
+                .strip_prefix(&*self.prefix)
+                .ok_or_else(|| {
+                    StoreError::InvalidArgument(
+                        "S3 version evidence key escaped the configured prefix".into(),
+                    )
+                })?
+                .to_owned();
+        }
+        Ok(page)
+    }
+    async fn list_s3_multipart_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3MultipartEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3MultipartEvidencePage> {
+        let mut page = self
+            .inner
+            .list_s3_multipart_evidence_page(&self.full(prefix), cursor, limit)
+            .await?;
+        for upload in &mut page.uploads {
+            upload.key = upload
+                .key
+                .strip_prefix(&*self.prefix)
+                .ok_or_else(|| {
+                    StoreError::InvalidArgument(
+                        "S3 multipart evidence key escaped the configured prefix".into(),
+                    )
+                })?
+                .to_owned();
+        }
+        Ok(page)
+    }
     async fn verify_versioning(&self) -> Result<()> {
         self.inner.verify_versioning().await
     }
@@ -903,5 +1139,166 @@ pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>
         Ok(inner)
     } else {
         Ok(Arc::new(Prefixed::new(inner, prefix)))
+    }
+}
+
+#[cfg(test)]
+mod s3_evidence_tests {
+    use std::sync::Mutex;
+
+    use futures::stream;
+
+    use super::*;
+
+    struct EvidenceStore {
+        version_key: String,
+        upload_key: String,
+        version_next: S3VersionEvidenceCursor,
+        multipart_next: S3MultipartEvidenceCursor,
+        requests: Mutex<Vec<String>>,
+    }
+
+    impl EvidenceStore {
+        fn new(version_key: &str, upload_key: &str) -> Self {
+            Self {
+                version_key: version_key.into(),
+                upload_key: upload_key.into(),
+                version_next: S3VersionEvidenceCursor {
+                    key_marker: Some("opaque-version-key".into()),
+                    version_id_marker: Some("opaque-version-id".into()),
+                },
+                multipart_next: S3MultipartEvidenceCursor {
+                    key_marker: Some("opaque-upload-key".into()),
+                    upload_id_marker: Some("opaque-upload-id".into()),
+                },
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for EvidenceStore {
+        fn backend(&self) -> &'static str {
+            "evidence-test"
+        }
+        async fn get(&self, key: &str, _opts: GetOptions) -> Result<GetResult> {
+            Err(StoreError::NotFound { key: key.into() })
+        }
+        async fn head(&self, _key: &str) -> Result<Option<ObjectMeta>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &str, _body: PutBody, _opts: PutOptions) -> Result<ObjectMeta> {
+            Err(StoreError::UnsupportedCapability {
+                backend: self.backend(),
+                capability: "test-put",
+            })
+        }
+        async fn delete(&self, _key: &str, _if_version: Option<CasToken>) -> Result<()> {
+            Err(StoreError::UnsupportedCapability {
+                backend: self.backend(),
+                capability: "test-delete",
+            })
+        }
+        async fn list_s3_version_evidence_page(
+            &self,
+            prefix: &str,
+            cursor: &S3VersionEvidenceCursor,
+            _limit: usize,
+        ) -> Result<S3VersionEvidencePage> {
+            self.requests.lock().unwrap().push(prefix.into());
+            Ok(S3VersionEvidencePage {
+                versions: vec![ObjectVersion {
+                    key: self.version_key.clone(),
+                    object_version_id: ObjectVersionId::new("version-id"),
+                    cas_token: None,
+                    size: 1,
+                    kind: ObjectVersionKind::Object,
+                    is_latest: true,
+                }],
+                request_cursor: cursor.clone(),
+                response_next_cursor: self.version_next.clone(),
+                is_truncated: true,
+            })
+        }
+        async fn list_s3_multipart_evidence_page(
+            &self,
+            prefix: &str,
+            cursor: &S3MultipartEvidenceCursor,
+            _limit: usize,
+        ) -> Result<S3MultipartEvidencePage> {
+            self.requests.lock().unwrap().push(prefix.into());
+            Ok(S3MultipartEvidencePage {
+                uploads: vec![S3MultipartEvidenceItem {
+                    key: self.upload_key.clone(),
+                    upload_id: "upload-id".into(),
+                }],
+                request_cursor: cursor.clone(),
+                response_next_cursor: self.multipart_next.clone(),
+                is_truncated: true,
+            })
+        }
+        fn list(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+        ) -> BoxStream<'static, Result<ObjectMeta>> {
+            Box::pin(stream::empty())
+        }
+        async fn list_prefixes(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn prefixed_evidence_translates_keys_once_and_preserves_opaque_cursors() {
+        let inner = Arc::new(EvidenceStore::new(
+            "scope/scope/lookalike",
+            "scope/nested/upload",
+        ));
+        let store = Prefixed::new(inner.clone(), "scope/");
+        let version_request = S3VersionEvidenceCursor {
+            key_marker: Some(String::new()),
+            version_id_marker: Some("request-version".into()),
+        };
+        let version = store
+            .list_s3_version_evidence_page("scope/", &version_request, 3)
+            .await
+            .unwrap();
+        assert_eq!(version.versions()[0].key, "scope/lookalike");
+        assert_eq!(version.request_cursor(), &version_request);
+        assert_eq!(version.response_next_cursor(), &inner.version_next);
+
+        let multipart_request = S3MultipartEvidenceCursor::initial();
+        let multipart = store
+            .list_s3_multipart_evidence_page("nested/", &multipart_request, 3)
+            .await
+            .unwrap();
+        assert_eq!(multipart.uploads()[0].key(), "nested/upload");
+        assert_eq!(multipart.response_next_cursor(), &inner.multipart_next);
+        assert_eq!(
+            inner.requests.lock().unwrap().as_slice(),
+            ["scope/scope/", "scope/nested/"]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_prefix_is_identity_and_prefix_escape_fails_closed() {
+        let identity = Arc::new(EvidenceStore::new("relative/key", "relative/upload"));
+        let store = Prefixed::new(identity, "");
+        let page = store
+            .list_s3_version_evidence_page("relative/", &S3VersionEvidenceCursor::initial(), 1)
+            .await
+            .unwrap();
+        assert_eq!(page.versions()[0].key, "relative/key");
+
+        let escaped = Arc::new(EvidenceStore::new("outside/key", "scope/upload"));
+        let store = Prefixed::new(escaped, "scope/");
+        let error = store
+            .list_s3_version_evidence_page("", &S3VersionEvidenceCursor::initial(), 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("escaped the configured prefix"), "{error}");
+        assert!(!error.contains("outside/key"), "{error}");
     }
 }
