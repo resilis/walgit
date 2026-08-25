@@ -22,6 +22,7 @@ pub use codec::{
 pub use validate::{
     ControlValidationError, CredentialTransitionKind, validate_credential_control,
     validate_credential_control_transition_structure, validate_repo_control,
+    validate_repo_control_successor,
 };
 
 /// Frozen V2 repository-control schema version.

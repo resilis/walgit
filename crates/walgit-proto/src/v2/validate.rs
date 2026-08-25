@@ -576,6 +576,77 @@ pub fn validate_repo_control(control: &RepoControl) -> Result<(), ControlValidat
     Ok(())
 }
 
+/// Validate the state-independent invariants of one exact `repo_control` CAS
+/// successor. Mutation-specific authorization, capacity, and fencing checks
+/// remain the responsibility of the caller that constructs the candidate.
+pub fn validate_repo_control_successor(
+    previous: &RepoControl,
+    successor: &RepoControl,
+) -> Result<(), ControlValidationError> {
+    validate_repo_control(previous)?;
+    validate_repo_control(successor)?;
+
+    if previous.schema_version != successor.schema_version {
+        return Err(invalid("schema_version", "cannot change after Create"));
+    }
+    if previous.identity != successor.identity {
+        return Err(invalid("identity", "cannot change after Create"));
+    }
+    if previous.create_intent_id != successor.create_intent_id {
+        return Err(invalid("create_intent_id", "cannot change after Create"));
+    }
+    if previous.create_intent_digest != successor.create_intent_digest {
+        return Err(invalid(
+            "create_intent_digest",
+            "cannot change after Create",
+        ));
+    }
+    if previous.create_intent_cose != successor.create_intent_cose {
+        return Err(invalid("create_intent_cose", "cannot change after Create"));
+    }
+    if previous.repo_control_key != successor.repo_control_key {
+        return Err(invalid("repo_control_key", "cannot change after Create"));
+    }
+    if previous.object_format != successor.object_format {
+        return Err(invalid("object_format", "cannot change after Create"));
+    }
+    if previous.cutover_generation != successor.cutover_generation {
+        return Err(invalid("cutover_generation", "cannot change after Create"));
+    }
+
+    let expected_revision = previous
+        .control_revision
+        .checked_add(1)
+        .ok_or_else(|| invalid("control_revision", "cannot advance past u64::MAX"))?;
+    if successor.control_revision != expected_revision {
+        return Err(invalid("control_revision", "must advance by exactly one"));
+    }
+    if previous.last_internal_mutation_id == successor.last_internal_mutation_id {
+        return Err(invalid(
+            "last_internal_mutation_id",
+            "must identify this successor mutation",
+        ));
+    }
+
+    let previous_lifecycle = Lifecycle::try_from(previous.lifecycle)
+        .map_err(|_| invalid("lifecycle", "contains an unknown value"))?;
+    let successor_lifecycle = Lifecycle::try_from(successor.lifecycle)
+        .map_err(|_| invalid("lifecycle", "contains an unknown value"))?;
+    let valid_lifecycle = matches!(
+        (previous_lifecycle, successor_lifecycle),
+        (Lifecycle::Active, Lifecycle::Active | Lifecycle::Deleting)
+            | (
+                Lifecycle::Deleting,
+                Lifecycle::Deleting | Lifecycle::Tombstoned
+            )
+    );
+    if !valid_lifecycle {
+        return Err(invalid("lifecycle", "is not an allowed successor"));
+    }
+
+    Ok(())
+}
+
 fn validate_identity(identity: &RepositoryIdentity) -> Result<(), ControlValidationError> {
     bounded_bytes("identity.tenant_id", &identity.tenant_id, 1, 256)?;
     bounded_bytes("identity.project_id", &identity.project_id, 1, 256)?;
