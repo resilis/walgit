@@ -58,20 +58,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/services/setup.json", get(setup_json))
         // "API" docs page (SPA route); `/api/v1` is the JSON discovery document (D20).
         .route("/api", get(index_route))
-        .route("/{owner}", get(index_route))
+        .route("/{owner}", get(owner_index_route))
         .route(
             "/{owner}/{repo}",
-            get(index_route)
+            get(repo_index_route)
                 .put(crate::dispatch)
                 .delete(crate::dispatch),
         )
-        .route("/{owner}/{repo}/tree/{*rest}", get(index_route))
-        .route("/{owner}/{repo}/blob/{*rest}", get(index_route))
-        .route("/{owner}/{repo}/commits", get(index_route))
-        .route("/{owner}/{repo}/commits/{*rest}", get(index_route))
-        .route("/{owner}/{repo}/commit/{*rest}", get(index_route))
-        .route("/{owner}/{repo}/wal", get(index_route))
-        .route("/{owner}/{repo}/settings", get(index_route));
+        .route("/{owner}/{repo}/tree/{*rest}", get(repo_index_route))
+        .route("/{owner}/{repo}/blob/{*rest}", get(repo_index_route))
+        .route("/{owner}/{repo}/commits", get(repo_index_route))
+        .route("/{owner}/{repo}/commits/{*rest}", get(repo_index_route))
+        .route("/{owner}/{repo}/commit/{*rest}", get(repo_index_route))
+        .route("/{owner}/{repo}/wal", get(repo_index_route))
+        .route("/{owner}/{repo}/settings", get(repo_index_route));
     let mut r = r;
     for base in crate::web::api::REPO_API_BASES {
         r = r
@@ -148,6 +148,31 @@ async fn root(State(state): State<Arc<AppState>>, req: Request<Body>) -> Respons
 /// changes the import map costs one 304-or-tiny-200 round trip.
 async fn index_route(req: Request<Body>) -> Response {
     index(req.method(), req.headers())
+}
+
+async fn owner_index_route(
+    State(state): State<Arc<AppState>>,
+    AxumPath(owner): AxumPath<String>,
+    req: Request<Body>,
+) -> Response {
+    match state.auth.require_tenant_read(req.headers(), &owner).await {
+        Ok(_) => index(req.method(), req.headers()),
+        Err(error) => auth_err(error).into_response(),
+    }
+}
+
+async fn repo_index_route(State(state): State<Arc<AppState>>, req: Request<Body>) -> Response {
+    let Some(route) = crate::repo::parse_repo_route(req.uri().path()) else {
+        return ApiError::NotFound("repository".into()).into_response();
+    };
+    match state
+        .auth
+        .require_tenant_read(req.headers(), route.id.owner())
+        .await
+    {
+        Ok(_) => index(req.method(), req.headers()),
+        Err(error) => auth_err(error).into_response(),
+    }
 }
 
 fn index(method: &Method, headers: &HeaderMap) -> Response {
@@ -576,9 +601,13 @@ async fn overview(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    state
+        .auth
+        .require_tenant_read(&headers, id.owner())
+        .await
+        .map_err(auth_err)?;
     let handle = state.registry.open(&id).await.map_err(wal_err)?;
     // read_log performs its own freshness check; acquire the read guard only
     // after it has completed because read_log may need the write lock.
@@ -1046,9 +1075,13 @@ async fn ops_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    state
+        .auth
+        .require_tenant_read(&headers, id.owner())
+        .await
+        .map_err(auth_err)?;
     let body = OpsInfo {
         available: crate::ops::OPS.to_vec(),
         recent: state.registry.tasks().recent(&id.to_string()),
@@ -1081,9 +1114,13 @@ async fn ops_start(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = state.auth.require_write(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    let principal = state
+        .auth
+        .require_tenant_admin(&headers, id.owner())
+        .await
+        .map_err(auth_err)?;
     // Make sure the repo exists before spawning anything.
     state.registry.open(&id).await.map_err(wal_err)?;
     tracing::info!(repo = %id, op = %op, by = %principal.name, ?params, "ops.start");
@@ -1105,9 +1142,13 @@ async fn tasks_list(
     AxumPath((owner, repo)): AxumPath<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    state
+        .auth
+        .require_tenant_read(&headers, id.owner())
+        .await
+        .map_err(auth_err)?;
     let tasks = state.registry.tasks();
     let body = serde_json::json!({
         "hostname": walgit_store::coord::instance_id(),
@@ -1132,9 +1173,13 @@ async fn task_stream(
     AxumPath((owner, repo, task_id)): AxumPath<(String, String, String)>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    state.auth.require_read(&headers).await.map_err(auth_err)?;
     let id =
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
+    state
+        .auth
+        .require_tenant_read(&headers, id.owner())
+        .await
+        .map_err(auth_err)?;
     let task = state
         .registry
         .tasks()
@@ -1303,7 +1348,10 @@ fn auth_err(error: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

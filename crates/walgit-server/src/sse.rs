@@ -119,6 +119,12 @@ impl Rendered {
                 r.headers_mut().insert(header::ETAG, etag.parse().unwrap());
                 r.headers_mut()
                     .insert(header::CACHE_CONTROL, self.cache_control.parse().unwrap());
+                r.headers_mut().insert(
+                    header::VARY,
+                    "Accept-Encoding, Authorization, Cookie, X-Walgit-Principal"
+                        .parse()
+                        .unwrap(),
+                );
                 return r;
             }
         }
@@ -127,6 +133,12 @@ impl Rendered {
             .insert(header::CONTENT_TYPE, self.content_type.parse().unwrap());
         r.headers_mut()
             .insert(header::CACHE_CONTROL, self.cache_control.parse().unwrap());
+        r.headers_mut().insert(
+            header::VARY,
+            "Accept-Encoding, Authorization, Cookie, X-Walgit-Principal"
+                .parse()
+                .unwrap(),
+        );
         if let Some(e) = &self.etag {
             r.headers_mut().insert(header::ETAG, e.parse().unwrap());
         }

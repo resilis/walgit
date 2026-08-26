@@ -98,7 +98,8 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
   OBJECT_FINALIZE`, `objectId`), an S3 event notification (`Records[].eventName = ObjectCreated:*`,
   `s3.object.key`; MinIO, rustfs and Ceph emit the same shape), or your own glue's `{"key": "repos/o/r/manifest.pb"}`
   / `{"repo": "o/r"}`. Everything else is acked and ignored; a webhook failure answers 503 so the notifier
-  redelivers. Authenticated like every route (`require_read`): give the notifier a token.
+  redelivers. The route requires a principal listed in `server.auth.platform_operators`; operator
+  status does not grant repository access. Give the notifier its own token or OIDC identity.
 - The sweep (`events.sweep_interval`, default 5 min): `list` + one conditional manifest GET per repo. Not needed
   for correctness; it is the backstop *and the health check* — a sweep that publishes anything means
   notifications are not flowing (`events_bridge_sweep_found_total`, warn). With no notifier at all, set the
@@ -107,6 +108,11 @@ Wake-ups (both idempotent; they only ever call `catch_up`):
 ```toml
 [server]
 roles = ["events"]            # or leave roles empty on a one-box install: every role, bridge included
+[server.auth]
+mode = "token"
+anonymous_read = false
+tokens = [{ principal = "bucket-notifier", token_env = "WALGIT_EVENT_TOKEN", write = false }]
+platform_operators = ["bucket-notifier"]
 [events]
 webhook_url = "https://hooks.example.com/walgit"
 webhook_secret = "…"          # env: WALGIT__EVENTS__WEBHOOK_SECRET

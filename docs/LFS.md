@@ -56,6 +56,7 @@ from a machine with disk and bandwidth: bare clone/fetch of the upstream, `git l
 
 ## 4. Not done / open
 - Upstream `verify` is not called (we only ever ask the upstream for downloads).
-- `lfs.serve_via = "signed_url"` hands out presigned store URLs (S3, or GCS with a signer); the default `proxy`
-  streams through walgit or the edge.
+- `lfs.serve_via = "signed_url"` hands out presigned S3 URLs. GCS also supports this when authentication is
+  disabled and a signer is configured. Authenticated GCS tenants must use the default `proxy` mode because
+  GCS signed URLs inherit public object cache metadata.
 - Size accounting of LFS bytes per repository in the overview.

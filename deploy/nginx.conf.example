@@ -170,6 +170,7 @@ http {
             set $store_auth $upstream_http_x_walgit_store_authorization;
             set $store_key  $upstream_http_x_walgit_store_key;
             set $walgit_etag $upstream_http_x_walgit_etag;
+            set $walgit_vary $upstream_http_vary;
 
             # Range requests are sliced into 64 MiB pieces so a resumed 30 GB download hits the cache.
             # Works for S3 presigned URLs too: `Range` is not a signed header.
@@ -195,11 +196,14 @@ http {
             proxy_cache_use_stale updating error timeout;
             proxy_ignore_headers Cache-Control Expires Set-Cookie;
 
-            # One Cache-Control and one validator set, walgit's: nginx carries the accel answer's
-            # Cache-Control/Content-Type/Accept-Ranges over the internal redirect; hide the bucket's.
+            # One Cache-Control, Vary and validator set, walgit's. Vary must be captured and
+            # re-emitted explicitly across the internal redirect so private browser caches remain
+            # partitioned by authorization/session identity; hide the bucket's values.
             proxy_hide_header Cache-Control; proxy_hide_header Expires;
+            proxy_hide_header Vary;
             proxy_hide_header ETag; proxy_hide_header Last-Modified;
             add_header ETag $walgit_etag always;            # the range filter evaluates If-Range against it → 206
+            add_header Vary $walgit_vary always;
             proxy_hide_header x-goog-hash; proxy_hide_header x-goog-generation; proxy_hide_header x-goog-metageneration;
             proxy_hide_header x-goog-stored-content-length; proxy_hide_header x-goog-stored-content-encoding;
             proxy_hide_header x-goog-storage-class; proxy_hide_header x-goog-component-count; proxy_hide_header x-goog-crc32c;

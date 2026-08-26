@@ -314,7 +314,7 @@ pub async fn http_notify(
 ) -> Result<axum::response::Response, crate::error::ApiError> {
     use crate::error::ApiError;
     use axum::response::IntoResponse;
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st.auth.require_operator(headers).await.map_err(auth_err)?;
     let Some(bridge) = &st.bridge else {
         return Err(ApiError::NotFound(
             "events bridge is not enabled here".into(),
@@ -347,7 +347,10 @@ fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

@@ -36,6 +36,11 @@ mode = "none"
 #   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true },
 #   { principal = "ci",    token_env = "WALGIT_TOKEN_CI",    write = false },
 # ]
+# tenant_grants = [
+#   { principal = "alice", tenant = "acme", role = "admin" },
+#   { principal = "ci",    tenant = "acme", role = "reader" },
+# ]
+# platform_operators = ["alice"]                 # metrics/events; does not imply repository access
 #
 # A team — any OpenID Connect issuer (Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab…):
 # browsers sign in through the issuer, then mint git tokens at /_auth/tokens.
@@ -47,6 +52,11 @@ mode = "none"
 # oauth_client_secret = "…"                      #   (env: WALGIT__SERVER__AUTH__OAUTH_CLIENT_SECRET)
 # session_secret = "…at least 32 random bytes…"  #   (env: WALGIT__SERVER__AUTH__SESSION_SECRET)
 # audiences = ["walgit-cli"]                     # optional ID-token audiences for non-browser clients
+# tenant_grants = [
+#   { principal = "alice@example.com", tenant = "acme", role = "admin" },
+#   { principal = "*", tenant = "acme", role = "writer" },
+# ]
+# platform_operators = ["alice@example.com"]
 
 [store]
 # The one durable thing; every host pointed at it serves the same repositories.

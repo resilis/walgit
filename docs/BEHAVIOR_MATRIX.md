@@ -24,7 +24,7 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | Git errors and real 401 | `walgit-server` | `smart.rs`, auth middleware | Preserve pkt-line errors and invalid-credential 401 | `just e2e`; `tests/lib-auth.sh` |
 | Static `HEAD` | `walgit-server` | `static_object.rs`, Git/static routes | Preserve metadata without body | `cargo test -p walgit-server --test static_http` |
 | Range, If-Range, 416 | `walgit-server` / stores | immutable static routes, `ObjectStore::get` | Preserve half-open internal ranges and HTTP static contract | `cargo test -p walgit-store --test contract`; `cargo test -p walgit-server --test static_http` |
-| ETag and cache rules | server / stores | static and ref-dependent responses | Preserve strong version and immutable or SWR cache policy | `cargo test -p walgit-server --test static_http --test web_api` |
+| ETag and cache rules | server / stores | static and ref-dependent responses | Preserve strong versions, HEAD, Range and immutable/SWR policy; authenticated proxy bytes are private, explicitly anonymous proxy bytes remain public, all S3 signed URLs are private, and authenticated GCS tenants cannot use public-cacheable signed URLs | `cargo test -p walgit-server --test static_http --test web_api`; config tests |
 | LFS batch/basic transfer | `walgit-server` | `lfs.rs` | Preserve batch, PUT, GET, verify and 16 GiB configured limit | `just e2e`; `rg -n "16GiB|lfs" walgit.example.toml crates/walgit-server/src/lfs.rs` |
 | LFS upstream/read-through | `walgit-server` | `lfs_upstream.rs` | Preserve authenticated read-through and persistence | `cargo test -p walgit-server --test lfs_upstream` |
 | Receive size | `walgit-server` / store | receive-pack ingest and pack PUT | Preserve 64 GiB configured limit and streaming; no 4 GiB limit | `rg -n "64GiB|receive" walgit.example.toml crates`; S3 contract large-object plan |
@@ -41,15 +41,15 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | Credential helper | installer | host-derived helper and token file | Preserve 0600 token and scoped Git config | `just e2e`; `tests/lib-auth.sh` |
 | Policy | server / WAL | `policy.json`, policy API/CLI | Preserve rule language and fail-before-publish behavior | `cargo test -p walgit-server --test policy` |
 | Repository settings | server / WAL / CLI | settings API and `walgit repo settings` | Preserve WAL publication and inline effective config | `cargo test -p walgit-server --test web_api`; CLI tests |
-| Effective settings secrecy | server | `/{o}/{r}/api/settings/effective` | Preserve route for PR1; secret-redaction hardening is PR2 and remains a production blocker | Route/code review; future auth gate |
+| Effective settings secrecy | server | settings HTTP API | Return only safe repository settings sections, hide raw upstream settings from non-operators, preserve operator-owned upstream settings across ordinary edits/clears, reject credentials in upstream URLs, and reserve upstream overrides for principals that are both tenant admins and platform operators | Settings/auth tests and route review |
 | Auth `none` | config / server | `server.auth.mode=none` | Preserve loopback-only validation | `cargo test -p walgit-config` |
-| Auth `token` | config / server | bearer/basic static tokens | Preserve current mode; repo grants and constant-time secrets are PR2 blockers | `just e2e`; future auth gate |
-| Auth `oidc` | config / server | discovery, browser session, `wgt_` token | Preserve current allowlist and validation | auth unit/e2e tests; future auth gate |
+| Auth `token` | config / server | bearer/basic static tokens | Preserve credential transport; require principal-to-tenant reader/writer/admin grants | auth unit tests; tenant isolation e2e |
+| Auth `oidc` | config / server | discovery, browser session, `wgt_` token | Preserve allowlist and validation; resolve the same tenant grants after identity verification | auth unit/e2e tests; tenant isolation e2e |
 | WAL operator CLI | `walgit-cli` / WAL | `walgit wal ls/show/materialize` | Preserve provenance and `--at-seq` | CLI unit tests; CLI help inspection |
 | Import CLI | `walgit-cli` | `walgit import` | Preserve direct/staged import behavior | `cargo test -p walgit-cli`; `docs/INTEGRITY.md` review |
 | Repair and fsck | CLI / Git / maintainer | `fsck`, `repair` units | Preserve connectivity audit and upstream repair | `cargo test -p walgit-server --test maintain`; `docs/INTEGRITY.md` review |
 | Versioned recovery | future control / store | exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 production approval | Future exact-provider version tests and recovery vertical acceptance in `docs/PRODUCTION_ARCHITECTURE.md` |
-| Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Preserve current routes in PR1; identity/lifecycle/reclamation move to PR2 | `just e2e`; future control gate |
+| Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Tenant Admin only; auto-create on push also requires Admin while Writer can push existing repositories | tenant isolation e2e |
 | Placement | config / server | serve/maintain include/exclude | Preserve prefix routing and explicit placement | `cargo test -p walgit-server --test routing_prefix --test maintain` |
 | Push broker | server | forwarding and trusted principal | Preserve broker fallback and opaque client credential lane | `just e2e`; config/code review |
 | Drain | server / maintainer | SIGTERM phases, `/readyz` | Preserve serving during phase 1 and refusal in phase 2 | `cargo test -p walgit-server --test drain` |

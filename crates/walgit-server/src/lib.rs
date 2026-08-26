@@ -341,8 +341,7 @@ pub(crate) async fn dispatch_route(
                 smart::receive_pack(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "info/lfs/objects/batch") => {
-                let bytes = collect_body(body.take().unwrap()).await?;
-                lfs::batch(st, route, &headers, bytes).await
+                lfs::batch(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::GET | &Method::HEAD, s)
                 if s.starts_with("info/lfs/objects/") && !s.ends_with("/batch") =>
@@ -353,8 +352,7 @@ pub(crate) async fn dispatch_route(
                 lfs::put_object(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::POST, "info/lfs/verify") => {
-                let bytes = collect_body(body.take().unwrap()).await?;
-                lfs::verify(st, route, &headers, bytes).await
+                lfs::verify(st, route, &headers, body.take().unwrap()).await
             }
             (&Method::GET, "bundles/list") => {
                 bundles::list(st, route, &headers, &query, true).await
