@@ -40,32 +40,38 @@ pub async fn info_refs(
     // Auth: read for upload-pack, write for receive-pack advertisement.
     let is_receive = service_param == "git-receive-pack";
     let auth_result = if is_receive {
-        st.auth.require_write(headers).await
+        st.auth
+            .require_tenant_write(headers, route.id.owner())
+            .await
     } else {
-        st.auth.require_read(headers).await
+        st.auth.require_tenant_read(headers, route.id.owner()).await
     };
-    if let Err(e) = auth_result {
-        // Git clients do not display 401/403 bodies, but they do print a pkt-line `ERR` message
-        // ("fatal: remote error: ..."). Tell humans how to authenticate instead of leaving them
-        // with "error 401" — but ONLY where a retry cannot help (the account is not allowed, the
-        // verifier is down). A credential that is merely invalid/expired MUST be a real 401: that is
-        // what makes git `erase` it from its credential helpers (the in-memory cache the installer
-        // puts in front of ours), ask them again (gcloud refreshes an expired token) and retry. The
-        // 200 + ERR answer made git keep — and re-`store` — a dead cached token for the cache's
-        // whole lifetime (rig, 2026-08-22: every clone failed for 50 minutes).
-        let has_creds = headers.contains_key(axum::http::header::AUTHORIZATION);
-        let retry_cannot_help = matches!(
-            e,
-            crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
-        );
-        if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help {
-            return Ok(git_err_response(
-                &service_param,
-                &auth_help_message(st, headers, &e),
-            ));
+    let principal = match auth_result {
+        Ok(principal) => principal,
+        Err(e) => {
+            // Git clients do not display 401/403 bodies, but they do print a pkt-line `ERR` message
+            // ("fatal: remote error: ..."). Tell humans how to authenticate instead of leaving them
+            // with "error 401" — but ONLY where a retry cannot help (the account is not allowed, the
+            // verifier is down). A credential that is merely invalid/expired MUST be a real 401: that is
+            // what makes git `erase` it from its credential helpers (the in-memory cache the installer
+            // puts in front of ours), ask them again (gcloud refreshes an expired token) and retry. The
+            // 200 + ERR answer made git keep — and re-`store` — a dead cached token for the cache's
+            // whole lifetime (rig, 2026-08-22: every clone failed for 50 minutes).
+            let has_creds = headers.contains_key(axum::http::header::AUTHORIZATION);
+            let retry_cannot_help = matches!(
+                e,
+                crate::auth::AuthError::Forbidden | crate::auth::AuthError::Unavailable
+            );
+            if is_git_client(headers) && !service_param.is_empty() && has_creds && retry_cannot_help
+            {
+                return Ok(git_err_response(
+                    &service_param,
+                    &auth_help_message(st, headers, &e),
+                ));
+            }
+            return Err(auth_err(e));
         }
-        return Err(auth_err(e));
-    }
+    };
     if is_receive {
         if let Some(msg) = push_url_must_be_git(st, route, headers) {
             return Ok(git_err_response("git-receive-pack", &msg));
@@ -78,7 +84,8 @@ pub async fn info_refs(
         other => return Err(ApiError::BadRequest(format!("unknown service: {other}"))),
     };
 
-    let handle = open_repo(st, &route.id, is_receive).await?;
+    let create_if_missing = is_receive && principal.can_admin_tenant(route.id.owner());
+    let handle = open_repo(st, &route.id, create_if_missing).await?;
     // Advertisements need refs only: never wait for (or require) the pack set.
     let _guard = handle.sync_refs().await.map_err(wal_err)?;
 
@@ -178,7 +185,10 @@ pub async fn upload_pack(
     headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
+    st.auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
 
     let handle = open_repo(st, &route.id, false).await?;
 
@@ -637,7 +647,7 @@ async fn narrated_fetch(
     let repo = route.id.to_string();
     let who = st
         .auth
-        .require_read(headers)
+        .require_tenant_read(headers, route.id.owner())
         .await
         .ok()
         .map(|p| p.name)
@@ -893,7 +903,11 @@ pub async fn receive_pack(
     headers: &HeaderMap,
     mut body: Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_write(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     if let Some(msg) = push_url_must_be_git(st, route, headers) {
         return refuse_push(body, headers, msg).await;
     }
@@ -1021,7 +1035,7 @@ pub async fn receive_pack(
         }
     }
 
-    let handle = open_repo(st, &route.id, true).await?;
+    let handle = open_repo(st, &route.id, principal.can_admin_tenant(route.id.owner())).await?;
 
     let enc = headers
         .get(axum::http::header::CONTENT_ENCODING)
@@ -1472,9 +1486,9 @@ async fn parse_fetch_request(
 pub(crate) async fn open_repo(
     st: &AppState,
     id: &walgit_git::RepoId,
-    write: bool,
+    create_if_missing: bool,
 ) -> Result<Arc<walgit_wal::RepoHandle>, ApiError> {
-    if write && st.cfg.server.auto_create_on_push {
+    if create_if_missing && st.cfg.server.auto_create_on_push {
         let format = walgit_git::ObjectFormat::from(st.cfg.git.object_format);
         Ok(st
             .registry
@@ -1586,6 +1600,9 @@ pub(crate) fn auth_help_message(
         .to_string();
     let why = match e {
         crate::auth::AuthError::Forbidden => "your identity is not allowed to access this host",
+        crate::auth::AuthError::TenantForbidden => {
+            "your identity does not have the required role in this tenant"
+        }
         crate::auth::AuthError::Unavailable => {
             "the token verifier is temporarily unavailable; retry"
         }
@@ -1634,7 +1651,12 @@ async fn bundle_fallback_allowed(
     headers: &HeaderMap,
     route: &RepoRoute,
 ) -> Option<String> {
-    let who = st.auth.require_read(headers).await.ok()?.name;
+    let who = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .ok()?
+        .name;
     if who.is_empty() || who == "anonymous" {
         return None;
     }
@@ -1757,7 +1779,10 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

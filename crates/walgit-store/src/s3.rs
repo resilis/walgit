@@ -857,6 +857,7 @@ impl ObjectStore for S3Store {
             .flatten()?;
         Some(crate::AccelTarget {
             url,
+            cache_key: key.to_string(),
             authorization: None,
         })
     }
@@ -1074,6 +1075,11 @@ impl ObjectStore for S3Store {
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            // Client-facing signed URLs are bearer credentials. Override the object's public
+            // immutable metadata so a shared cache cannot retain private repository bytes after
+            // the URL expires. A private client cache is safe: the client already downloaded the
+            // content-addressed object.
+            .response_cache_control("private, max-age=31536000, immutable")
             .presigned(presigning)
             .await
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning: {e}")))?;
@@ -1362,6 +1368,46 @@ mod tests {
         assert!(!error.contains("also-must-not-appear"));
         assert!(explicit_credentials("ACCESS", "", "", |_| None).is_err());
         assert!(explicit_credentials("", "", "TOKEN", |_| None).is_err());
+    }
+
+    #[tokio::test]
+    async fn client_signed_urls_override_public_object_cache_metadata() {
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(Credentials::new(
+                "test-access",
+                "test-secret",
+                None,
+                None,
+                "unit-test",
+            ))
+            .endpoint_url("http://127.0.0.1:9000")
+            .force_path_style(true)
+            .build();
+        let store = S3Store {
+            client: S3Client::from_conf(config),
+            bucket: "test-bucket".into(),
+            http: reqwest::Client::new(),
+            multipart_threshold: 8 * 1024 * 1024,
+            multipart_part_size: S3_MIN_PART_SIZE,
+        };
+
+        let url = store
+            .signed_get_url("lfs/private-object", Duration::from_secs(60))
+            .await
+            .expect("signing must succeed")
+            .expect("S3 supports signed URLs");
+        let cache_control = reqwest::Url::parse(&url)
+            .expect("signed URL")
+            .query_pairs()
+            .find_map(|(name, value)| {
+                (name == "response-cache-control").then(|| value.into_owned())
+            });
+        assert_eq!(
+            cache_control.as_deref(),
+            Some("private, max-age=31536000, immutable")
+        );
     }
 
     #[tokio::test]

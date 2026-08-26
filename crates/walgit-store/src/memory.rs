@@ -88,6 +88,7 @@ impl ObjectStore for MemoryStore {
             .load(Ordering::Relaxed)
             .then(|| crate::AccelTarget {
                 url: format!("https://storage.example.test/test-bucket/{key}"),
+                cache_key: key.to_string(),
                 authorization: Some("Bearer test-store-access-token".to_string()),
             })
     }

@@ -265,14 +265,17 @@ removes it — the same handlers as `PUT|DELETE /{owner}/{repo}`.
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
-restricted to `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]`, merged over the
+restricted to `[bundles]`, `[maintenance]`, `[compaction]`, and `[upstream]`, merged over the
 host's config (`effective config`).
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
-on failure; 200 `{revision}`. `DELETE` publishes an empty document. `GET …/settings/effective` → the effective
-config as TOML (`application/toml`); `GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,
-at,toml}]}` from the live log (older changes are folded into checkpoints). All `no-store`; write needs write
-access. Every instance sees a new revision on its next refs-level sync (no extra round trip: the document rides
+on failure; 200 `{revision}`. A tenant Admin can change ordinary sections. `[upstream]` additionally requires
+platform-operator status. Non-operators do not receive `[upstream]` in the raw current/history documents, and
+their PUT or DELETE preserves an existing operator-owned block. `GET …/settings/effective` → only the safe
+repository settings sections as TOML (`application/toml`), with `upstream.token_env` omitted;
+`GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,at,toml}]}` from the live log (older
+changes are folded into checkpoints). All `no-store`. Every instance sees a new revision on its next refs-level
+sync (no extra round trip: the document rides
 inline on `manifest.pb`). CLI: `walgit repo settings show|set|clear|history`.
 
 Settings tab helpers (`/{o}/{r}/api/settings…`, all `no-store`): `GET …/settings/describe` → `{settings, sections,

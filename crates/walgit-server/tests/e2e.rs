@@ -11,6 +11,7 @@ use harness::{Server, TestRepo, git, git_in};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;
+use walgit_store::ObjectStore;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn info_refs_v2_advertises_capabilities() -> TestResult {
@@ -271,6 +272,361 @@ async fn admin_create_list_delete() -> TestResult {
         .send()
         .await?;
     assert_eq!(del_again.status(), 404);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_grants_isolate_same_named_repositories_and_admin_actions() -> TestResult {
+    use walgit_config::{StaticToken, TenantGrant, TenantRole};
+
+    let server = Server::start_with_tweak(|cfg| {
+        cfg.server.auth.mode = walgit_config::AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auto_create_on_push = true;
+        cfg.server.auth.tokens = vec![
+            StaticToken {
+                principal: "alice".into(),
+                token: "alice-token".into(),
+                token_env: None,
+                write: true,
+            },
+            StaticToken {
+                principal: "bob".into(),
+                token: "bob-token".into(),
+                token_env: None,
+                write: true,
+            },
+            StaticToken {
+                principal: "carol".into(),
+                token: "carol-token".into(),
+                token_env: None,
+                write: true,
+            },
+            StaticToken {
+                principal: "dave".into(),
+                token: "dave-token".into(),
+                token_env: None,
+                write: false,
+            },
+            StaticToken {
+                principal: "observer".into(),
+                token: "observer-token".into(),
+                token_env: None,
+                write: false,
+            },
+            StaticToken {
+                principal: "erin".into(),
+                token: "erin-token".into(),
+                token_env: None,
+                write: true,
+            },
+        ];
+        cfg.server.auth.platform_operators = vec!["observer".into(), "erin".into()];
+        cfg.server.auth.tenant_grants = vec![
+            TenantGrant {
+                principal: "alice".into(),
+                tenant: "acme".into(),
+                role: TenantRole::Admin,
+            },
+            TenantGrant {
+                principal: "bob".into(),
+                tenant: "beta".into(),
+                role: TenantRole::Admin,
+            },
+            TenantGrant {
+                principal: "carol".into(),
+                tenant: "acme".into(),
+                role: TenantRole::Writer,
+            },
+            TenantGrant {
+                principal: "dave".into(),
+                tenant: "acme".into(),
+                role: TenantRole::Reader,
+            },
+            TenantGrant {
+                principal: "erin".into(),
+                tenant: "acme".into(),
+                role: TenantRole::Admin,
+            },
+        ];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    for (tenant, token) in [("acme", "alice-token"), ("beta", "bob-token")] {
+        let response = client
+            .put(format!("{}/{tenant}/app", server.base_url))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        assert_eq!(response.status(), 201, "create {tenant}/app");
+    }
+    assert!(
+        ObjectStore::head(&*server.store, "repos/acme/app/manifest.pb")
+            .await?
+            .is_some()
+    );
+    assert!(
+        ObjectStore::head(&*server.store, "repos/beta/app/manifest.pb")
+            .await?
+            .is_some()
+    );
+
+    let alice_list_response = client
+        .get(format!("{}/?format=text", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert_eq!(
+        alice_list_response.headers()[reqwest::header::CACHE_CONTROL],
+        "no-store"
+    );
+    let alice_list = alice_list_response.text().await?;
+    assert!(alice_list.contains("acme/app"), "{alice_list}");
+    assert!(!alice_list.contains("beta/app"), "{alice_list}");
+    let alice_owners: serde_json::Value = client
+        .get(format!("{}/api/v1/owners", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(alice_owners, serde_json::json!(["acme"]));
+    let bob_list = client
+        .get(format!("{}/?format=text", server.base_url))
+        .bearer_auth("bob-token")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(bob_list.contains("beta/app"), "{bob_list}");
+    assert!(!bob_list.contains("acme/app"), "{bob_list}");
+
+    let cross_read = client
+        .get(format!(
+            "{}/beta/app.git/info/refs?service=git-upload-pack",
+            server.base_url
+        ))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert_eq!(cross_read.status(), 404);
+    let invalid = client
+        .get(format!(
+            "{}/acme/app.git/info/refs?service=git-upload-pack",
+            server.base_url
+        ))
+        .bearer_auth("invalid")
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), 401);
+
+    let writer_existing = client
+        .get(format!(
+            "{}/acme/app.git/info/refs?service=git-receive-pack",
+            server.base_url
+        ))
+        .bearer_auth("carol-token")
+        .send()
+        .await?;
+    assert_eq!(writer_existing.status(), 200);
+    let writer_missing = client
+        .get(format!(
+            "{}/acme/new.git/info/refs?service=git-receive-pack",
+            server.base_url
+        ))
+        .bearer_auth("carol-token")
+        .send()
+        .await?;
+    assert_eq!(writer_missing.status(), 404);
+    assert!(
+        ObjectStore::head(&*server.store, "repos/acme/new/manifest.pb")
+            .await?
+            .is_none()
+    );
+    let writer_create = client
+        .put(format!("{}/acme/new", server.base_url))
+        .bearer_auth("carol-token")
+        .send()
+        .await?;
+    assert_eq!(writer_create.status(), 403);
+    let reader_push = client
+        .get(format!(
+            "{}/acme/app.git/info/refs?service=git-receive-pack",
+            server.base_url
+        ))
+        .bearer_auth("dave-token")
+        .header(reqwest::header::USER_AGENT, "git/2.46.0")
+        .send()
+        .await?;
+    assert_eq!(reader_push.status(), 403);
+    let cross_lfs = client
+        .post(format!(
+            "{}/beta/app.git/info/lfs/objects/batch",
+            server.base_url
+        ))
+        .bearer_auth("alice-token")
+        .json(&serde_json::json!({"operation": "download", "objects": []}))
+        .send()
+        .await?;
+    assert_eq!(cross_lfs.status(), 404);
+    let reader_lfs_upload = client
+        .post(format!(
+            "{}/acme/app.git/info/lfs/objects/batch",
+            server.base_url
+        ))
+        .bearer_auth("dave-token")
+        .json(&serde_json::json!({"operation": "upload", "objects": []}))
+        .send()
+        .await?;
+    assert_eq!(reader_lfs_upload.status(), 403);
+    let lfs_bytes = b"tenant-private-lfs";
+    let lfs_oid = {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(lfs_bytes))
+    };
+    let lfs_put = client
+        .put(format!(
+            "{}/acme/app.git/info/lfs/objects/{lfs_oid}",
+            server.base_url
+        ))
+        .bearer_auth("alice-token")
+        .body(lfs_bytes.to_vec())
+        .send()
+        .await?;
+    assert_eq!(lfs_put.status(), 200);
+    let lfs_get = client
+        .get(format!(
+            "{}/acme/app.git/info/lfs/objects/{lfs_oid}",
+            server.base_url
+        ))
+        .bearer_auth("dave-token")
+        .send()
+        .await?;
+    assert_eq!(lfs_get.status(), 200);
+    assert_eq!(
+        lfs_get.headers()[reqwest::header::CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
+    let vary = lfs_get.headers()[reqwest::header::VARY].to_str()?;
+    assert!(vary.contains("Authorization"), "{vary}");
+    assert!(vary.contains("Cookie"), "{vary}");
+    let unsafe_settings = client
+        .put(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("alice-token")
+        .body("[upstream]\nlfs = \"https://attacker.example/lfs\"\ntoken_env = \"AWS_SECRET_ACCESS_KEY\"\n")
+        .send()
+        .await?;
+    assert_eq!(unsafe_settings.status(), 403);
+    let operator_settings = client
+        .put(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("erin-token")
+        .body(
+            "[upstream]\nlfs = \"https://source.example/acme/app.git/info/lfs\"\ntoken_env = \"WALGIT_UPSTREAM_TOKEN\"\n",
+        )
+        .send()
+        .await?;
+    assert_eq!(operator_settings.status(), 200);
+    let tenant_visible: serde_json::Value = client
+        .get(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert!(
+        !tenant_visible["toml"]
+            .as_str()
+            .unwrap()
+            .contains("upstream")
+    );
+    let tenant_edit = client
+        .put(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("alice-token")
+        .body("[bundles]\nmin_commits = 3\n")
+        .send()
+        .await?;
+    assert_eq!(tenant_edit.status(), 200);
+    let operator_visible: serde_json::Value = client
+        .get(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("erin-token")
+        .send()
+        .await?
+        .json()
+        .await?;
+    let operator_toml = operator_visible["toml"].as_str().unwrap();
+    assert!(operator_toml.contains("[upstream]"), "{operator_toml}");
+    assert!(operator_toml.contains("[bundles]"), "{operator_toml}");
+    let tenant_clear = client
+        .delete(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert_eq!(tenant_clear.status(), 200);
+    let after_clear: serde_json::Value = client
+        .get(format!("{}/acme/app/api/settings", server.base_url))
+        .bearer_auth("erin-token")
+        .send()
+        .await?
+        .json()
+        .await?;
+    let after_clear_toml = after_clear["toml"].as_str().unwrap();
+    assert!(
+        after_clear_toml.contains("[upstream]"),
+        "{after_clear_toml}"
+    );
+    assert!(
+        !after_clear_toml.contains("[bundles]"),
+        "{after_clear_toml}"
+    );
+    let tenant_history = client
+        .get(format!("{}/acme/app/api/settings/history", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(!tenant_history.contains("token_env"), "{tenant_history}");
+    assert!(
+        !tenant_history.contains("source.example"),
+        "{tenant_history}"
+    );
+    let effective = client
+        .get(format!(
+            "{}/acme/app/api/settings/effective",
+            server.base_url
+        ))
+        .bearer_auth("alice-token")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(!effective.contains("[server]"), "{effective}");
+    assert!(!effective.contains("session_secret"), "{effective}");
+    assert!(!effective.contains("token_env"), "{effective}");
+
+    let tenant_metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .bearer_auth("alice-token")
+        .send()
+        .await?;
+    assert_eq!(tenant_metrics.status(), 403);
+    let operator_metrics = client
+        .get(format!("{}/metrics", server.base_url))
+        .bearer_auth("observer-token")
+        .send()
+        .await?;
+    assert_eq!(operator_metrics.status(), 200);
+    let operator_repo = client
+        .get(format!(
+            "{}/acme/app.git/info/refs?service=git-upload-pack",
+            server.base_url
+        ))
+        .bearer_auth("observer-token")
+        .send()
+        .await?;
+    assert_eq!(operator_repo.status(), 404);
+
     Ok(())
 }
 
@@ -1588,6 +1944,18 @@ async fn bundles_require_allows_one_upload_pack_fallback_after_a_failed_bundle_a
                 write: true,
             },
         ];
+        c.server.auth.tenant_grants = vec![
+            walgit_config::TenantGrant {
+                principal: "dev@example.com".into(),
+                tenant: "t".into(),
+                role: walgit_config::TenantRole::Admin,
+            },
+            walgit_config::TenantGrant {
+                principal: "other@example.com".into(),
+                tenant: "t".into(),
+                role: walgit_config::TenantRole::Reader,
+            },
+        ];
     })
     .await?;
     let r = reqwest::Client::new()
@@ -2718,6 +3086,11 @@ async fn public_lane_serves_only_the_installer_without_auth() -> TestResult {
             token_env: None,
             write: true,
         }];
+        c.server.auth.tenant_grants = vec![walgit_config::TenantGrant {
+            principal: "dev@example.com".into(),
+            tenant: "t".into(),
+            role: walgit_config::TenantRole::Reader,
+        }];
     })
     .await?;
     let c = reqwest::Client::new();
@@ -2776,6 +3149,11 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
             token: "fresh".into(),
             token_env: None,
             write: true,
+        }];
+        c.server.auth.tenant_grants = vec![walgit_config::TenantGrant {
+            principal: "dev@example.com".into(),
+            tenant: "t".into(),
+            role: walgit_config::TenantRole::Admin,
         }];
     })
     .await?;

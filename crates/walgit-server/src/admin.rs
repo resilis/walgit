@@ -16,7 +16,11 @@ pub async fn create(
     headers: &HeaderMap,
     query: &str,
 ) -> Result<Response, ApiError> {
-    let _principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _principal = st
+        .auth
+        .require_tenant_admin(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let format = match query
         .split('&')
         .find_map(|part| part.strip_prefix("object_format="))
@@ -45,26 +49,38 @@ pub async fn delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _principal = st
+        .auth
+        .require_tenant_admin(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     st.registry.delete(&route.id).await.map_err(wal_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
 }
 
 /// `GET /` — list repos as text/plain, one `owner/name` per line.
 pub async fn list_repos(st: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(wal_err)?;
     let body = repos
         .into_iter()
+        .filter(|repo| principal.can_read_tenant(repo.owner()))
         .map(|r| r.to_string())
         .collect::<Vec<_>>()
         .join("\n");
     Ok((
         StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (
+                axum::http::header::VARY,
+                "Authorization, Cookie, X-Walgit-Principal",
+            ),
+        ],
         body,
     )
         .into_response())
@@ -75,7 +91,10 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

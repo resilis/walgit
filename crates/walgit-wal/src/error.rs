@@ -19,6 +19,8 @@ pub enum WalError {
         expected: String,
         actual: String,
     },
+    #[error("settings conflict: expected revision {expected}, got {actual}")]
+    SettingsConflict { expected: u64, actual: u64 },
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

@@ -65,7 +65,7 @@ r.policy.get() / .put(doc) / .delete()       → push policy (docs/POLICY.md)
 r.policy.validate(doc) / .dryRun(doc, last)  → validate or replay a policy against recent pushes
 r.settings.get() / .put(toml, message) / .delete()
 r.settings.effective() / .history() / .describe() / .validate(toml)
-                                             → per-repository WAL settings and their effective host overlay
+                                             → per-repository WAL settings and the safe effective settings sections
 r.urls.{html, clone, api, raw(rev,path), tree(rev,path), blob(rev,path), commit(sha)}
 
 repos.configure({ token, base, lane, onProgress, interactive })
