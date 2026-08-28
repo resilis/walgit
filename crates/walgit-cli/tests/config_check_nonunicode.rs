@@ -14,11 +14,17 @@ bucket = "config-check"
 [server.auth]
 mode = "token"
 issuer = ""
+anonymous_read = false
 
 [[server.auth.tokens]]
 principal = "robot"
 token = "literal-fallback-must-not-be-used"
 token_env = "SELECTED_TOKEN_ENV"
+
+[[server.auth.tenant_grants]]
+principal = "robot"
+tenant = "acme"
+role = "admin"
 "#,
     )
     .expect("write test config");
