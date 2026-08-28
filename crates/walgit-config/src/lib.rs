@@ -3173,13 +3173,15 @@ audiences = ["walgit-cli", "https://git.example.com"]
         );
         assert_eq!(
             keys(table["upstream"].as_table().unwrap()),
-            field_set(SETTINGS_UPSTREAM_FIELDS)
+            field_set(&["git", "lfs", "follow"])
         );
         let strategy = table["bundles"]["strategy"].as_array().unwrap()[0]
             .as_table()
             .unwrap();
         assert_eq!(keys(strategy), field_set(SETTINGS_BUNDLE_STRATEGY_FIELDS));
         let text = view.to_toml_string().unwrap();
+        assert!(!text.contains("token_env"), "{text}");
+        assert!(!text.contains("UPSTREAM_TOKEN"), "{text}");
         for sentinel in [
             "settings-session-secret-sentinel",
             "settings-oauth-secret-sentinel",

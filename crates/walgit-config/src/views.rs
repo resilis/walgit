@@ -85,7 +85,6 @@ pub struct EffectiveCompactionView {
 pub struct EffectiveUpstreamView {
     pub git: Option<String>,
     pub lfs: Option<String>,
-    pub token_env: Option<String>,
     pub follow: Vec<String>,
 }
 
@@ -143,7 +142,6 @@ impl EffectiveSettingsView {
             upstream: EffectiveUpstreamView {
                 git: config.upstream.git.clone(),
                 lfs: config.upstream.lfs.clone(),
-                token_env: config.upstream.token_env.clone(),
                 follow: config.upstream.follow.clone(),
             },
         }

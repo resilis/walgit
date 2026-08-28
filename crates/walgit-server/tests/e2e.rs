@@ -2653,6 +2653,7 @@ async fn settings_views_are_exact_and_secret_free_on_both_api_lanes() -> TestRes
     const OAUTH_SECRET: &str = "server-settings-oauth-secret-sentinel";
     const BROKER_SECRET: &str = "server-settings-broker-secret-sentinel";
     const WEBHOOK_SECRET: &str = "server-settings-webhook-secret-sentinel";
+    const UPSTREAM_SELECTOR: &str = "UPSTREAM_TOKEN";
 
     let server = Server::start_with_tweak(|cfg| {
         cfg.server.auth.tokens = vec![walgit_config::StaticToken {
@@ -2665,7 +2666,7 @@ async fn settings_views_are_exact_and_secret_free_on_both_api_lanes() -> TestRes
         cfg.server.auth.oauth_client_secret = Some(OAUTH_SECRET.into());
         cfg.wal.push_broker_token = Some(BROKER_SECRET.into());
         cfg.events.webhook_secret = Some(WEBHOOK_SECRET.into());
-        cfg.upstream.token_env = Some("UPSTREAM_TOKEN".into());
+        cfg.upstream.token_env = Some(UPSTREAM_SELECTOR.into());
     })
     .await?;
     server.put_repo("t", "projection").await?;
@@ -2699,6 +2700,11 @@ async fn settings_views_are_exact_and_secret_free_on_both_api_lanes() -> TestRes
                 "{lane} effective leaked {sentinel}"
             );
         }
+        assert!(!effective.contains("token_env"), "{lane}: {effective}");
+        assert!(
+            !effective.contains(UPSTREAM_SELECTOR),
+            "{lane}: {effective}"
+        );
 
         let describe_text = client
             .get(format!("{base}/describe"))
@@ -2736,6 +2742,19 @@ async fn settings_views_are_exact_and_secret_free_on_both_api_lanes() -> TestRes
                     .any(|prefix| key.starts_with(prefix))
             })
         }));
+        assert_eq!(
+            describe["upstream"]["token_env"], true,
+            "{lane}: {describe_text}"
+        );
+        assert!(describe["fields"].as_array().unwrap().iter().all(|field| {
+            field["key"] != "upstream.token_env"
+                && field["value"] != UPSTREAM_SELECTOR
+                && field["host_value"] != UPSTREAM_SELECTOR
+        }));
+        assert!(
+            !describe_text.contains(UPSTREAM_SELECTOR),
+            "{lane}: {describe_text}"
+        );
         for sentinel in sentinels {
             assert!(
                 !describe_text.contains(sentinel),
@@ -2760,6 +2779,19 @@ async fn settings_views_are_exact_and_secret_free_on_both_api_lanes() -> TestRes
                     .any(|prefix| key.starts_with(prefix))
             })
         }));
+        assert_eq!(
+            validate["upstream"]["token_env"], true,
+            "{lane}: {validate_text}"
+        );
+        assert!(validate["fields"].as_array().unwrap().iter().all(|field| {
+            field["key"] != "upstream.token_env"
+                && field["value"] != UPSTREAM_SELECTOR
+                && field["host_value"] != UPSTREAM_SELECTOR
+        }));
+        assert!(
+            !validate_text.contains(UPSTREAM_SELECTOR),
+            "{lane}: {validate_text}"
+        );
         for sentinel in sentinels {
             assert!(
                 !validate_text.contains(sentinel),
