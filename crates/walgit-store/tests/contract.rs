@@ -209,27 +209,38 @@ async fn test_put_create_wins_once(store: &DynStore, key: &str) {
         let s = store.clone();
         let k = key.to_owned();
         handles.push(tokio::spawn(async move {
-            let result = s
-                .put(
-                    &k,
-                    PutBody::Bytes(Bytes::from(format!(" contender {i}"))),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await;
-            result.is_ok()
+            s.put(
+                &k,
+                PutBody::Bytes(Bytes::from(format!(" contender {i}"))),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
         }));
     }
 
-    let mut wins = 0u32;
+    let mut wins = 0usize;
+    let mut losers = 0usize;
     for h in handles {
-        if h.await.expect("task join") {
-            wins += 1;
+        match h.await.expect("task join") {
+            Ok(_) => wins += 1,
+            Err(error) => {
+                assert!(
+                    error.is_precondition_failed(),
+                    "Create loser should be PreconditionFailed, got {error:?}"
+                );
+                losers += 1;
+            }
         }
     }
     assert_eq!(wins, 1, "Create: exactly one of {n} should win, got {wins}");
+    assert_eq!(
+        losers,
+        n - 1,
+        "Create: every loser should be PreconditionFailed"
+    );
 
     // Cleanup.
     let _ = store.delete(key, None).await;

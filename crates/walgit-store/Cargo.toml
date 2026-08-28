@@ -42,4 +42,5 @@ tempfile.workspace = true
 sha1 = { workspace = true }
 bytesize = { workspace = true }
 uuid = { workspace = true }
+aws-smithy-http-client = { version = "1.4.0", features = ["test-util"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
