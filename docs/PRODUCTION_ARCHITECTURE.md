@@ -16,7 +16,7 @@ redaction stay unchanged.
 
 Cloud Core remains the tenant, project, repository, build, credential, and
 orchestration owner. WalGit owns Git protocol execution and repository control.
-One versioned S3-compatible bucket is WalGit's only durable state. Local disk
+One versioned Amazon S3 bucket is WalGit's only durable state. Local disk
 and memory remain disposable caches.
 
 Delivery is producer before consumer and pull-request only. A source pull
@@ -41,7 +41,7 @@ production approval. No PR1 image is production-deployable.
    identity, lifecycle, visibility, repository grants, writer fencing, finite
    quotas, capacity reservations, mutation receipts and settlement, exact
    object-version references, and bounded typed reclamation. The exact selected
-   S3-compatible provider primitive gate must pass before PR2 merges.
+   AWS S3 primitive gate must pass before PR2 merges.
 3. **PR3 — events and operations (future).** Extend settled receipts with
    durable event materialization and fanout. Add exact-commit pins, recovery
    catalogs and journals, production-scale and recovery evidence, and one
@@ -52,7 +52,7 @@ production approval. No PR1 image is production-deployable.
 
 ## PR1 binding storage contract
 
-- The selected S3-compatible bucket is the only durable state. Local disk and
+- The selected Amazon S3 production bucket is the only durable state. Local disk and
   memory are disposable caches.
 - Small mutable metadata uses one atomic conditional write. A caller gets an
   explicit failure when the provider cannot enforce the requested condition.
@@ -85,10 +85,10 @@ production approval. No PR1 image is production-deployable.
   syntax with no path or trailing slash. WalGit binds it after AWS SDK config
   loading and disables ambient endpoint, FIPS, and dual-stack modifiers.
   Memory, GCS, and standalone behavior remain supported for development and
-  non-production contracts. Only an S3-compatible provider is eligible for the
-  future production hard cut.
+  non-production contracts. Only AWS S3 is eligible for the future production
+  hard cut.
 - PR1 local RustFS evidence does not prove the production provider. The PR2
-  provider gate below must use the exact S3-compatible endpoint, region,
+  provider gate below must use the exact AWS S3 endpoint, region,
   addressing mode, credential mode, temporary bucket, and unique prefix
   selected for production.
 
@@ -310,17 +310,15 @@ The following field limits apply across the V2 schema:
 | Inline settings | 0–16,384 encoded bytes |
 | Inline policy | 0–65,536 encoded bytes |
 | Delivery or reclamation cursor | 0–4,096 bytes |
-| S3 proof key, version-ID, or upload-ID marker | 0–1,024 bytes |
-| Canonical S3 proof cursor | 39–2,087 bytes |
-| Cutover scan record | computed maximum 4,404 bytes; hard cap 8,192 bytes |
-| Bootstrap-proof IAM revision or request watermark | 1–4,096 bytes |
+| S3 inventory key or version ID | 0–1,024 bytes |
+| Cutover inventory record | exactly 88 bytes |
+| Bootstrap authority-precondition digest | exactly 32 bytes |
 | Ed25519 public key | exactly 32 bytes |
 | Ed25519 signature | exactly 64 bytes |
 | HMAC-SHA256 key ID or event-delivery key ID | exactly 16 bytes |
 | HMAC-SHA256 result or body digest | exactly 32 bytes |
 | HTTPS callback URL or normalized callback path | 1–2,048 ASCII bytes |
 | Webhook body | 1–1,048,576 bytes |
-| Provider admission horizon | 0–300 seconds |
 | Event-to-READY interval, named `event_to_build_intent_delay` | 0–2,592,000 seconds |
 | Build queue, retry, or maximum completion horizon | 0–2,592,000 seconds each; their sum is at most 7,776,000 seconds |
 | Conservative event build-retention span | 0–10,368,000 seconds |
@@ -1006,23 +1004,28 @@ Versioning is mandatory. Every durable root records key, `ObjectVersionID`,
 digest, and size. Recovery and reclamation use exact-version HEAD, GET, and
 delete. They never treat an ETag or `CasToken` as a historical identity.
 
-Production eligibility requires the exact selected S3-compatible provider to
-enumerate current objects, noncurrent versions, delete markers, and all active
-multipart uploads with complete pagination. GCS remains supported for
-development and non-production contracts. Its non-production exact-delete
-contract requires bucket Object Versioning enabled and soft-delete retention
-zero. GCS is not eligible for the hard-cut production target because it cannot
-enumerate every resumable upload session and delete marker required by the
-four-set proof.
+Production eligibility for this AWS-native hard cut requires a general-purpose
+Amazon S3 bucket with versioning enabled before the gate and a fresh deployment
+prefix whose complete expected bootstrap history fits in one nontruncated
+`ListObjectVersions` response. The gate treats that strongly consistent
+completed-version inventory, conditional single-part writes, and exact-version
+reads as authoritative. It does not treat multipart-upload enumeration as
+authority. GCS remains supported for development and non-production contracts.
+Its non-production exact-delete contract requires Object Versioning enabled and
+soft-delete retention zero. The AWS-native production gate also depends on AWS
+Roles Anywhere activation, so GCS evidence cannot satisfy it.
 
 ### Production bucket administrative safety
 
-Production requires provable exclusive administrative control over bucket
-versioning, lifecycle, encryption and KMS retention, and all IAM and provider
-policies that can affect the deployment prefix for the full runtime horizon.
-Runtime serving, writer, recovery, and reclamation identities have explicit
-denies for every administrative change. A provider that cannot expose and
-enforce this separation is not production-eligible.
+Production pre-provisions and then freezes the bucket configuration used by the
+deployment prefix: versioning, lifecycle, encryption and KMS retention, the
+bootstrap role, the prefix-scoped runtime role, the bucket policy, the Roles
+Anywhere trust anchor, and a dedicated runtime profile. Runtime serving,
+writer, recovery, and reclamation identities cannot change that configuration.
+The profile is created disabled and has never been enabled. No other enabled
+profile or role-assumption path can issue credentials for the runtime role.
+These are trusted provisioning preconditions, not facts inferred from an IAM
+propagation wait or an audit log.
 
 `bucket_admin_control` is the global safety authority. It records an epoch,
 state, exact safety-configuration digest, proof digest, and the allowed
@@ -1033,8 +1036,10 @@ bucket, prefix, versioning state, lifecycle-rules digest,
 abandoned-multipart-days, encryption mode, KMS key ID, KMS key version, KMS
 retention seconds, object-version retention seconds, object-lock state, bucket
 policy digest, IAM policy digest, organization-policy digest, administrative
-principal-set digest, runtime-deny-policy digest, and provider-control-policy
-digest. IDs are bounded byte strings, times are unsigned 64-bit integers, enums
+principal-set digest, bootstrap-data-policy digest, and runtime-credential-
+authority digest. The last digest binds the dedicated role, disabled profile,
+trust anchor, certificate identity, and absence of another assumption path.
+IDs are bounded byte strings, times are unsigned 64-bit integers, enums
 are unsigned integers, and digests are exactly 32 bytes. Each nested rule or
 principal set is deterministic CBOR sorted by its encoded bytes; its field is
 the SHA-256 digest of those exact bytes. The digest preimage uses the complete
@@ -1042,32 +1047,27 @@ RFC 8949 deterministic encoding of this map. Duplicate keys, indefinite-length
 items, floats, non-shortest encodings, non-canonical map order, unknown keys,
 missing keys, and trailing bytes fail closed.
 
-An infrastructure change first CASes `bucket_admin_control` from `STABLE(e)` to
-`PREPARING(e+1)`. That CAS blocks new mutation and reclamation admission. The
-controller then installs a provider runtime-write deny, revokes every epoch
-`e` runtime credential, proves provider-policy convergence, collects
-acknowledgements from every serving, writer, recovery, and reclamation process,
-and drains every request admitted under epoch `e`. Only then may the dedicated
-administration identity change external configuration. An old credential is
-never re-enabled.
+The bootstrap controller reads back the current configuration and roots its
+exact digest. That readback proves only what the AWS control plane reports at
+that instant. It does not prove IAM convergence, historical non-use, or the
+absence of a request that AWS admitted earlier. The hard cut therefore makes no
+IAM or bucket-policy change during bootstrap. It gets safety from a never-used
+prefix, no obtainable runtime credential, a bootstrap role that cannot start
+multipart uploads or delete versions, and conditional `PutObject` enforcement.
 
-The controller reads back the complete configuration and roots its exact new
-proof and digest. Before publication resumes, it issues, distributes, and
-proves loading of new epoch `e+1` runtime credentials. Its final CAS to
-`STABLE(e+1)` binds those proofs. A failed or ambiguous change remains fenced
-until recovery either proves the new configuration or restores and proves the
-prior configuration. A stale actor paused after safety validation is denied by
-the provider and cannot publish when it resumes. Terminal `cutover_control`
-does not change.
+The active bucket configuration is immutable in this slice. A later change that
+needs credential revocation or an IAM-policy transition requires a separate
+fenced-outage protocol and PR3 evidence. Until that protocol exists, the
+controller must fail closed instead of claiming that an IAM readback or elapsed
+time proves convergence. Terminal `cutover_control` does not change.
 
 Immediately before every `repo_control` publication and every reclamation
 delete, the actor reads the current exact `bucket_admin_control`, requires
-`STABLE`, proves that its loaded runtime credential has that exact epoch, reads
-the provider configuration, recomputes the safety digest, and requires an exact
-match. Each published control version binds the bucket-admin epoch and safety
-digest. Readiness performs the same validation and fails on drift, an
-unavailable proof, a stale credential epoch, or a non-`STABLE` state. No cached
-or advisory value can satisfy this check.
+`STABLE`, and requires the frozen safety digest and runtime credential binding.
+Each published control version binds the bucket-admin epoch and safety digest.
+Readiness performs the same validation and fails on drift, an unavailable
+readback, a stale credential binding, or a non-`STABLE` state. This detects
+drift; it does not make an out-of-band IAM change synchronously safe.
 
 Ordinary request and maintenance paths cannot delete noncurrent versions. A
 writer-fenced typed reclaimer can exact-version-delete a catalog-proven
@@ -1078,12 +1078,14 @@ abort abandoned multipart uploads, but they cannot expire protected object
 versions. KMS key retention exceeds the maximum retained object-version
 horizon.
 
-An object, version, delete-marker, or multipart enumeration requests at most
-1,000 entries per provider page. One bounded invocation processes at most 1,000
-pages and stores a continuation cursor of at most 4,096 bytes before it resumes.
-Runtime cursors are rooted in control. A production bootstrap holds its
-`PREPARING` administrative fence until all four S3-compatible-provider
-enumerations return a terminal page.
+Normal recovery and reclamation version enumeration requests at most 1,000
+entries per provider page. One bounded invocation processes at most 1,000 pages
+and stores a continuation cursor of at most 4,096 bytes before it resumes.
+Runtime cursors are rooted in control. Bootstrap is intentionally narrower: it
+accepts exactly one nontruncated `ListObjectVersions` page and fails if the
+expected graph does not fit. A one-page `ListMultipartUploads` call is only
+anomaly evidence. A nonempty or truncated result fails the gate, but an empty
+result is not part of the authoritative zero-data proof.
 
 ### Mutation receipt and settlement
 
@@ -1662,7 +1664,7 @@ delete within one correctly versioned bucket. It excludes loss of the bucket,
 account, region, KMS key, or a permanently deleted object version. Those risks
 require independent replication or backup and are not hidden by the RPO claim.
 
-An RTO of four hours is valid only after exact selected S3-compatible-provider
+An RTO of four hours is valid only after exact selected AWS S3
 throughput and sizing equations pass with two-times headroom. Writer scratch
 sizing uses fixed-thin, index, and expanded-object peaks rather than a fixed
 guess.
@@ -1671,41 +1673,65 @@ guess.
 
 ### Fresh-prefix bootstrap
 
-V2 production uses one fresh deployment prefix `P` on the exact selected
-S3-compatible provider. It does not adopt, backfill, translate, or import V1
-`manifest.pb` repositories. No production repository data exists in `P` before
-bootstrap. Old development data stays in its old prefix and is not changed.
+V2 production uses one brand-new UUID-derived deployment prefix `P` in one
+general-purpose Amazon S3 bucket. `P` has never been used by a development,
+test, failed-production, or prior-production attempt. V2 does not adopt,
+backfill, translate, or import V1 `manifest.pb` repositories.
 
-The first durable action is one conditional `Create` of
+Provisioning finishes before the bounded bootstrap gate starts:
+
+- bucket versioning is enabled and has been left stable for at least 15
+  minutes; AWS documents that a first enable can take up to 15 minutes to
+  propagate, so the gate does not spend its budget waiting for it
+  ([S3 versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/manage-versioning-examples.html));
+- lifecycle rules cannot expire a current version, noncurrent version, or
+  delete marker under `P`; an `AbortIncompleteMultipartUpload` rule may remain;
+- no replication, batch job, event target, or other service can write under
+  `P`;
+- bucket and organization policies admit data-plane writes under `P` only from
+  the bootstrap role and the dedicated runtime role;
+- the bootstrap role is prefix-scoped, cannot delete a version or start a
+  multipart upload, and can write only with `If-None-Match: *` or `If-Match`;
+  the bucket policy enforces the same conditional-write requirement
+  ([S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)); and
+- the dedicated runtime role has no other assumption path. Its dedicated Roles
+  Anywhere profile is disabled and has never been enabled. No runtime session
+  or runtime writer credential exists.
+
+The never-used prefix and never-enabled profile are deployment invariants. AWS
+does not expose a synchronous historical proof for either one. The signed
+bootstrap authority-precondition document records those assertions and binds
+the exact account, bucket, prefix, roles, trust anchor, certificate identity,
+profile, policies, versioning, lifecycle, encryption, and KMS configuration.
+Configuration readback must match the document, but readback is an observation,
+not an IAM-convergence proof.
+
+Before the first write, the controller issues exactly one
+`ListObjectVersions` request with prefix `P`, no delimiter, and `MaxKeys=1000`.
+The response must be nontruncated and contain no object version and no delete
+marker. This is the initial completed-version inventory. Amazon S3 documents
+strong consistency for LIST operations
+([S3 consistency](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)).
+The controller also issues one `ListMultipartUploads` request as anomaly
+evidence. A nonempty or truncated response fails the gate. An empty response is
+not authoritative proof because AWS does not document that API as a strongly
+consistent inventory. Safety does not depend on it: neither the bootstrap role
+nor any runtime identity can initiate a multipart upload under `P`.
+
+The first durable action is one conditional, single-part `PutObject` Create of
 `P || "v2/control/cutover_control.pb"` in `OPEN(g0)`. It binds the target
-provider configuration, bootstrap session UUID, and intended safety policy, but
-does not claim that the prefix is empty. An ambiguous Create is resolved only
-by an exact read of its key, `ObjectVersionID`, digest, and session. The next
-action is the control CAS from `OPEN` to `PREPARING`. No IAM, administration,
-route, worker, credential, legacy, or other external change may occur before
-that CAS lands.
+provider configuration, bootstrap session UUID, authority-precondition digest,
+and initial inventory. An ambiguous Create is resolved only by an exact read of
+its key, `ObjectVersionID`, digest, and session. The next action is one
+conditional, single-part `If-Match` update from `OPEN` to `PREPARING`. No
+runtime credential, workload, route, or consumer change may occur before that
+CAS lands. Bootstrap performs no IAM or bucket-policy mutation.
 
-Only in `PREPARING` may the controller install the exclusive bucket IAM and
-administrative fence. That fence makes the cutover administration identity the
-only actor able to change provider safety configuration and denies all legacy
-and runtime writes, deletes, and multipart starts under `P`. The controller
-revokes old runtime credentials, proves provider-policy convergence, collects
-acknowledgements from every old writer, and drains admitted requests.
-
-The selected provider must prove one maximum request, signature, and multipart
-admission horizon `H`, with `0 <= H <= 300` seconds, plus a monotonic policy and
-write-admission audit watermark. After convergence and drain, the controller
-waits the full `H` without reopening writes and records the last admitted
-mutating-request watermark. Proof reads do not advance it. A provider without a
-bounded, testable horizon and stable write-admission watermark is
-production-ineligible.
-
-The controller then verifies versioning, lifecycle, encryption, KMS retention,
-and the full provider-policy closure. Before any initial control-plane object
-Create, a `PREPARING` CAS roots an inline bootstrap creation plan. The plan has
-at most 262 rows: 256 capacity shards plus exactly one initial key ring,
-`credential_control`, `bucket_admin_control`, `capacity_control`, empty
-tenant-capacity catalog page, and `recovery_control`. No other type is valid.
+Before any other control-plane Create, a `PREPARING` CAS roots an inline
+bootstrap creation plan. The plan has at most 262 rows: 256 capacity shards plus
+exactly one initial key ring, `credential_control`, `bucket_admin_control`,
+`capacity_control`, empty tenant-capacity catalog page, and `recovery_control`.
+No other type is valid.
 
 Every plan row is appended by CAS before its matching Create and binds the exact
 deterministic key, body digest, size, type, dependency-row indexes, and state
@@ -1723,9 +1749,12 @@ for this bootstrap session, inserts the exact proof digest as field 10, and only
 then appends the final control key, body digest, and size to stage two. Cloud
 Core retains the proof bytes; they are not a 263rd plan row or a bucket object.
 
-Each initial object uses conditional Create. One stage runs at most 32 Creates
-concurrently. Success returns its assigned `ObjectVersionID`; one batched
-cutover CAS changes all completed rows to `RESOLVED` and binds each exact target
+Each initial object uses one conditional, single-part `PutObject` Create. No
+bootstrap object uses multipart upload, unconditional overwrite, or Delete.
+Every `cutover_control` update is one conditional, single-part `If-Match`
+`PutObject`. One stage runs at most 32 Creates concurrently. Success returns its
+assigned `ObjectVersionID`; one batched cutover CAS changes all completed rows
+to `RESOLVED` and binds each exact target
 key, `ObjectVersionID`, digest, size, and type. Thus the healthy two-stage plan
 needs at most three plan CASes: append stage one, resolve stage one while
 appending stage two, and resolve stage two. An ambiguous Create is resolved by
@@ -1736,10 +1765,12 @@ its matching object retry-resolvable rather than orphaned. No planned object is
 operational authority before its row is `RESOLVED` and its own authoritative
 parent roots it.
 
-With all 262 rows resolved and writes still denied, the controller enumerates
-every current object, noncurrent version, delete marker, and active multipart
-upload under `P`. It fetches and verifies every version in the allowlisted
-control-plane graph:
+With all plan rows resolved and runtime access still disabled, the controller
+issues the final completed-version inventory: exactly one
+`ListObjectVersions` request with prefix `P`, no delimiter, and `MaxKeys=1000`.
+The response must be nontruncated. It must contain no delete marker. The
+controller exact-version GETs and hashes every returned object version, then
+verifies the complete allowlisted control-plane graph:
 
 - the complete `cutover_control` transition, digest, generation, bootstrap
   session, creation-plan, and row-resolution chain;
@@ -1754,146 +1785,60 @@ version is allowed only when its key, `ObjectVersionID`, digest, size, type,
 transition predecessor, generation, and bootstrap session match that graph.
 During retry, each unresolved `PLANNED` row permits only its one exact matching
 object while the controller resolves the batch. Repository-data counts remain
-zero. Any other current object, noncurrent version, delete marker, multipart
-upload, control transition, or orphaned object fails the hard cut. Retry never
-assumes cleanup or deletes an unexpected entry.
+zero. Any other current object, noncurrent object version, delete marker,
+control transition, or orphaned object fails the hard cut. Retry never assumes
+cleanup and never deletes an unexpected entry. A failed production prefix is
+quarantined permanently. A later attempt uses a new prefix, bootstrap session,
+runtime role, and never-enabled profile.
 
-The four scanned sets have exact, disjoint classifications. A current object is
-an object version that the provider reports as latest for its key and that is
-not a delete marker. A noncurrent object is every object version that the
-provider does not report as latest. If a delete marker is latest, that key has
-no current object and all of its object versions are noncurrent. The delete-
-marker set contains every delete marker, whether or not it is latest, and
-records its latest bit. The multipart set contains every active multipart
-upload. A provider entry that cannot be assigned once under these rules, or is
-assigned to more than one set, fails the proof.
-
-The scan uses exact provider-returned key, `ObjectVersionID`, and upload-ID
-bytes. Let `LP(x) = u32be(len(x)) || x`; `u8` is one unsigned byte and `u64be`
-is one unsigned 64-bit big-endian integer. Set kinds are current object `1`,
-noncurrent object `2`, delete marker `3`, and active multipart upload `4`. Let
-`E = LP("walgit-cutover-entry-v1")`. Entries have only these encodings:
+The inventory uses exact provider-returned key and `ObjectVersionID` bytes. Let
+`LP(x) = u32be(len(x)) || x`; `u8` is one unsigned byte and `u64be` is one
+unsigned 64-bit big-endian integer. Let
+`E = LP("walgit-cutover-completed-version-entry-v2")`. A completed object
+version has this encoding:
 
 ```text
-object(k) = E || u8(k) || LP(key) || LP(ObjectVersionID) ||
-            u64be(size) || SHA-256(exact_version_content)
-marker    = E || u8(3) || LP(key) || LP(ObjectVersionID) || u8(is_latest)
-upload    = E || u8(4) || LP(key) || LP(upload_id)
+object = E || u8(1) || LP(key) || LP(ObjectVersionID) ||
+         u8(is_latest) || u64be(size) ||
+         SHA-256(exact_version_content)
 ```
 
-Here `k` is `1` or `2`, and `is_latest` is exactly `0` or `1`. Exact-version
-GET supplies the object content digest, and exact-version HEAD, GET, and list
-sizes must agree. Delete markers and active uploads have no committed content
-size or content digest, so their encodings omit those fields. Within each set,
-the controller sorts complete encoded entries in unsigned lexicographic byte
-order and rejects an exact duplicate. It can use bounded spill files and an
-external merge, but it must finish every paginated enumeration before it
-accepts a digest.
-
-For set kind `k`, with sorted entries `e1` through `en`, the streaming set
-digest is:
+`is_latest` is exactly `0` or `1`. Exact-version GET supplies the object content
+digest, and exact-version HEAD, GET, and list sizes must agree. The controller
+sorts the entries in unsigned lexicographic byte order and rejects an exact
+duplicate. With sorted entries `e1` through `en`, the completed-version digest
+is:
 
 ```text
-SHA-256(LP("walgit-cutover-set-v1") || u8(k) ||
+SHA-256(LP("walgit-cutover-completed-versions-v2") ||
         LP(e1) || ... || LP(en) || u64be(n))
 ```
 
-Each scan performs exactly two shared S3 traversals. One complete
-`ListObjectVersions` traversal feeds current objects, noncurrent objects, and
-delete markers from each entry's provider type and `IsLatest` value. One
-complete `ListMultipartUploads` traversal feeds active uploads. Requests use
-prefix `P`, no delimiter, and the provider maximum page size of 1,000. No
-per-set LIST or cursor exists.
-The current-object, noncurrent-object, and delete-marker set clauses share the
-exact version-traversal page count and cursor-chain digest. The upload set uses
-the multipart-traversal page count and cursor-chain digest. A set cannot carry
-independent traversal evidence.
-
-Traversal kind `1` is versions and kind `2` is multipart uploads. Let
-`C = LP("walgit-s3-list-cursor-v1")`. A canonical cursor is:
+One inventory record has this exact encoding:
 
 ```text
-version_cursor = C || u8(1) ||
-  u8(key_marker_present) || LP(key_marker_or_empty) ||
-  u8(version_id_marker_present) || LP(version_id_marker_or_empty)
-
-multipart_cursor = C || u8(2) ||
-  u8(key_marker_present) || LP(key_marker_or_empty) ||
-  u8(upload_id_marker_present) || LP(upload_id_marker_or_empty)
-```
-
-Each presence value is exactly `0` or `1`. An absent component has presence
-`0` and a zero-length LP value. A present component has presence `1` and its
-exact provider-returned raw bytes, including an empty value if the provider
-returned one. Key, version-ID, and upload-ID marker values are each at most
-1,024 bytes, so a canonical cursor is 39–2,087 bytes. The initial request cursor
-has both components absent.
-
-This production contract uses general-purpose S3 pagination. When a response
-is truncated, both required next components must be present: `NextKeyMarker`
-and `NextVersionIdMarker` for versions, or `NextKeyMarker` and
-`NextUploadIdMarker` for multipart uploads. Their canonical response-next
-cursor becomes the exact next request cursor, with the same presence bits and
-raw bytes. A nontruncated terminal response must have both next components
-absent. Directory-bucket pagination that omits the upload-ID marker is not
-eligible. The scanner rejects a missing required component, a next request
-that differs from the preceding response-next cursor, a repeated request
-cursor, a truncated response whose next cursor repeats any prior request, or a
-nontruncated response with a next component present.
-
-For traversal kind `t`, page `i` binds request cursor `ri`, response-next cursor
-`ni`, and the response's exact truncation bit `bi`. With `p >= 1` pages, the
-streaming cursor-chain digest is:
-
-```text
-SHA-256(LP("walgit-s3-cursor-chain-v1") || u8(t) ||
-        for i = 0..p-1:
-          u64be(i) || LP(ri) || u8(bi) || LP(ni) ||
-        u64be(p))
-```
-
-All nonterminal `bi` values are `1`; the last is `0`, and its `ni` is the
-canonical both-absent cursor. The scanner hashes this chain incrementally and
-retains only its page count and digest. Entry duplicate checks span page
-boundaries, including many versions and delete markers for one key.
-
-One scan record has this exact binary encoding, with the four set clauses and
-then the two traversal clauses in ascending kind order:
-
-```text
-LP("walgit-cutover-scan-v1") ||
-u64be(start_unix_milliseconds) || u64be(finish_unix_milliseconds) ||
-LP(request_audit_high_watermark) ||
-for k = 1..4:
-  u8(k) || u64be(item_count) || set_digest_raw32 ||
-for t = 1..2:
-  u8(t) || u64be(page_count) || cursor_chain_digest_raw32 ||
+LP("walgit-cutover-inventory-v2") ||
+u8(phase) || u64be(item_count) || completed_version_digest_raw32 ||
 u64be(repository_data_count) || u64be(allowlisted_graph_count)
 ```
 
-With the 4,096-byte watermark maximum, a scan record's exact worst case is
-4,404 bytes, below its 8,192-byte hard cap. Its digest is
-`SHA-256(LP("walgit-cutover-scan-digest-v1") || LP(scan_record))`. Both scans
-must have complete pagination, identical per-set counts and set digests,
-identical zero repository-data and allowlisted-graph counts, and the same
-request-audit high watermark. Their start and finish times, page counts,
-cursor-chain digests, and scan-record digests remain distinct evidence.
-
-The shared request-audit high watermark is the provider's exact last admitted
-mutating-request or write-admission watermark after policy convergence, writer
-drain, and the full `H` wait. Bootstrap LIST, exact-version HEAD, and
-exact-version GET proof reads do not advance it. A provider that cannot expose
-that stable write-admission watermark separately from proof reads is
-production-ineligible.
+`phase` is `1` for the initial inventory and `2` for the final inventory. The
+record is exactly 88 bytes. The initial record has zero items, zero repository
+data, zero allowlisted graph objects, and the digest of the empty completed-
+version set. The final record has zero repository data and identifies every
+version in the allowlisted graph. A truncated response cannot produce a record.
+The contract contains only these two one-page completed-version inventories.
+It has no production pagination or request-admission evidence.
 
 The final proof uses a dedicated pinned 32-byte Ed25519 bootstrap public key.
 Define `bootstrap_kid = first16(SHA-256("walgit-bootstrap-ed25519-kid-v1" ||
 bootstrap_public_key))`; it is the first 16 digest bytes in wire order and is
 encoded as a 16-byte CBOR byte string. The production candidate and `OPEN` bind
-that exact public key and key ID before a scan. The proof is an untagged `COSE_Sign1` with
-the exact deterministic-CBOR protected map `{1: -8, 4: bootstrap_kid}`, an
+that exact public key and key ID before an inventory. The proof is an untagged
+`COSE_Sign1` with the exact deterministic-CBOR protected map
+`{1: -8, 4: bootstrap_kid}`, an
 empty unprotected map, an attached payload, and external AAD equal to the exact
-ASCII bytes `walgit-cutover-proof-v1`. It uses the same deterministic-CBOR and
+ASCII bytes `walgit-cutover-proof-v2`. It uses the same deterministic-CBOR and
 strict Ed25519 rejection rules as create intents. No verification-ring key can
 substitute for the dedicated bootstrap key.
 
@@ -1903,13 +1848,13 @@ text. It has only these required keys:
 
 | Key | Type and value |
 |---:|---|
-| 1 | unsigned proof schema, exactly `1` |
+| 1 | unsigned proof schema, exactly `2` |
 | 2 | bootstrap-session UUIDv7, 16-byte byte string |
 | 3 | unsigned cutover generation |
 | 4 | exact prior cutover key byte string, 1–1,024 bytes |
 | 5 | exact prior cutover `ObjectVersionID` byte string, 1–1,024 bytes |
 | 6 | exact prior cutover `CasToken` byte string, 1–256 bytes |
-| 7 | unsigned intended transition, exactly `1` for `PREPARING -> PREPARING_WITH_FOUR_SET_PROOF` |
+| 7 | unsigned intended transition, exactly `1` for rooting the inventory proof while `PREPARING` |
 | 8 | provider byte string, 1–128 ASCII bytes |
 | 9 | provider account byte string, 1–256 bytes |
 | 10 | endpoint byte string, 1–2,048 ASCII bytes |
@@ -1917,54 +1862,56 @@ text. It has only these required keys:
 | 12 | bucket byte string, 1–256 ASCII bytes |
 | 13 | deployment-prefix byte string, 0–256 ASCII bytes |
 | 14 | fixed integer-keyed mode map described below |
-| 15 | 32-byte safety-configuration digest |
-| 16 | provider IAM or policy-revision byte string, 1–4,096 bytes |
-| 17 | request-audit high-watermark byte string, 1–4,096 bytes |
-| 18 | unsigned admission horizon `H`, in seconds |
-| 19 | 32-byte production-image digest |
-| 20 | 32-byte resolved creation-plan digest |
-| 21 | exact first scan-record byte string, 1–4,404 bytes |
-| 22 | 32-byte first scan-record digest |
-| 23 | exact second scan-record byte string, 1–4,404 bytes |
-| 24 | 32-byte second scan-record digest |
+| 15 | 32-byte bootstrap authority-precondition digest |
+| 16 | 32-byte production-image digest |
+| 17 | 32-byte resolved creation-plan digest |
+| 18 | exact 88-byte initial inventory record |
+| 19 | 32-byte initial inventory-record digest |
+| 20 | exact 88-byte final inventory record |
+| 21 | 32-byte final inventory-record digest |
 
 The key-14 map has exactly six byte-string values: key 1 addressing mode, key 2
 credential mode, key 3 versioning mode, key 4 lifecycle mode, key 5 encryption
-mode, and key 6 KMS mode. Each value is 1–128 ASCII bytes. At all simultaneous
-maxima, the 24-key deterministic-CBOR payload is at most 23,557 bytes. The
-untagged four-item COSE array, exact 21-byte protected-map encoding and byte-
-string wrapper, empty map, payload wrapper, and 64-byte-signature wrapper make
-the complete envelope at most 23,650 bytes. The declared envelope limit remains
-65,536 bytes. A contract linter repeats this exact expansion and rejects any
-schema change that exceeds either computed maximum or the declared limit.
+mode, and key 6 KMS mode. Each value is 1–128 ASCII bytes. The declared envelope
+limit remains 65,536 bytes. A contract linter computes the exact maximum from
+the 21 required keys and rejects a schema change that exceeds that limit.
 
 After the creation-plan resolution CAS, the controller reads and fixes the
 exact prior cutover key, `ObjectVersionID`, and `CasToken`. No durable write
-occurs until both scans finish. It then builds and signs the deterministic
-payload locally, embeds the exact proof in the next `cutover_control`
+occurs between the final inventory and proof construction. It then builds and
+signs the deterministic payload locally, embeds the exact proof in the next `cutover_control`
 candidate, and uses the bound prior token for the proof-rooting CAS while state
 remains `PREPARING`. The payload does not include the candidate control's
 future `ObjectVersionID`, digest, or size, or the proof envelope's digest, so it
 has no self-digest cycle. The store result supplies the new control version.
 Any session, generation, prior key, prior version, prior token, transition,
-provider configuration, key ID, or scan mismatch rejects replay. An ambiguous
-CAS is resolved by an exact control read before another attempt. No standalone
-proof object exists. A crash repeats graph verification and both scans before
-`PREPARED`.
+provider configuration, key ID, or inventory mismatch rejects replay. An
+ambiguous CAS is resolved by an exact control read before another attempt. No standalone
+proof object exists. A crash repeats the final inventory and graph verification
+before `PREPARED`. The proof does not claim IAM propagation, request ordering,
+or multipart absence.
 
-All later V1 disablement, legacy route barriers, drains, worker and retry stops,
-credential revocations, runtime-IAM installation, and authority transfers are
-rooted idempotent `PREPARING` steps. Repository creation stays fenced until
-`ACTIVE`. Every later repository starts as a new immutable UUID with generation
+AWS can synchronously establish the conditional S3 write result, the current
+completed-version inventory, and exact-version bytes. Current profile and IAM
+readbacks are configuration observations only. IAM changes are eventually
+consistent
+([IAM troubleshooting](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot.html)),
+and CloudTrail does not guarantee event ordering
+([CloudTrail events](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-events.html))
+or provide an admission-complete request watermark. CloudTrail and S3 access
+logs remain audit evidence and never satisfy the bootstrap authority proof.
+
+Repository creation stays fenced until `ACTIVE`. Every later repository starts
+as a new immutable UUID with generation
 1 from a valid signed create intent at the routing-digest-derived control key.
 No read, write, recovery, or discovery path can adopt V1 state. There is no
 legacy identity migration or path-reuse exception.
 
 A crash before `PREPARING` leaves only the `OPEN` control write and resolves
-only the control CAS. A crash after `PREPARING` is owned by the state-machine
-recovery: it resumes from rooted step proofs or restores and verifies every
-changed IAM, administrative, legacy, route, worker, and credential state before
-`ABORTED`.
+only the control CAS. A crash after `PREPARING` resumes from the exact control
+and plan. A terminal validation failure writes `ABORTED` when possible and
+quarantines the prefix. It does not restore, delete, or reuse anything under
+that prefix.
 
 ### Cutover transitions
 
@@ -1973,27 +1920,32 @@ machine is:
 
 ```text
 OPEN(g0) -> PREPARING(g1) -> PREPARED(g1) -> ACTIVE(g1)
-                         \-> ABORTED(g1) -> PREPARING(g2)
+OPEN | PREPARING | PREPARED -> ABORTED
 ```
 
-`ACTIVE` is terminal. Each generation validates linearly at repository commit
-and build enqueue. After the conditional `OPEN` Create, the CAS to `PREPARING`
+`ACTIVE` and `ABORTED` are terminal for `P`. Each generation validates linearly
+at repository commit and build enqueue. After the conditional `OPEN` Create, the CAS to `PREPARING`
 happens before any external cutover effect other than those two required control
-writes. Every ingress fence, Forgejo barrier, drain, worker stop, retry stop,
-credential revocation, scale, route change, and proof is idempotent. Its exact
-configuration or evidence digest is rooted while state remains `PREPARING`.
+writes. The inventory proof and all bootstrap control writes happen while the
+runtime profile remains disabled. Their exact configuration and evidence
+digests are rooted while state remains `PREPARING`.
 
-Before `PREPARED`, Cloud Core verifies the signed zero-data condition, makes
-the old path read-only, drains or terminates active mutations, stops workers
-and retries, revokes mutation credentials, and records all high-water marks.
-It scales Forgejo to zero before a second zero-session proof. Both providers
-remain fenced during the route switch.
+Before `PREPARED`, Cloud Core verifies the signed zero-data condition and the
+complete resolved creation plan. The old service remains unchanged and keeps
+the production route. No V2 runtime session, workload, consumer, or route is
+active.
 
-A crash in `PREPARING` or `PREPARED` deterministically resumes or reverts from
-the rooted proofs. Revert restores and verifies the complete legacy route,
-credentials, workers, and session state before CAS to `ABORTED`. A new attempt
-uses a new generation. `ACTIVE` is the last cutover action, binds preparation,
-route, workload, image, and generation digests, and has no return transition.
+A crash in `PREPARING` or `PREPARED` deterministically resumes from the rooted
+proofs. A nonrecoverable failure moves to terminal `ABORTED` and quarantines
+`P`; a new attempt uses a new prefix and generation. `ACTIVE` is the storage-
+authority commit, not the last external action. Only after its CAS lands may
+Cloud Core call `EnableProfile`, obtain a Roles Anywhere session, exact-read the
+rooted controls, start the candidate workload and consumers, pass readiness,
+and switch the route. A disabled profile cannot create a new session; activation
+uses the AWS `EnableProfile` operation
+([Roles Anywhere EnableProfile](https://docs.aws.amazon.com/rolesanywhere/latest/APIReference/API_EnableProfile.html)).
+Failure after `ACTIVE` delays availability and resumes those idempotent
+post-activation effects. It cannot reopen bootstrap or reuse the prefix.
 
 Forgejo databases, persistent volumes, and buckets remain intact after
 `ACTIVE`. Their deletion requires separate explicit approval.
@@ -2005,51 +1957,43 @@ security, and cutover result binds its exact image digest. Promotion attests
 that same digest without a rebuild or mutable tag. Cloud Core verifies the
 signature, attestations, test identity, and digest before accepting the image.
 
-Critical PR work still targets a 15-minute P95. In addition, every required PR,
-provider, evidence, recovery, cutover, and promotion job declares
-`timeout-minutes` of at most 15. Each provider job gives test work at most 12
-minutes and reserves at least the final 3 minutes for unconditional,
-fail-closed cleanup and evidence upload. Provider evidence runs
-production-locally as parallel bounded jobs. The admission-horizon job spends
-at most 5 of its 12 test minutes waiting for `H` and reserves at least 7 test
-minutes for policy convergence and two complete scans. The complete provider
-workflow has a 30-minute cap. A 60-minute fallback is not allowed. Linting rejects a
-missing or larger required-job timeout, a provider test budget above 12
-minutes, a cleanup reserve below 3 minutes, or a workflow cap above 30 minutes.
-Timing evidence enforces the same bounds.
+Every required PR, provider, evidence, recovery, cutover, and promotion gate
+declares `timeout-minutes` of at most 15. The AWS bootstrap gate gives test work
+at most 12 minutes and reserves at least the final 3 minutes for fail-closed
+evidence upload and cleanup of its disposable test prefix. A production prefix
+is never cleaned. Versioning's initial 15-minute stabilization is a completed
+provisioning prerequisite, not a CI sleep. The required gate has a 15-minute
+wall-clock cap. A 30-minute or 60-minute fallback is not allowed. Linting
+rejects a missing or larger timeout, a test budget above 12 minutes, or an
+evidence reserve below 3 minutes.
 
 The PR2 exact-production-provider primitive gate runs only against the selected
-S3-compatible provider and proves:
+AWS S3 provider and proves the bounded bootstrap primitives that this contract
+uses:
 
-- objects larger than 5 GiB and the calculated 10,000-part boundary;
-- concurrent conditional Create and Update and conditional multipart
-  completion;
-- refreshable credential rotation;
-- failed and abandoned multipart cleanup;
+- concurrent conditional single-part Create and Update, including exact AWS
+  conditional-conflict handling;
 - Range, HEAD, ETag, and explicit conditional-failure behavior;
 - versioning enabled and stable `ObjectVersionID` results;
-- paginated version enumeration;
-- exact-version HEAD, GET, and delete;
-- delete-marker behavior and cleanup isolation;
-- paginated post-`PREPARING` proof with exactly one shared
-  `ListObjectVersions` traversal for current objects, noncurrent versions, and
-  delete markers and one `ListMultipartUploads` traversal for active uploads
-  per scan, with canonical cursor continuity, zero repository data, and only
-  the exact allowlisted control-plane graph;
-- `OPEN -> PREPARING` before the exclusive IAM or administrative fence and
-  before every other external cutover effect;
-- exclusive-IAM denial of a concurrent legacy or runtime writer during the
-  post-`PREPARING` four-set proof;
-- provider-policy convergence, a bounded admission horizon, request-audit high
-  watermarks, and two matching complete scans before the proof CAS, with
-  `H <= 300` seconds inside the 12-minute test budget;
-- exclusive administrative control, exact safety-configuration digest checks,
-  drift failure, and the global writer fence around every infrastructure
-  change.
+- one-page nontruncated empty and allowlisted `ListObjectVersions`
+  inventories, exact-version HEAD/GET, delete-marker rejection, and failure
+  when the graph exceeds one page;
+- conditional `OPEN -> PREPARING`, all planned conditional single-part control
+  writes, and a final proof CAS while the runtime profile remains disabled; and
+- `ACTIVE` before `EnableProfile`, runtime credential issue, workload start,
+  readiness, consumer start, or route switch.
+
+PR3 separately proves multipart data paths above 5 GiB, the calculated
+10,000-part boundary, conditional multipart completion, abandoned-upload
+cleanup, long-running credential refresh, and production-scale recovery. Those
+paths are required for serving large repositories but are not part of the
+single-part bootstrap authority proof. PR3 keeps the same 15-minute required-
+job cap; it must use bounded parallel or accelerated evidence rather than an
+hour-long CI soak.
 
 The later production gate proves full-scale object counts, throughput,
 retention, event replay and fanout, build pins, restore, cutover, and recovery
-on the exact selected S3-compatible provider and exact production candidate
+on the exact selected AWS S3 provider and exact production candidate
 digest.
 
 ## Future vertical acceptance
@@ -2177,42 +2121,35 @@ These scenarios are required by later gates. PR1 does not implement them.
   missing control only under the signed global fence, and release create,
   mutation, and reclamation only after the terminal exact CAS. They reject
   faults outside the stated one-bucket loss model.
-- Cutover tests include open Forgejo sessions, worker and retry activity,
-  crashes at every state and external step, verified abort restoration, stale
-  generation requests, and terminal `ACTIVE` behavior.
-- Bootstrap tests prove conditional `OPEN`, then `PREPARING`, then the exclusive
-  IAM and administrative fence, credential revocation, policy convergence, the
-  bounded admission wait, and two matching complete S3 scans. They cover every
-  state, scan, proof-rooting, and external crash point; exercise the 262-row
-  creation-plan bound, 32-Create concurrency bound, three healthy plan CASes,
-  and a crash after every Create but before its batched resolving CAS; verify
-  the complete allowlisted graph and exact version history; reject an
-  unplanned, mismatched, unexpected, or V1 object and concurrent writer without
-  cleanup; and prove no post-`ACTIVE` path adopts V1 state. Shared cross-language
-  vectors cover all four entry classifications, exact LP/u8/u64 encodings,
-  content corruption, lexicographic order, and duplicate rejection. Cursor
-  vectors split pages between many versions and delete markers for the same key
-  and cover present-empty versus absent components, missing required next
-  markers, response-next/request mismatch, repetition, terminal markers, and
-  the two shared traversal page-count and chain digests. They cover every set
-  and scan digest, the exact 4,404-byte scan and 23,650-byte proof maxima,
+- Cutover tests crash at every control and post-activation step, reject stale
+  generation requests, quarantine every failed prefix, and prove terminal
+  `ACTIVE` and `ABORTED` behavior. They prove that no runtime session, workload,
+  consumer, or route exists before `ACTIVE`.
+- Bootstrap tests prove the never-used prefix and never-enabled profile
+  preconditions; one nontruncated empty initial inventory; conditional
+  single-part `OPEN`, `PREPARING`, plan, and proof writes; and one nontruncated
+  final inventory containing only the exact allowlisted graph. They exercise
+  the 262-row creation-plan bound, 32-Create concurrency bound, three healthy
+  plan CASes, and a crash after every Create but before its batched resolving
+  CAS. They reject a truncated inventory, delete marker, repository object,
+  unplanned or mismatched control version, V1 object, multipart anomaly, or
+  cleanup/reuse of a failed production prefix. Shared cross-language vectors
+  cover the exact LP/u8/u64 inventory encoding, content corruption,
+  lexicographic order, duplicate rejection, the exact 88-byte record,
   deterministic proof payload bytes, the dedicated bootstrap `kid` and COSE
-  signature, and replay rejection across session, generation, prior control
-  version, prior `CasToken`, or transition. A vector also proves that the proof
-  excludes its candidate control and envelope digests and therefore has no
-  self-digest cycle.
+  signature, and replay rejection across session, generation, prefix, prior
+  control version, prior `CasToken`, or transition. A vector also proves that
+  the proof excludes its candidate control and envelope digests and therefore
+  has no self-digest cycle.
 - GCS tests remain development and non-production only. They prove Object
   Versioning and zero soft-delete retention where exact deletion is tested and
-  prove that production eligibility fails because the four-set resumable-upload
-  and delete-marker proof is unavailable.
+  prove that they cannot satisfy the AWS-native Roles Anywhere activation gate.
 - Secret and revocation tests cover Git, LFS, API, settings, policy, webhook,
   build, and capability surfaces.
 - Exact-provider tests bind the selected endpoint and candidate digest and
   exercise every PR2 primitive plus the later scale and recovery gates.
 - Promotion tests prove that production consumes the exact candidate digest
   that passed all evidence, with no rebuild or mutable-tag substitution. CI
-  lint tests reject every required job above 15 minutes, every provider test
-  budget above 12 minutes, every cleanup reserve below 3 minutes, and every
-  provider workflow above 30 minutes. The horizon job also proves that at most
-  5 test minutes cover `H` and at least 7 test minutes remain for convergence
-  and two scans.
+  lint tests reject every required gate above 15 minutes, every provider test
+  budget above 12 minutes, and every evidence reserve below 3 minutes. No
+  30-minute or 60-minute fallback exists.

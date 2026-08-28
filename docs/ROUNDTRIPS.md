@@ -58,7 +58,8 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | S3 compose | source HEADs for layout → upload/copy parts → 1 conditional complete; after a conditional-complete 412 or exact conditional 409 only, abort then 1 destination HEAD | sources + about one copy call per contiguous GiB (up to the calculated 5 GiB cap); fragmented sources coalesce to the bounded multipart target; +2 create/complete calls and **one fewer destination HEAD for Create** on the happy path | `s3.rs::compose` |
 | S3 conditional delete | 1 conditional DELETE; after a 412 only, 1 HEAD distinguishes absent from moved | 1 happy path; **one fewer HEAD** | `s3.rs::delete` |
 | S3 exact-version HEAD | 1 HEAD; an exact delete-marker 405 with complete AWS headers returns directly, while an ambiguous RustFS 405 pages version history until the named key/version is proved | 1 normal path; listing is bounded to 1,000 pages on the delete-marker failure path only | `s3.rs::head_version` |
-| Dormant S3 proof-inventory page | exactly 1 `ListObjectVersions` or `ListMultipartUploads` request for one caller-owned page; strict decoding is local and does no per-entry request | 1 request/page, at most 1,000 entries; no internal pagination, retry, HEAD, cleanup, or hot-path use | `s3.rs::{list_s3_version_evidence_page,list_s3_multipart_evidence_page}` |
+| Dormant S3 completed-version inventory page | exactly 1 `ListObjectVersions` request for one caller-owned page; strict decoding is local and does no per-entry request | 1 request, at most 1,000 entries; no internal pagination, retry, HEAD, cleanup, or hot-path use | `s3.rs::list_s3_version_evidence_page` |
+| Dormant S3 multipart anomaly page | exactly 1 `ListMultipartUploads` request for one caller-owned page; strict decoding is local | 1 request, at most 1,000 entries; non-authoritative and no internal pagination, retry, cleanup, or hot-path use | `s3.rs::list_s3_multipart_evidence_page` |
 
 S3 lane selection and bulk admission are local. Independent control/bulk
 transports add no provider request or sequential round trip to these budgets.
@@ -77,10 +78,15 @@ old destination HEAD from compose Create and conditional delete. Source HEADs
 remain necessary for compose layout; every copied or ranged source is pinned
 to the version that HEAD returned. No CAS object's write rate changed.
 
-The dormant S3 proof-inventory page boundary adds no user-visible or write-path
-request. A future proof scanner owns page traversal and continuity checks; this
-slice performs one bounded provider request per explicit page call and never
-adds a request per returned version, delete marker, or multipart upload.
+The dormant S3 inventory boundaries add no user-visible or write-path request.
+The future greenfield bootstrap makes two explicit, single-page
+`ListObjectVersions` calls: one before the first write and one after the planned
+control graph is complete. Either truncated result fails; bootstrap does not
+paginate. Exact-version verification adds one GET per returned version off the
+serving path. A separate one-page `ListMultipartUploads` call is only anomaly
+evidence: nonempty or truncated fails, but empty is not authoritative proof.
+This slice performs only the one provider request requested by each dormant
+page call and does not activate that bootstrap protocol.
 
 AWS can report an exact `ConditionalRequestConflict` (409) when concurrent
 conditional destination writes race. Walgit resolves that response with one

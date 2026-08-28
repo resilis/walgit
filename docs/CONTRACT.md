@@ -151,12 +151,28 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
   `list_versions` pagination over objects and provider delete markers. `ComposeSource` pins each input by key,
   size, CAS token, and object-version ID. `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, and
   `util::{collect,once,file_stream,backoff,retry}` preserve the shared implementation surface.
-  The dormant S3 provider-proof boundary adds distinct opaque version and multipart cursors plus strict
-  single-page evidence DTOs. Each method issues exactly one ungrouped S3 request for at most 1,000 entries,
-  preserves exact marker presence and bytes, and fails closed on an incomplete or inconsistent response.
-  `Prefixed` adds the configured physical prefix once and removes it exactly once from evidence item keys; it
-  never rewrites opaque cursors. Other backends return `UnsupportedCapability`. This boundary does not activate
-  a scanner, controller, cleanup workflow, runtime route, or provider-pass claim.
+  The dormant S3 inventory boundary exposes separate strict single-page
+  `ListObjectVersions` and `ListMultipartUploads` DTOs with opaque provider
+  cursors. Each method issues exactly one ungrouped S3 request for at most 1,000
+  entries, preserves exact marker presence and bytes, and fails closed on an
+  incomplete or inconsistent response. `Prefixed` adds the configured physical
+  prefix once and removes it exactly once from evidence item keys; it never
+  rewrites opaque cursors. Other backends return `UnsupportedCapability`.
+
+  The future AWS-native bootstrap caller accepts only one nontruncated versions
+  page before the first write and one after its planned control graph is
+  complete; it does not follow either cursor. It exact-loads every final object
+  version and rejects delete markers, repository data, unexpected control
+  history, or a graph larger than one page. The multipart page is
+  non-authoritative anomaly evidence: nonempty or truncated fails, but empty
+  cannot prove multipart absence. Safety instead requires a never-reused prefix,
+  no obtainable runtime credential, a bootstrap role without multipart/delete
+  permission, and conditional single-part bootstrap writes. `ACTIVE` must land
+  before a future controller enables the never-enabled Roles Anywhere profile
+  or starts any runtime consumer. A failed production prefix is quarantined and
+  never cleaned or reused. None of that caller, state machine, provisioning,
+  profile activation, cleanup policy, runtime route, or provider-pass claim is
+  implemented by these dormant page methods.
 - `walgit-store::v2_control`: dormant strict persistence for the V2 repository
   authority. `ControlStore` receives a store that is already scoped to the
   configured `DeploymentPrefix`. It validates the full persisted
