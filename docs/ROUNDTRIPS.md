@@ -51,9 +51,9 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Maintainer bundle pass, refs level (retention + settle closed slots) | 1 list GET → at most 1 CAS (retention) → at most **1 CAS for every verdict of the pass** (`record_skipped_many`; was one CAS per settled slot until 2026-08-22: a rig repo with 9,654 closed slots paid 9,654 CAS per pass and, past the 4,096-verdict cap, forever) | ≤ 3 | `walgit-bundle/src/lib.rs::settle_closed_slots`, `ops.rs::record_skipped_many` |
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
-| S3 small conditional PUT | 1 conditional PUT; after a 412 only, 1 HEAD to report the current ETag | 1 happy path | `s3.rs::put` |
-| S3 multipart PUT | 1 create → upload parts → 1 conditional complete | N + 2; no destination probe | `s3.rs::multipart_put` |
-| S3 compose | source HEADs for layout → upload/copy parts → 1 conditional complete | sources + about one copy call per contiguous GiB (up to the calculated 5 GiB cap); fragmented sources coalesce to the bounded multipart target; +2 create/complete calls and **one fewer destination HEAD for Create** | `s3.rs::compose` |
+| S3 small conditional PUT | 1 conditional PUT; after a 412 or exact conditional 409 only, 1 HEAD to report or reconcile the current ETag | 1 happy path | `s3.rs::put` |
+| S3 multipart PUT | 1 create → upload parts → 1 conditional complete; after a conditional-complete 412 or exact conditional 409 only, abort then 1 destination HEAD | N + 2 happy path; no destination probe | `s3.rs::multipart_put` |
+| S3 compose | source HEADs for layout → upload/copy parts → 1 conditional complete; after a conditional-complete 412 or exact conditional 409 only, abort then 1 destination HEAD | sources + about one copy call per contiguous GiB (up to the calculated 5 GiB cap); fragmented sources coalesce to the bounded multipart target; +2 create/complete calls and **one fewer destination HEAD for Create** on the happy path | `s3.rs::compose` |
 | S3 conditional delete | 1 conditional DELETE; after a 412 only, 1 HEAD distinguishes absent from moved | 1 happy path; **one fewer HEAD** | `s3.rs::delete` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
@@ -68,6 +68,14 @@ old destination HEAD from compose Create and conditional delete. Source HEADs
 remain necessary for compose layout; every copied or ranged source is pinned
 to the version that HEAD returned. No CAS object's write rate changed.
 
+AWS can report an exact `ConditionalRequestConflict` (409) when concurrent
+conditional destination writes race. Walgit resolves that response with one
+failure-path HEAD: a changed or absent Update target, or an existing Create
+target, is a precondition failure; an unchanged Update target or absent Create
+target remains retryable because the failed request did not establish the
+winner. Other 409 responses are not reclassified. The successful path remains
+one conditional write and no CAS object's write rate changes.
+
 Keep this table current; when you change a protocol, update the row and put the before/after depth in the
 commit message. The sim harness can enforce it: `FaultStore::stats().ops` counts exact store requests per
 link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a regression test.
@@ -76,10 +84,12 @@ link, so a scenario can assert "a push on a healthy link is ≤ N requests" as a
 - **Depth before count.** Two PUTs in parallel cost one round trip; the same two in sequence cost two.
   `tokio::join!` independent writes; never `await` uploads one after the other.
 - **Let the conditional write be the read.** `PutMode::Create` → 412 *is* "it exists"; `Update(v)` → 412 *is*
-  "someone moved it" and GCS tells you the current generation. Don't GET to decide what a conditional write will
-  tell you for free.
-- **Verification goes on the failure path.** e.g. `put_immutable_create` HEADs only after a 412; `cas_landed`
-  re-reads the manifest only after a non-412 error. The happy path must not pay for rare cases.
+  "someone moved it" and GCS tells you the current generation. AWS's exact conditional 409 is ambiguous, so one
+  failure-path HEAD reconciles it. Don't GET to decide what a conditional write will tell you for free.
+- **Verification goes on the failure path.** e.g. `put_immutable_create` adds its verification HEAD only after a
+  precondition failure, from a 412 or from the S3 adapter's exact conditional-409 reconciliation (which uses its
+  own HEAD); `cas_landed` re-reads the manifest only after a non-412 error. The happy path must not pay for rare
+  cases.
 - **Carry state in the object you already fetch.** The manifest is the one GET every request makes: anything a
   reader needs at refs level (pack set + side-file inventory, checkpoint pointer, log segments, revision, writer)
   belongs in it, so no second request is needed to know *what* to fetch.

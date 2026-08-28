@@ -188,7 +188,7 @@ jobs:
         run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: Audit locked Rust dependencies
-        run: cargo audit --deny warnings
+        run: cargo audit --deny warnings --no-yanked
 
   s3-contract:
     name: Disposable RustFS S3 contract

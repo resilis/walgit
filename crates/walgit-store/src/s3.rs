@@ -16,8 +16,9 @@
 //!
 //! `PutMode::Create`    → `If-None-Match: *`  (object must not exist).
 //! `PutMode::Update(v)` → `If-Match: <etag>`  (CAS on current ETag).
-//! On failure the SDK returns a `PreconditionFailed` service error; we fill
-//! `current` via a follow-up HEAD when the SDK doesn't include it.
+//! On 412, or on AWS's exact `ConditionalRequestConflict` response, a
+//! failure-path HEAD resolves the current object version. No destination
+//! probe is added to the successful path.
 //!
 //! ## Conditional DELETE
 //!
@@ -560,42 +561,99 @@ fn retryable_status(status: u16) -> bool {
     status == 429 || status >= 500
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum S3ErrorClass {
+    PreconditionFailed,
+    NotFound,
+    Retryable,
+    Other,
+}
+
+fn classify_error_metadata(
+    code: Option<&str>,
+    status: Option<u16>,
+    retryable_transport: bool,
+) -> S3ErrorClass {
+    let code = code.unwrap_or("");
+    if code == "PreconditionFailed" || status == Some(412) {
+        return S3ErrorClass::PreconditionFailed;
+    }
+    if matches!(code, "NoSuchKey" | "NotFound") || status == Some(404) {
+        return S3ErrorClass::NotFound;
+    }
+    if retryable_transport || status.is_some_and(retryable_status) || retryable_service_code(code) {
+        S3ErrorClass::Retryable
+    } else {
+        S3ErrorClass::Other
+    }
+}
+
+fn should_reconcile_conditional_conflict(code: Option<&str>, mode: &PutMode) -> bool {
+    code == Some("ConditionalRequestConflict")
+        && matches!(mode, PutMode::Create | PutMode::Update(_))
+}
+
+fn conditional_conflict_retryable(key: &str, reason: &str) -> StoreError {
+    StoreError::retryable(anyhow::anyhow!(
+        "s3 conditional write conflict for {key}: {reason}"
+    ))
+}
+
+fn reconcile_conditional_conflict(
+    key: &str,
+    mode: &PutMode,
+    current: Option<Version>,
+) -> StoreError {
+    match mode {
+        PutMode::Create if current.is_some() => StoreError::PreconditionFailed {
+            key: key.into(),
+            current,
+        },
+        PutMode::Create => conditional_conflict_retryable(
+            key,
+            "the destination was absent in the reconciliation snapshot",
+        ),
+        PutMode::Update(expected) if current.as_ref() != Some(expected) => {
+            StoreError::PreconditionFailed {
+                key: key.into(),
+                current,
+            }
+        }
+        PutMode::Update(_) => conditional_conflict_retryable(
+            key,
+            "the expected destination version remained current in the reconciliation snapshot",
+        ),
+        PutMode::Overwrite => {
+            conditional_conflict_retryable(key, "the destination write was unconditional")
+        }
+    }
+}
+
 fn classify_sdk_error<E>(op: &str, key: &str, err: aws_sdk_s3::error::SdkError<E>) -> StoreError
 where
     E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     use aws_sdk_s3::error::SdkError;
 
-    let code = err_code(&err).unwrap_or("");
+    let code = err_code(&err);
     let status = err
         .raw_response()
         .map(|response| response.status().as_u16());
-    if code == "PreconditionFailed" || status == Some(412) {
-        return StoreError::PreconditionFailed {
-            key: key.into(),
-            current: None,
-        };
-    }
-    if matches!(code, "NoSuchKey" | "NotFound") || status == Some(404) {
-        return StoreError::NotFound { key: key.into() };
-    }
-    let retryable_status = status.is_some_and(retryable_status);
     let retryable_transport = matches!(
         err,
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
     );
-    if retryable_transport || retryable_status || retryable_service_code(code) {
-        StoreError::retryable(anyhow::anyhow!("s3 {op} error for {key}: {err}"))
-    } else {
-        StoreError::other(anyhow::anyhow!("s3 {op} error for {key}: {err}"))
+    match classify_error_metadata(code, status, retryable_transport) {
+        S3ErrorClass::PreconditionFailed => StoreError::PreconditionFailed {
+            key: key.into(),
+            current: None,
+        },
+        S3ErrorClass::NotFound => StoreError::NotFound { key: key.into() },
+        S3ErrorClass::Retryable => {
+            StoreError::retryable(anyhow::anyhow!("s3 {op} error for {key}: {err}"))
+        }
+        S3ErrorClass::Other => StoreError::other(anyhow::anyhow!("s3 {op} error for {key}: {err}")),
     }
-}
-
-fn classify_put_error(
-    key: &str,
-    err: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
-) -> StoreError {
-    classify_sdk_error("put", key, err)
 }
 
 fn classify_list_error(
@@ -695,16 +753,9 @@ impl ObjectStore for S3Store {
                     version: Version::new(etag.as_deref().unwrap_or("")),
                 })
             }
-            Err(e) => {
-                let mut err = classify_put_error(key, e);
-                // Fill `current` via HEAD if we got a PreconditionFailed.
-                if let StoreError::PreconditionFailed { current: c, .. } = &mut err
-                    && c.is_none()
-                {
-                    *c = self.head(key).await.ok().flatten().map(|m| m.version);
-                }
-                Err(err)
-            }
+            Err(e) => Err(self
+                .resolve_conditional_write_failure("put", key, &opts.mode, e)
+                .await),
         }
     }
 
@@ -1045,18 +1096,9 @@ impl ObjectStore for S3Store {
             Ok(r) => r,
             Err(e) => {
                 self.abort_multipart_after_failure(dest, &upload_id).await;
-                let mut error = classify_sdk_error("complete multipart", dest, e);
-                if let StoreError::PreconditionFailed { current, .. } = &mut error
-                    && current.is_none()
-                {
-                    *current = self
-                        .head(dest)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|meta| meta.version);
-                }
-                return Err(error);
+                return Err(self
+                    .resolve_conditional_write_failure("complete multipart", dest, &opts.mode, e)
+                    .await);
             }
         };
         let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
@@ -1101,6 +1143,41 @@ struct ListState {
 // ---- multipart upload --------------------------------------------------
 
 impl S3Store {
+    async fn resolve_conditional_write_failure<E>(
+        &self,
+        op: &str,
+        key: &str,
+        mode: &PutMode,
+        error: aws_sdk_s3::error::SdkError<E>,
+    ) -> StoreError
+    where
+        E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+    {
+        let reconcile_conflict = should_reconcile_conditional_conflict(err_code(&error), mode);
+        let mut mapped = classify_sdk_error(op, key, error);
+
+        if reconcile_conflict {
+            return match self.head(key).await {
+                Ok(current) => {
+                    reconcile_conditional_conflict(key, mode, current.map(|meta| meta.version))
+                }
+                Err(_) => conditional_conflict_retryable(
+                    key,
+                    "the reconciliation HEAD failed; the write outcome is unknown",
+                ),
+            };
+        }
+
+        // S3's 412 response does not include the current ETag. Preserve the
+        // existing one-HEAD failure path so callers receive it when available.
+        if let StoreError::PreconditionFailed { current, .. } = &mut mapped
+            && current.is_none()
+        {
+            *current = self.head(key).await.ok().flatten().map(|meta| meta.version);
+        }
+        mapped
+    }
+
     async fn multipart_put(
         &self,
         key: &str,
@@ -1203,13 +1280,9 @@ impl S3Store {
             Ok(r) => r,
             Err(e) => {
                 self.abort_multipart_after_failure(key, &upload_id).await;
-                let mut error = classify_sdk_error("complete multipart", key, e);
-                if let StoreError::PreconditionFailed { current, .. } = &mut error
-                    && current.is_none()
-                {
-                    *current = self.head(key).await.ok().flatten().map(|meta| meta.version);
-                }
-                return Err(error);
+                return Err(self
+                    .resolve_conditional_write_failure("complete multipart", key, &opts.mode, e)
+                    .await);
             }
         };
 
@@ -1271,7 +1344,89 @@ impl S3Store {
 mod tests {
     use std::collections::HashMap;
 
+    use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+    use aws_smithy_types::{body::SdkBody, retry::RetryConfig};
+
     use super::*;
+
+    const TEST_BUCKET: &str = "test-bucket";
+    const CONDITIONAL_CONFLICT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>ConditionalRequestConflict</Code><Message>conflict</Message><RequestId>test</RequestId><HostId>test</HostId></Error>"#;
+
+    fn replay_event(
+        status: u16,
+        body: &'static str,
+        headers: &[(&'static str, &'static str)],
+    ) -> ReplayEvent {
+        let request = http::Request::builder()
+            .uri("https://unused.invalid/")
+            .body(SdkBody::empty())
+            .expect("replay request");
+        let mut response = http::Response::builder().status(status);
+        for (name, value) in headers {
+            response = response.header(*name, *value);
+        }
+        ReplayEvent::new(
+            request,
+            response.body(SdkBody::from(body)).expect("replay response"),
+        )
+    }
+
+    fn replay_store(events: Vec<ReplayEvent>) -> (S3Store, StaticReplayClient) {
+        let replay = StaticReplayClient::new(events);
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .retry_config(RetryConfig::disabled())
+            .endpoint_url("https://s3.test")
+            .force_path_style(true)
+            .http_client(replay.clone())
+            .build();
+        (
+            S3Store {
+                client: S3Client::from_conf(config),
+                bucket: TEST_BUCKET.into(),
+                http: reqwest::Client::new(),
+                multipart_threshold: 1024 * 1024,
+                multipart_part_size: S3_MIN_PART_SIZE,
+            },
+            replay,
+        )
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ActualRequest {
+        method: String,
+        path: String,
+        query: Option<String>,
+        if_match: Option<String>,
+        if_none_match: Option<String>,
+        copy_source_if_match: Option<String>,
+    }
+
+    fn actual_requests(replay: &StaticReplayClient) -> Vec<ActualRequest> {
+        replay
+            .actual_requests()
+            .map(|request| {
+                let uri: http::Uri = request.uri().parse().expect("actual request URI");
+                ActualRequest {
+                    method: request.method().to_string(),
+                    path: uri.path().to_owned(),
+                    query: uri.query().map(ToOwned::to_owned),
+                    if_match: request.headers().get("if-match").map(ToOwned::to_owned),
+                    if_none_match: request
+                        .headers()
+                        .get("if-none-match")
+                        .map(ToOwned::to_owned),
+                    copy_source_if_match: request
+                        .headers()
+                        .get("x-amz-copy-source-if-match")
+                        .map(ToOwned::to_owned),
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn explicit_credentials_fall_back_only_when_both_are_absent() {
@@ -1578,6 +1733,241 @@ mod tests {
         assert!(update.get_if_none_match().is_none());
     }
 
+    #[tokio::test]
+    async fn sdk_conditional_put_conflicts_reconcile_from_head() {
+        let (store, replay) = replay_store(vec![
+            replay_event(
+                409,
+                CONDITIONAL_CONFLICT_XML,
+                &[("content-type", "application/xml")],
+            ),
+            replay_event(404, "", &[]),
+            replay_event(
+                409,
+                CONDITIONAL_CONFLICT_XML,
+                &[("content-type", "application/xml")],
+            ),
+            replay_event(200, "", &[("etag", "\"moved\""), ("content-length", "0")]),
+        ]);
+
+        let create = store
+            .put(
+                "create",
+                PutBody::Bytes(Bytes::from_static(b"create")),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect_err("absent Create reconciliation remains retryable");
+        assert!(create.is_retryable(), "{create:?}");
+
+        let update = store
+            .put(
+                "update",
+                PutBody::Bytes(Bytes::from_static(b"update")),
+                PutOptions::from(PutMode::Update(Version::new("expected"))),
+            )
+            .await
+            .expect_err("moved Update reconciliation is a precondition failure");
+        match update {
+            StoreError::PreconditionFailed { key, current } => {
+                assert_eq!(key, "update");
+                assert_eq!(current, Some(Version::new("moved")));
+            }
+            other => panic!("expected PreconditionFailed, got {other:?}"),
+        }
+
+        let requests = actual_requests(&replay);
+        assert_eq!(requests.len(), 4, "no happy-path or reconciliation extras");
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(requests[0].path, format!("/{TEST_BUCKET}/create"));
+        assert_eq!(requests[0].if_none_match.as_deref(), Some("*"));
+        assert_eq!(requests[1].method, "HEAD");
+        assert_eq!(requests[1].path, format!("/{TEST_BUCKET}/create"));
+        assert_eq!(requests[2].method, "PUT");
+        assert_eq!(requests[2].path, format!("/{TEST_BUCKET}/update"));
+        assert_eq!(requests[2].if_match.as_deref(), Some("expected"));
+        assert_eq!(requests[3].method, "HEAD");
+        assert_eq!(requests[3].path, format!("/{TEST_BUCKET}/update"));
+    }
+
+    #[tokio::test]
+    async fn sdk_operation_aborted_409_is_not_reconciled() {
+        let operation_aborted = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>OperationAborted</Code><Message>conflict</Message><RequestId>test</RequestId><HostId>test</HostId></Error>"#;
+        let (store, replay) = replay_store(vec![replay_event(
+            409,
+            operation_aborted,
+            &[("content-type", "application/xml")],
+        )]);
+
+        let error = store
+            .put(
+                "negative",
+                PutBody::Bytes(Bytes::from_static(b"negative")),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect_err("OperationAborted must fail");
+        assert!(matches!(error, StoreError::Other(_)), "{error:?}");
+
+        let requests = actual_requests(&replay);
+        assert_eq!(requests.len(), 1, "OperationAborted must not trigger HEAD");
+        assert_eq!(requests[0].method, "PUT");
+        assert_eq!(requests[0].if_none_match.as_deref(), Some("*"));
+    }
+
+    #[tokio::test]
+    async fn sdk_multipart_conflict_aborts_before_head_reconciliation() {
+        let initiated = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test-bucket</Bucket><Key>multi</Key><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>"#;
+        let (store, replay) = replay_store(vec![
+            replay_event(200, initiated, &[("content-type", "application/xml")]),
+            replay_event(200, "", &[("etag", "\"part\"")]),
+            replay_event(
+                409,
+                CONDITIONAL_CONFLICT_XML,
+                &[("content-type", "application/xml")],
+            ),
+            replay_event(204, "", &[]),
+            replay_event(200, "", &[("etag", "\"moved\""), ("content-length", "0")]),
+        ]);
+
+        let error = store
+            .put(
+                "multi",
+                PutBody::Bytes(Bytes::from(vec![b'x'; S3_MIN_PART_SIZE as usize])),
+                PutOptions::from(PutMode::Create),
+            )
+            .await
+            .expect_err("multipart conflict must fail");
+        match error {
+            StoreError::PreconditionFailed { key, current } => {
+                assert_eq!(key, "multi");
+                assert_eq!(current, Some(Version::new("moved")));
+            }
+            other => panic!("expected PreconditionFailed, got {other:?}"),
+        }
+
+        let requests = actual_requests(&replay);
+        assert_eq!(requests.len(), 5, "multipart failure path request count");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["POST", "PUT", "POST", "DELETE", "HEAD"]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path == format!("/{TEST_BUCKET}/multi"))
+        );
+        assert!(
+            requests[0]
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("uploads"))
+        );
+        assert!(
+            requests[1]
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("partNumber=1"))
+        );
+        assert_eq!(requests[2].if_none_match.as_deref(), Some("*"));
+        assert!(
+            requests[2]
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("uploadId=upload-id"))
+        );
+        assert!(
+            requests[3]
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("uploadId=upload-id"))
+        );
+        assert_eq!(
+            requests[4].query, None,
+            "HEAD follows abort without multipart query"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_compose_conflict_aborts_before_head_reconciliation() {
+        let initiated = r#"<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test-bucket</Bucket><Key>compose-dest</Key><UploadId>compose-upload</UploadId></InitiateMultipartUploadResult>"#;
+        let copied = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LastModified>2026-08-28T00:00:00.000Z</LastModified><ETag>"copy"</ETag></CopyPartResult>"#;
+        let (store, replay) = replay_store(vec![
+            replay_event(
+                200,
+                "",
+                &[("etag", "\"source\""), ("content-length", "6291456")],
+            ),
+            replay_event(200, initiated, &[("content-type", "application/xml")]),
+            replay_event(200, copied, &[("content-type", "application/xml")]),
+            replay_event(
+                409,
+                CONDITIONAL_CONFLICT_XML,
+                &[("content-type", "application/xml")],
+            ),
+            replay_event(204, "", &[]),
+            replay_event(
+                200,
+                "",
+                &[("etag", "\"dest-moved\""), ("content-length", "0")],
+            ),
+        ]);
+
+        let error = store
+            .compose(
+                "compose-dest",
+                &["source".into()],
+                PutOptions::from(PutMode::Update(Version::new("expected"))),
+            )
+            .await
+            .expect_err("compose conflict must fail");
+        match error {
+            StoreError::PreconditionFailed { key, current } => {
+                assert_eq!(key, "compose-dest");
+                assert_eq!(current, Some(Version::new("dest-moved")));
+            }
+            other => panic!("expected PreconditionFailed, got {other:?}"),
+        }
+
+        let requests = actual_requests(&replay);
+        assert_eq!(requests.len(), 6, "compose failure path request count");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD", "POST", "PUT", "POST", "DELETE", "HEAD"]
+        );
+        assert_eq!(requests[0].path, format!("/{TEST_BUCKET}/source"));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.path == format!("/{TEST_BUCKET}/compose-dest"))
+        );
+        assert_eq!(requests[2].copy_source_if_match.as_deref(), Some("source"));
+        assert_eq!(requests[3].if_match.as_deref(), Some("expected"));
+        assert!(
+            requests[3]
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("uploadId=compose-upload"))
+        );
+        assert!(
+            requests[4]
+                .query
+                .as_deref()
+                .is_some_and(|query| query.contains("uploadId=compose-upload"))
+        );
+        assert_eq!(requests[5].query, None, "destination HEAD follows abort");
+    }
+
     #[test]
     fn multipart_layout_stays_within_s3_limits() {
         assert_eq!(
@@ -1680,5 +2070,111 @@ mod tests {
         }
         assert!(!retryable_status(409));
         assert!(!retryable_status(412));
+    }
+
+    #[test]
+    fn conditional_request_conflict_recognition_is_exact_and_conditional() {
+        for mode in [PutMode::Create, PutMode::Update(Version::new("expected"))] {
+            assert!(should_reconcile_conditional_conflict(
+                Some("ConditionalRequestConflict"),
+                &mode
+            ));
+            for code in [
+                None,
+                Some("OperationAborted"),
+                Some("PreconditionFailed"),
+                Some("conditionalrequestconflict"),
+                Some("Unknown409"),
+            ] {
+                assert!(!should_reconcile_conditional_conflict(code, &mode));
+            }
+        }
+        assert!(!should_reconcile_conditional_conflict(
+            Some("ConditionalRequestConflict"),
+            &PutMode::Overwrite
+        ));
+    }
+
+    #[test]
+    fn sdk_error_metadata_classification_preserves_existing_boundaries() {
+        assert_eq!(
+            classify_error_metadata(Some("ConditionalRequestConflict"), Some(409), false),
+            S3ErrorClass::Retryable
+        );
+        assert_eq!(
+            classify_error_metadata(Some("OperationAborted"), Some(409), false),
+            S3ErrorClass::Other
+        );
+        assert_eq!(
+            classify_error_metadata(None, Some(409), false),
+            S3ErrorClass::Other
+        );
+        assert_eq!(
+            classify_error_metadata(Some("Unknown409"), Some(409), false),
+            S3ErrorClass::Other
+        );
+        assert_eq!(
+            classify_error_metadata(Some("PreconditionFailed"), Some(412), false),
+            S3ErrorClass::PreconditionFailed
+        );
+        assert_eq!(
+            classify_error_metadata(Some("NoSuchKey"), Some(404), false),
+            S3ErrorClass::NotFound
+        );
+        assert_eq!(
+            classify_error_metadata(Some("SlowDown"), Some(503), false),
+            S3ErrorClass::Retryable
+        );
+        assert_eq!(
+            classify_error_metadata(Some("AccessDenied"), Some(403), true),
+            S3ErrorClass::Retryable
+        );
+    }
+
+    #[test]
+    fn conditional_conflict_reconciliation_uses_one_head_snapshot() {
+        let current = Version::new("current");
+        let expected = Version::new("expected");
+
+        assert_precondition(
+            reconcile_conditional_conflict("key", &PutMode::Create, Some(current.clone())),
+            Some(&current),
+        );
+        assert!(reconcile_conditional_conflict("key", &PutMode::Create, None).is_retryable());
+
+        assert_precondition(
+            reconcile_conditional_conflict("key", &PutMode::Update(expected.clone()), None),
+            None,
+        );
+        assert_precondition(
+            reconcile_conditional_conflict(
+                "key",
+                &PutMode::Update(expected.clone()),
+                Some(current.clone()),
+            ),
+            Some(&current),
+        );
+        assert!(
+            reconcile_conditional_conflict(
+                "key",
+                &PutMode::Update(expected.clone()),
+                Some(expected),
+            )
+            .is_retryable()
+        );
+        assert!(
+            reconcile_conditional_conflict("key", &PutMode::Overwrite, Some(current))
+                .is_retryable()
+        );
+    }
+
+    fn assert_precondition(error: StoreError, expected: Option<&Version>) {
+        match error {
+            StoreError::PreconditionFailed { key, current } => {
+                assert_eq!(key, "key");
+                assert_eq!(current.as_ref(), expected);
+            }
+            other => panic!("expected PreconditionFailed, got {other:?}"),
+        }
     }
 }
