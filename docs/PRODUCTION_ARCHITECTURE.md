@@ -1,7 +1,7 @@
 # Production architecture charter
 
-Status: frozen V5.3 production target. PR1 implements only the storage and
-preservation gate described below. The V5.3 identity, control, event, recovery,
+Status: frozen V5.9 production target. PR1 implements only the storage and
+preservation gate described below. The V5.9 identity, control, event, recovery,
 Cloud Core, cutover, and production-promotion contracts are future gates. They
 are not implemented by PR1, and this document does not claim that WalGit is
 ready for production.
@@ -16,7 +16,7 @@ redaction stay unchanged.
 
 Cloud Core remains the tenant, project, repository, build, credential, and
 orchestration owner. WalGit owns Git protocol execution and repository control.
-One versioned S3-compatible bucket is WalGit's only durable state. Local disk
+One versioned Amazon S3 bucket is WalGit's only durable state. Local disk
 and memory remain disposable caches.
 
 Delivery is producer before consumer and pull-request only. A source pull
@@ -41,7 +41,7 @@ production approval. No PR1 image is production-deployable.
    identity, lifecycle, visibility, repository grants, writer fencing, finite
    quotas, capacity reservations, mutation receipts and settlement, exact
    object-version references, and bounded typed reclamation. The exact selected
-   provider primitive gate must pass before PR2 merges.
+   AWS S3 primitive gate must pass before PR2 merges.
 3. **PR3 — events and operations (future).** Extend settled receipts with
    durable event materialization and fanout. Add exact-commit pins, recovery
    catalogs and journals, production-scale and recovery evidence, and one
@@ -52,7 +52,7 @@ production approval. No PR1 image is production-deployable.
 
 ## PR1 binding storage contract
 
-- The selected S3-compatible bucket is the only durable state. Local disk and
+- The selected Amazon S3 production bucket is the only durable state. Local disk and
   memory are disposable caches.
 - Small mutable metadata uses one atomic conditional write. A caller gets an
   explicit failure when the provider cannot enforce the requested condition.
@@ -60,23 +60,39 @@ production approval. No PR1 image is production-deployable.
   multipart operations. The design continues to support a 64 GiB receive, a
   16 GiB LFS object, and 30 GiB or larger packs and bundles. It has no 4 GiB
   product limit.
-- The AWS SDK default credential chain supplies refreshable credentials. Empty
-  explicit override names leave standard AWS environment variables and
-  temporary credentials under that chain. Configured custom access and secret
-  variables override it only when both contain non-empty values. A configured
-  custom session-token variable must also resolve. An incoherent partial
-  override is a startup error. Secret values never enter logs or errors.
+- S3 control data uses one dedicated AWS SDK transport and presigned-GET HTTP
+  pool. Pack, bundle, LFS, temporary raw payload, unknown data, and every
+  ranged read use independent bulk SDK and HTTP pools. The closed classifier
+  defaults malformed, future, and wrong-prefix data keys to bulk. Bulk
+  requests use bounded per-provider-call permits, and a streamed GET retains
+  its permit through EOF, error, cancellation, or drop. Bulk never falls back
+  to the control lane. Separate application transports do not reserve host
+  NIC bandwidth or provider-account quota.
+- Credential selection is a closed `default_chain | explicit_env` mode.
+  `default_chain` accepts no custom variable names and delegates to the
+  refreshable AWS SDK chain, including standard AWS environment variables and
+  temporary credentials. `explicit_env` requires bounded custom access and
+  secret variable names plus an optional session-token name. Every named value
+  must resolve non-empty, and missing, empty, or non-Unicode values fail
+  startup without falling back to ambient AWS identity. This greenfield hard
+  cut intentionally rejects the earlier pre-1 implicit custom-name override
+  shape. Secret values never enter logs or errors.
 - Runtime multipart abort is best effort. The production bucket must configure
   `AbortIncompleteMultipartUpload` cleanup for uploads left by process death or
   provider outages.
 - Endpoint, region, bucket, prefix, and path-style settings remain explicit
-  deployment inputs. Memory, GCS, and standalone behavior remain supported.
+  deployment inputs. The endpoint is required and uses exact canonical origin
+  syntax with no path or trailing slash. WalGit binds it after AWS SDK config
+  loading and disables ambient endpoint, FIPS, and dual-stack modifiers.
+  Memory, GCS, and standalone behavior remain supported for development and
+  non-production contracts. Only AWS S3 is eligible for the future production
+  hard cut.
 - PR1 local RustFS evidence does not prove the production provider. The PR2
-  provider gate below must use the exact endpoint, region, addressing mode,
-  credential mode, temporary bucket, and unique prefix selected for
-  production.
+  provider gate below must use the exact AWS S3 endpoint, region,
+  addressing mode, credential mode, temporary bucket, and unique prefix
+  selected for production.
 
-## Future V5.3 repository control contract
+## Future V5.9 repository control contract
 
 Everything in this section is frozen future scope. PR1 does not implement it.
 
@@ -89,54 +105,852 @@ list, LFS catalog, event record, capacity shard, lease, host index, or recovery
 record cannot independently publish repository-visible state or authorize a
 mutation.
 
-`repo_control` contains the complete bounded WAL and control state needed for a
-normal read. It contains immutable identity, lifecycle, visibility, durable
-roots, grants and authorization epoch, writer holder and epoch, finite quota
-and charged usage, capacity binding, unresolved receipts, reclamation state,
-and the last internal mutation identity. Large collections use immutable
-catalog pages. A catalog becomes authoritative only when an exact root is
-published by the `repo_control` CAS.
+Let `P` be the configured deployment prefix. `P` is empty or has 1–4
+slash-terminated ASCII segments. Each segment has 1–63 bytes, matches
+`[a-z0-9][a-z0-9._-]{0,62}`, and is not `.` or `..`. Thus `P` is at most 256
+bytes and ends in `/` when non-empty. Let `C` be the canonical repository path
+bytes. Define:
 
-The encoded control object is at most 1 MiB. It contains at most 4,096 pack
-references, 256 inline WAL-tail entries, and 256 direct grants. Every string,
-byte field, catalog root set, and catalog page also has an explicit encoded
-size and item bound. The writer compacts before a limit. If compaction cannot
-restore the bound, it rejects new work before publication. It never truncates
-authority or lets control grow without a bound.
+```text
+canonical_path_digest = SHA-256(C)
+routing_digest = SHA-256("walgit-repo-path-v1" || u32be(len(C)) || C)
+repo_control_key = P || "v2/repositories/by-path/<routing_digest-lowerhex>/repo_control.pb"
+R = P || "v2/repositories/by-id/<repository-uuid-lowerhex>/g<generation-16hex>/"
+```
 
-`host_control` is a derived namespace, path, discovery, and routing index. It
-does not define repository existence, visibility, authorization, roots, or
+Every V2 key in this contract is the full physical provider key and therefore
+includes `P` exactly once. The configured `ObjectStore` is already scoped to
+`P`; its methods accept a validated store-relative suffix `S`, and the provider
+sees `P || S`. The V2 adapter is the only translation boundary. It accepts a
+full V2 key `K`, verifies the closed grammar and exact configured prefix,
+proves `K = P || S`, strips `P` exactly once, and passes only `S` to the
+configured store. For metadata, exact-version, and listing results, the adapter
+prepends `P` exactly once before returning the full key to V2 semantic code.
+This rule also applies when `P` is empty.
+
+A prefix mismatch is `KEY_PREFIX_MISMATCH` and fails closed. No V2 caller
+passes a full `K` directly to the already-prefixed store, treats a
+store-relative suffix as an authoritative key, or concatenates `P` a second
+time. In particular, `P || P || S` is never valid. Every lookup, parent root,
+persisted key field, digest preimage that includes a key, and returned object
+identity uses the full physical key `K`; only the configured store call uses
+the relative suffix `S`.
+
+The public path therefore addresses `repo_control` without first knowing the
+tenant, project, UUID, or generation. A direct lookup reads this exact key and
+then verifies with binary equality that the stored canonical path is `C`, its
+stored `canonical_path_digest` is `SHA-256(C)`, its stored `routing_digest` is
+the domain-separated value above, and its stored complete control key is the
+key read. It also verifies that lifecycle permits the operation. An
+inconsistent stored identity or key is the bounded typed error
+`PATH_IDENTITY_MISMATCH`. If the stored routing digest equals the requested
+routing digest but the stored canonical bytes differ, the error is
+`ROUTING_DIGEST_COLLISION`; the server does not try an alternate key.
+
+`R` is the immutable payload root for that UUID and generation. Its closed
+subkeys and leaf forms are:
+
+| Kind | Key below `R` |
+|---|---|
+| Pack catalog page | `catalogs/pack/<sha256-lowerhex>.pb` |
+| Ref-delta catalog page | `catalogs/ref-delta/<sha256-lowerhex>.pb` |
+| Grant catalog page | `catalogs/grant/<sha256-lowerhex>.pb` |
+| Receipt catalog page | `catalogs/receipt/<sha256-lowerhex>.pb` |
+| Event catalog page | `catalogs/event/<sha256-lowerhex>.pb` |
+| Pin catalog page | `catalogs/pin/<sha256-lowerhex>.pb` |
+| Git-ownership catalog page | `catalogs/git-ownership/<sha256-lowerhex>.pb` |
+| LFS-ownership catalog page | `catalogs/lfs-ownership/<sha256-lowerhex>.pb` |
+| Bundle catalog page | `catalogs/bundle/<sha256-lowerhex>.pb` |
+| Recovery catalog page | `catalogs/recovery/<sha256-lowerhex>.pb` |
+| Audit catalog page | `catalogs/audit/<sha256-lowerhex>.pb` |
+| Reclamation catalog page | `catalogs/reclamation/<sha256-lowerhex>.pb` |
+| Receipt result | `receipts/results/<mutation-uuid-lowerhex>.pb` |
+| Event result | `events/results/<event-uuid-lowerhex>.pb` |
+| Event archive | `events/archive/<event-uuid-lowerhex>/<subscriber-sha256-lowerhex>.pb` |
+| Event archive watermark | `events/watermarks/<wal-sequence-16hex>/<sha256-lowerhex>.pb` |
+| Checkpoint | `checkpoints/<wal-sequence-16hex>/<sha256-lowerhex>.pb` |
+| Recovery journal | `recovery/<recovery-uuid-lowerhex>/journal/<sequence-16hex>.pb` |
+| Recovery mapping | `recovery/<recovery-uuid-lowerhex>/mapping/<sequence-16hex>.pb` |
+| Recovery catalog | `recovery/<recovery-uuid-lowerhex>/catalog/<sequence-16hex>.pb` |
+| Recovery payload reference | `recovery/<recovery-uuid-lowerhex>/payload/<sequence-16hex>.pb` |
+| Git pack | `git/packs/<sha256-lowerhex>.pack` |
+| LFS object | `lfs/<sha256-lowerhex>.bin` |
+| Bundle | `bundles/<sha256-lowerhex>.bundle` |
+| Temporary Git pack upload | `tmp/git-pack-upload/<operation-uuid-lowerhex>/<sequence-16hex>.bin` |
+| Temporary LFS upload | `tmp/lfs-upload/<operation-uuid-lowerhex>/<sequence-16hex>.bin` |
+| Temporary bundle upload | `tmp/bundle-upload/<operation-uuid-lowerhex>/<sequence-16hex>.bin` |
+| Temporary catalog candidate | `tmp/catalog-candidate/<operation-uuid-lowerhex>/<sequence-16hex>.pb` |
+| Temporary recovery copy | `tmp/recovery-copy/<operation-uuid-lowerhex>/<sequence-16hex>.bin` |
+
+This table is exhaustive. No other leaf or caller-supplied kind is valid.
+Object-key components use lowercase fixed-width hex for UUIDs and digests and
+16-digit lowercase hex for generations and sequence numbers. A complete object
+key is at most 1,024 bytes.
+
+Every persisted immutable body binds tenant, project, repository UUID,
+generation, canonical path, `canonical_path_digest`, `routing_digest`, and its
+semantic content. It does not bind its own key, `ObjectVersionID`, digest, or
+size because those values do not exist until the store accepts the object. Only
+an authoritative parent reference binds a target's exact key,
+`ObjectVersionID`, digest, and size. `repo_control` roots top-level catalogs and
+checkpoints. Each catalog parent roots its children. A settlement control CAS
+roots a result envelope. An archive watermark roots subscriber archives. The
+global recovery authority and repository control root recovery artifacts.
+
+Raw Git pack, LFS, and bundle bytes remain their standard formats and do not
+embed WalGit identity. Their exact authoritative parent references carry the
+identity plus key, `ObjectVersionID`, digest, and size. Unpublished raw
+temporary bytes also carry no authority.
+
+Each digest has one exact preimage:
+
+- a `.pb` object uses `SHA-256` over the exact stored deterministic protobuf
+  wire bytes;
+- a Git pack, LFS object, bundle, or raw temporary payload uses `SHA-256` over
+  the exact stored raw bytes;
+- any signed envelope uses `SHA-256` over the complete exact untagged
+  `COSE_Sign1` bytes, including protected header, payload, and signature; and
+- a verification-ring key uses the digest of the exact stored untagged
+  verification-ring `COSE_Sign1` bytes.
+
+These are object and envelope identity digests. The credential verifier-set and
+acknowledgement-set semantic fields below use their separately domain-separated
+digest formulas; neither retained evidence value is a bucket object identity.
+
+Readers hash the stored bytes before parsing and reject a non-matching digest.
+Persisted protobuf uses deterministic field ordering, minimal varints, packed
+canonical repeated scalars, no maps, no unknown fields, no duplicate singular
+fields, and no groups. The subscriber component is
+`SHA-256("walgit-subscriber-v1" || u32be(len(subscriber_id)) || subscriber_id)`.
+
+Global control-plane objects use only these keys:
+
+| Kind | Exact key |
+|---|---|
+| Cutover authority | `P || "v2/control/cutover_control.pb"` |
+| Credential binding authority | `P || "v2/control/credential_control.pb"` |
+| Bucket-administration safety authority | `P || "v2/control/bucket_admin_control.pb"` |
+| Immutable signed verification key ring | `P || "v2/control/key-rings/<sha256-lowerhex>.cose"` |
+| Capacity allocation authority | `P || "v2/capacity/capacity_control.pb"` |
+| Immutable tenant-capacity catalog page | `P || "v2/capacity/catalogs/tenant/<sha256-lowerhex>.pb"` |
+| Capacity shard | `P || "v2/capacity/shards/<shard-2hex>/capacity_shard.pb"` |
+| Global recovery authority | `P || "v2/recovery/recovery_control.pb"` |
+| Writer lease | `P || "v2/leases/by-id/<repository-uuid-lowerhex>/g<generation-16hex>/writer_lease.pb"` |
+| Host index by path | `P || "v2/host_control/by-path/<routing_digest-lowerhex>.pb"` |
+| Host index by identity | `P || "v2/host_control/by-id/<repository-uuid-lowerhex>/g<generation-16hex>.pb"` |
+
+There are exactly 256 capacity shards. The first byte of
+`SHA-256(repository_uuid)` selects the two-hex-digit shard. `capacity_control`
+is the CAS-owned allocation authority. Capacity shards and leases are bounded
+mutable side state but cannot publish or authorize. `recovery_control` is the
+global recovery fence; it cannot publish repository state. The signed key
+rings and tenant-capacity catalog pages are
+immutable. Their authoritative controls bind exact roots. `credential_control`
+selects the bounded accepted ring set. `cutover_control` roots its initial
+control-plane graph, but later credential, capacity, bucket-safety, or recovery
+changes do not mutate the terminal cutover state.
+
+`host_control` is an optional derived discovery and routing index at
+`P || "v2/host_control/by-path/<routing_digest-lowerhex>.pb"` and
+`P || "v2/host_control/by-id/<repository-uuid-lowerhex>/g<generation-16hex>.pb"`.
+It does not define repository existence, visibility, authorization, roots, or
 writer ownership. A stale or missing host index can affect discovery only.
-Direct repository lookup reads `repo_control`.
+Direct repository lookup always reads the routing-digest-derived
+`repo_control` key.
+
+`repo_control` contains the complete bounded authority needed for a normal
+read. Large collections use immutable catalog pages under `R`. A catalog
+becomes authoritative only when an exact root is published by the
+`repo_control` CAS.
 
 Immutable payloads and candidate catalog pages can be written before the
 control CAS. They remain unreachable and have no semantic effect until that
 CAS publishes their exact roots. Every client and system mutator follows this
 rule. There is no local fallback and no second publishing key.
 
-### Identity, lifecycle, visibility, and grants
+### Bounded V2 schema
 
-Repository identity is a UUID plus immutable generation 1. Create, recovery,
-capability, pin, event, build, cutover, and provider records bind all of these
-values:
+Every protobuf `string`, `bytes`, and `repeated` field has a machine-readable
+bound annotation. Every message has a maximum encoded size. A descriptor
+linter rejects an unbounded field, a missing message maximum, or a nested value
+without an enforceable parent-size check. Decoders check item, count, and total
+message bounds before allocation. Writers compact or reject when the first
+field, count, or encoded-message limit is reached. They never truncate
+authority.
+
+| Message or object | Maximum encoded bytes |
+|---|---:|
+| `repo_control` or `cutover_control` | 1,048,576 |
+| `capacity_control`, its redistribution state payload, capacity shard, or checkpoint | 1,048,576 |
+| `credential_control`, `bucket_admin_control`, or `recovery_control` | 65,536 |
+| Catalog node | 524,288 |
+| Event archive watermark | 524,288 |
+| Mutation receipt or result, event core, result, archive, pin, build row, provider row, host row, recovery row, reclamation row, WAL-tail entry, bootstrap, cutover, bucket-safety evidence row, signed cutover-proof envelope, or signed verification key ring | 65,536 |
+| Signed credential verifier-set envelope or credential acknowledgement-set bytes | 65,536 |
+| Archive-root reference | 4,096 |
+| Capacity reservation, tenant-capacity allocation row, verification data-key row, or build-context row | 16,384 |
+| Create-intent, capability, or credential-transition-proof `COSE_Sign1` envelope | 8,192 |
+| Lease | 16,384 |
+| Any other nested V2 control message | 4,096 |
+
+The following field limits apply across the V2 schema:
+
+| Field class | Bound |
+|---|---:|
+| Tenant, project, issuer, subject, audience, holder, purpose, cursor owner, and other opaque identifiers | 1–256 bytes |
+| Repository, intent, token, proof, mutation, event, reservation, recovery, operation, or bootstrap-session UUID | exactly 16 bytes; RFC 9562 UUIDv7 except a pre-existing repository UUID supplied by Cloud Core |
+| Canonical repository path | 1–1,024 UTF-8 bytes |
+| Object key | 1–1,024 bytes in the closed ASCII key grammar |
+| `CasToken` | 1–256 opaque bytes |
+| `ObjectVersionID` | 1–1,024 opaque bytes |
+| SHA-256 digest | exactly 32 bytes |
+| Git object ID | exactly 20 bytes for SHA-1 or 32 bytes for SHA-256 |
+| Ref name or symbolic target | 1–1,024 bytes |
+| Human-readable label or bounded error text | 0–1,024 UTF-8 bytes |
+| Inline settings | 0–16,384 encoded bytes |
+| Inline policy | 0–65,536 encoded bytes |
+| Delivery or reclamation cursor | 0–4,096 bytes |
+| S3 inventory key or version ID | 0–1,024 bytes |
+| Cutover inventory record | exactly 88 bytes |
+| Bootstrap authority-precondition digest | exactly 32 bytes |
+| Ed25519 public key | exactly 32 bytes |
+| Ed25519 signature | exactly 64 bytes |
+| HMAC-SHA256 key ID or event-delivery key ID | exactly 16 bytes |
+| HMAC-SHA256 result or body digest | exactly 32 bytes |
+| HTTPS callback URL or normalized callback path | 1–2,048 ASCII bytes |
+| Webhook body | 1–1,048,576 bytes |
+| Event-to-READY interval, named `event_to_build_intent_delay` | 0–2,592,000 seconds |
+| Build queue, retry, or maximum completion horizon | 0–2,592,000 seconds each; their sum is at most 7,776,000 seconds |
+| Conservative event build-retention span | 0–10,368,000 seconds |
+| Content type, algorithm, state, kind, or enum text | 1–128 ASCII bytes |
+| Any other protobuf string or byte field | 0–1,024 bytes |
+
+Repeated fields have these maxima: 4,096 inline pack roots; 256 inline WAL-tail
+entries; 256 direct grants; 64 immutable dependencies per receipt; 256 ref
+changes or superseded object-version IDs per tail entry; 4,096 aggregate inline
+ref changes across all WAL-tail entries in one control object; exactly 256
+shard-budget rows per `capacity_control`; exactly 256 target shard budgets and,
+in `APPLYING`, exactly 256 drained-shard baselines; exactly 256 shard slices per
+tenant-capacity row; at most 262 bootstrap creation-plan rows per cutover
+generation; 2,048 children per catalog node; 4,096 items per catalog leaf;
+4,096 reservations per capacity shard; and 4,096 current tenant-account rows
+per capacity shard. Any other repeated field has at most 64 items. The
+credential binding has exactly one current and at most one next and one previous
+root, at most 64 revoked key IDs, and no other ring slot. A webhook has exactly
+one current and at most one previous HMAC-key reference. Protobuf maps are not
+used in V2 persisted messages. A repository has at most 64 active webhook
+subscribers. An archive watermark has at most 64 archive-root references, and
+each reference has a maximum encoded size of 4,096 bytes. The descriptor
+linter computes the maximum outer encoding from the repeated count, nested
+message bounds, tags, lengths, and fixed fields and proves that it fits the
+524,288-byte watermark limit.
+
+A verification key ring has at most 64 data keys and 16 allowed audiences per
+key. A build has at most 64 named Git contexts. One atomic ref transaction and
+its event core have at most 256 inline ref changes and have no overflow
+representation. The 4,096 control-wide limit above bounds aggregate historical
+WAL-tail state and never permits an atomic transaction above 256. The fixed control
+catalog-root set has exactly these 11 optional slots: pack, grant,
+receipt, event, pin, Git ownership, LFS ownership, bundle, recovery, audit, and
+reclamation. Ref-delta roots are bound by their WAL-tail entries. Absence is
+explicit; the schema does not use a variable or unknown root kind.
+
+A catalog has at most four levels, 131,072 nodes, and 68,719,476,736 encoded
+bytes. Every root records kind, key, `ObjectVersionID`, digest, size, depth, node
+count, item count, and total encoded bytes. Per-repository catalog item maxima
+are 1,000,000 packs; 4,000,000 refs; 65,536 grants; 16,384 retained receipt
+rows in the future multilevel model (with at most one `UNRESOLVED` row);
+65,536 pending events; 1,000,000 pins; 100,000,000 Git-ownership entries;
+100,000,000 LFS-ownership entries; 65,536 bundles; 100,000,000 recovery
+entries; 10,000,000 audit entries; and 1,000,000 candidates in one reclamation
+batch. Reaching a maximum applies bounded backpressure. It never silently drops
+or replaces an item. The dormant flat-catalog slice has the lower explicit
+limit of 4,096 retained rows and does not implement multilevel compaction.
+
+The dormant global tenant-capacity catalog is one immutable flat page with at
+most 4,096 binary-sorted unique allocation rows and at most 524,288 exact
+encoded bytes. Either bound can apply first and causes explicit backpressure.
+Each row binds one opaque tenant ID, a finite total tenant budget, and exactly
+256 positive per-shard slices whose checked sum equals that budget. Before
+activation, a later explicit schema and controller phase must introduce the
+deferred multilevel topology and its 65,536-row target. For each shard column,
+the checked sum of all tenants' slices must be no greater than that shard's
+budget, and the checked aggregate must be no greater than the plan's global
+allocatable bytes. The exported cross-object validator exact-binds loaded page
+bytes to the control root and proves these sums for the current plan and, while
+PREPARING, the target plan. A page reference alone cannot prove the referenced
+body, so the future controller must run that validator immediately after exact
+strict loads and before publishing a plan or admitting a reservation.
+
+### Normal-read inline and catalog split
+
+Every normal read first gets only the routing-digest-derived `repo_control`.
+Control always carries identity and create binding; object format; lifecycle;
+visibility; control revision and cutover generation; writer holder and epoch;
+authorization epoch; quota, charged usage, and the active capacity binding;
+bucket-admin epoch and safety digest; inline settings and policy; WAL head,
+minimum sequence, and checkpoint root; at most 256 WAL-tail entries;
+reclamation state and cursor root; the last internal mutation ID; and a fixed
+set of typed catalog roots.
+
+Up to and including 4,096 pack roots stay inline while the encoded control fits
+its byte bound. Before an addition would create root 4,097 or exceed the byte
+bound, one pack catalog replaces the entire inline pack list. Up to and
+including 256 grants stay inline under the same rule. Before an addition would
+create grant 257 or exceed the byte bound, one grant catalog replaces the
+entire inline list. A WAL-tail entry contains at most 256 ref changes and
+superseded version IDs; a typed ref-delta catalog replaces an entry before an
+addition would exceed its count or byte limit. The full inline control contains
+at most 4,096 aggregate historical ref changes across its WAL-tail entries;
+this does not raise the 256-change limit for one atomic transaction. The writer
+compacts the tail before adding entry 257 and rejects the mutation if compaction
+cannot complete within the bounds.
+
+Schema `oneof` fields make inline and catalog forms mutually exclusive.
+Settings and policy remain inline. A cold ref read gets control and then exact
+checkpoint, ref-delta, and pack catalog versions only when the requested ref
+needs them. Receipt, event, pin, ownership, capacity, recovery, audit, and
+reclamation catalogs are operation-specific and are not part of every normal
+read.
+
+### Identity and path
+
+Repository identity is a UUID plus immutable generation 1. Control, create,
+receipt, capacity, lease, recovery, capability, pin, event, build, cutover,
+provider, and host records bind all of these values:
 
 - opaque tenant ID;
 - opaque project ID;
 - repository UUID and generation;
-- the exact canonical UTF-8 path bytes produced by Cloud Core; and
-- the SHA-256 digest of those bytes.
+- the exact canonical UTF-8 path bytes produced by Cloud Core;
+- `canonical_path_digest = SHA-256(C)`; and
+- the domain-separated `routing_digest` above.
 
 Cloud Core is the only Unicode canonicalizer. Rust treats the supplied bytes
 as opaque and compares them with binary equality. A shared adversarial corpus
 proves that both implementations accept and reject the same paths. Rename,
 move, path reuse, and generation change remain unsupported in the foundation.
 
+The V2 Git transport base is `/<segment...>/<final>.git`. The exact lowercase
+`.git` suffix is mandatory for smart HTTP and LFS transport and is not part of
+the canonical path. A canonical path is the decoded segments joined by `/`,
+without a leading or trailing slash. It has 1–8 non-empty UTF-8 segments and
+1–1,024 decoded bytes. `/` is the only separator. The decoder rejects invalid
+UTF-8, an encoded slash, an empty segment, `.` or `..`, NUL, ASCII control
+bytes, backslash, and DEL. The final canonical segment cannot end in the
+literal bytes `.git`.
+
+Only ASCII unreserved bytes `[A-Za-z0-9._~-]` appear literally in the transport
+path. Every other UTF-8 byte uses uppercase `%HH`. The server decodes exactly
+once from the raw request target. It rejects invalid, lowercase, overlong, or
+unnecessary escapes. Neither Cloud Core nor Rust applies case folding or
+Unicode normalization at transport time. Cloud Core produces the canonical
+bytes; both systems use one adversarial conformance corpus. Management and UI
+routes use the fixed prefix
+`/_repos/<same-encoded-canonical-path>/<closed-api-suffix>`, which keeps them
+separate from Git transport routes. PR1 routes remain preserved until the
+future hard cut. No V2 alias or legacy path fallback exists after `ACTIVE`.
+
+Cloud Core enforces permanent global uniqueness on the exact canonical path
+bytes, `canonical_path_digest`, and `routing_digest`, including tombstones.
+Create requires unused canonical bytes, both digests, repository UUID, and
+control key. A repository cannot be renamed or moved, a path cannot be reused,
+and its generation cannot change. Different canonical bytes with the same raw
+identity digest fail as `CANONICAL_PATH_DIGEST_COLLISION`. Different canonical
+bytes with the same routing digest fail as `ROUTING_DIGEST_COLLISION`. These
+errors are not aliases.
+
 Only a signed Cloud Core create intent can create control. It binds identity,
 path, object format, initial visibility, finite quota, and the initial
 repository-admin grant. It also binds issuer, audience, key ID, intent ID,
 issue time, and expiry. One `Create` of `repo_control` makes the candidate
-`ACTIVE`. An exact replay is idempotent. A different intent or identity at the
-same path fails.
+`ACTIVE`. At that same derived `repo_control` key, an exact replay is idempotent
+and a different intent or identity fails.
+
+### Signed create intents and capabilities
+
+Create intents and capabilities use untagged `COSE_Sign1`. Their protected
+header is the exact deterministic-CBOR map `{1: -8, 4: data_kid}`, where
+`data_kid` is exactly 16 bytes. Their unprotected header is the exact empty map.
+The payload is deterministic CBOR under RFC 8949. The verifier rejects
+duplicate map keys, indefinite-length items, floats, non-shortest encodings,
+non-canonical map order, and trailing bytes. Identity and path values are CBOR
+byte strings. Ed25519 signatures are exactly 64 bytes and use strict RFC 8032
+verification. The decoded payload is at most 7,680 bytes and is one
+integer-keyed map. It uses no CBOR text strings.
+
+Both payloads use these required keys:
+
+| Key | Type and value |
+|---:|---|
+| 1 | unsigned schema version, exactly `1` |
+| 2 | unsigned type: `1` create intent or `2` capability |
+| 3 | issuer byte string, 1–256 bytes |
+| 4 | audience byte string, 1–256 bytes |
+| 5 | intent or token UUIDv7, 16-byte byte string |
+| 6 | issued-at, signed 64-bit Unix seconds |
+| 7 | not-before, signed 64-bit Unix seconds |
+| 8 | expiry, signed 64-bit Unix seconds |
+| 9 | opaque tenant ID byte string, 1–256 bytes |
+| 10 | opaque project ID byte string, 1–256 bytes |
+| 11 | repository UUID, 16-byte byte string |
+| 12 | generation, unsigned 64-bit integer; exactly `1` in this foundation |
+| 13 | canonical path byte string, 1–1,024 bytes |
+| 14 | canonical path digest `SHA-256(C)`, 32-byte byte string |
+| 15 | unsigned 64-bit verification-ring epoch |
+| 16 | verification-ring SHA-256 digest, 32-byte byte string |
+| 17 | domain-separated routing digest, 32-byte byte string |
+
+The create map also requires:
+
+| Key | Type and value |
+|---:|---|
+| 20 | object format: unsigned `1` SHA-1 or `2` SHA-256 |
+| 21 | visibility: unsigned `1` private, `2` internal, or `3` public |
+| 22 | positive unsigned 64-bit logical quota |
+| 23 | initial administrator issuer byte string, 1–256 bytes |
+| 24 | initial administrator subject byte string, 1–256 bytes |
+| 25 | unsigned 64-bit cutover generation |
+| 26 | derived control-key byte string, 1–1,024 ASCII bytes |
+
+The capability map also requires:
+
+| Key | Type and value |
+|---:|---|
+| 30 | purpose enum |
+| 31 | unsigned 64-bit authorization epoch |
+| 32 | issuing control-key byte string, 1–1,024 ASCII bytes |
+| 33 | issuing `ObjectVersionID` byte string, 1–1,024 bytes |
+| 34 | unsigned 64-bit cutover generation |
+| 35 | repository-grant issuer byte string, 1–256 bytes |
+| 36 | repository-grant subject byte string, 1–256 bytes |
+
+Purpose is an unsigned enum: `1` clone-read, `2` Git-read, `3` Git-write, `4`
+LFS-read, `5` LFS-finalize, `6` webhook-admin, `7` service-build, or `8`
+repository-admin. Unknown keys, enum values, and missing required keys fail
+closed. Key 3 identifies the capability signer. Keys 35 and 36 identify the
+exact repository grant and are independent of key 3. Binary equality is
+required; a verifier does not derive either grant identity from an email,
+display name, signer, token holder, or request path.
+
+Every capability-authorized read or mutation rereads the current
+`repo_control`, finds the exact `(grant issuer, grant subject)` pair, checks its
+role and the capability authorization epoch, and then applies lifecycle,
+visibility, and purpose rules. Clone-read, Git-read, LFS-read, and service-build
+require reader, writer, or administrator. Git-write and LFS-finalize require
+writer or administrator. Webhook-admin and repository-admin require
+administrator. A mutation repeats this grant check against the exact control
+version it will CAS, including after CAS contention. A missing, revoked,
+wrong-role, or changed grant fails closed.
+
+The create external AAD is the exact ASCII bytes
+`walgit-create-intent-v1`. The capability external AAD is the exact ASCII bytes
+`walgit-capability-v1`. The normal COSE `Sig_structure` signs that external AAD,
+the exact protected header bytes, and the exact payload bytes.
+
+Every `COSE_Sign1` in this credential contract uses an attached, non-null
+byte-string payload. Detached and CBOR-null payloads fail closed. Data-key and
+acknowledgement `kid` values are opaque reserved 16-byte values; a verifier
+derives only `root_kid` from a public key.
+
+Intent and token IDs are RFC 9562 UUIDv7 values encoded as their raw 16 bytes.
+Their embedded millisecond timestamp must be within 30 seconds of issued-at.
+At the same derived `repo_control` key, an exact create envelope replay is
+idempotent; reuse of its intent UUID with any changed byte is a conflict. WalGit
+does not create, query, or LIST a global intent-ID index. Before signing, Cloud
+Core atomically records and permanently enforces uniqueness of every
+create-intent UUID across all tenants, projects, paths, and repository UUIDs. A
+valid signature is the producer assertion that this reservation completed;
+this does not create a second global bucket authority. The allowed clock skew
+is 30 seconds. A create intent
+lives at most 10 minutes and a capability at most 15 minutes. Both require
+`issued_at <= not_before <= expiry`; issue time cannot be more than 30 seconds
+in the future. A verifier accepts time only from 30 seconds before not-before
+through 30 seconds after expiry.
+
+The lifetime calculation is checked `expiry - issued_at`: at most 600 seconds
+for a create intent or transition proof and 900 seconds for a capability.
+Envelope validity uses the verifier's explicit `now` and only the stated
+30-second envelope skew. A data key requires `not_before <= not_after`; key
+eligibility is evaluated at the signed envelope `issued_at` with no key skew.
+These are separate checks, so a correctly issued envelope can remain valid
+while a previous ring drains. Ring and verifier-set IDs need valid UUIDv7 wire
+form only. They have no UUID-to-issued-at proximity, artifact lifetime, or
+future-skew rule beyond the requirements stated for their containing object.
+
+Cloud Core publishes a deterministic-CBOR verification key ring in untagged
+`COSE_Sign1`, signed by a pinned Ed25519 root with external AAD equal to the
+exact ASCII bytes `walgit-verification-key-ring-v1`. Let `root_public_key` be
+the exact 32-byte pinned Ed25519 public key and define
+`root_kid = first16(SHA-256("walgit-ed25519-root-kid-v1" || root_public_key))`.
+Here `first16` means the first 16 digest bytes in wire order. The production
+candidate and `cutover_control` pin both exact values. The ring
+protected header is the exact deterministic-CBOR map `{1: -8, 4: root_kid}`;
+its unprotected header is the exact empty map. Its integer-keyed payload
+contains schema version exactly `1` at key 1, ring UUIDv7 at key 2, issued-at at
+key 3, prior-ring SHA-256 digest at key 4, the data-key array at key 5, and a
+positive unsigned 64-bit ring epoch at key 6. Key 4 is an empty byte string only
+for the bootstrap ring and otherwise is exactly 32 bytes. The array is sorted
+by binary `kid` and contains 1–64 unique entries. A data key uses integer keys
+1–7 for 16-byte `kid`, 32-byte public key, issuer byte string, a binary-sorted
+array of at most 16 unique audience byte strings, not-before, not-after, and
+state. Issuer and audience values have 1–256 bytes. Times are signed 64-bit
+Unix seconds. State is `1` PENDING, `2` ACTIVE, `3` RETIRING, or `4` REVOKED.
+
+The bootstrap `CredentialControl` has schema version `2`, control revision `1`,
+issuer epoch `1`, exactly the bootstrap ring root in `current`, absent `next`
+and `previous`, absent `previous_last_issue_unix_seconds`, and an empty
+`revoked_kids` list. The bootstrap ring has ring epoch `1`, an empty prior-ring
+digest, and at least one `ACTIVE` data key. Its verifier-set and
+acknowledgement-proof digests come from the bootstrap transition proof below.
+No other bootstrap value is valid.
+
+For every later install, checked addition must prove
+`next.ring_epoch = current.ring_epoch + 1`; `current.ring_epoch = u64::MAX`
+therefore makes another install impossible. The next ring payload key 6 must
+equal that epoch, and payload key 4 must equal the exact `current.digest`. The
+next root's full key, `ObjectVersionID`, digest, size, and epoch must match that
+payload and immutable object. A skipped epoch, zero or wrapped epoch, empty or
+wrong prior digest, rollback, or a candidate fork from any root other than the
+currently bound `current` fails closed. If two candidates fork from one
+current, only one install CAS can land; the loser can never become `next` after
+the winner changes current lineage.
+
+Cloud Core permanently reserves each ring UUIDv7, data `kid`, and Ed25519
+public-key byte string before signing a ring. It never reuses one in another
+ring, including after retirement or revocation. The root signature is the
+producer assertion that those reservations completed; WalGit creates no global
+bucket index. WalGit additionally rejects a next ring whose UUID, root tuple,
+`kid`, or public key duplicates any bound current, next, or previous ring, or
+whose `kid` occurs in `revoked_kids`. Because epoch and prior digest are inside
+the signed bytes and the object key is their digest, a valid descendant cannot
+reuse an older ring body or root identity. Digest collision, duplicate root,
+reused identity, and retired-key reuse all fail closed.
+
+Slot position and key state jointly decide use:
+
+| Data-key state | `current` slot | `next` slot | `previous` slot |
+|---|---|---|---|
+| `PENDING` | no sign; no verify | no sign; no verify | no sign; no verify |
+| `ACTIVE` | sign and verify | verify only | verify only |
+| `RETIRING` | verify only | no sign; no verify | verify only |
+| `REVOKED` | no sign; no verify | no sign; no verify | no sign; no verify |
+
+Only an `ACTIVE` key in the bound `current` ring can sign. The immutable ring
+placed in `next` already marks the key that will be promoted as `ACTIVE`, but
+slot position prevents issuance until the promotion CAS. `PENDING` and
+`REVOKED` never sign or verify. `RETIRING` never signs and verifies only in an
+allowed `current` or `previous` slot. The global revoked-`kid` set overrides
+the matrix.
+
+The credential authority uses these exact protobuf fields and tags. The shown
+scalar types are the wire types. The message fields have protobuf presence;
+`previous_last_issue_unix_seconds` uses explicit optional presence so Unix
+second zero is distinct from absence.
+
+```proto
+message VerificationRingRoot {            // maximum 4,096 encoded bytes
+  bytes key = 1;                           // 1..1,024 bytes
+  bytes object_version_id = 2;             // 1..1,024 bytes
+  bytes digest = 3;                        // exactly 32 bytes
+  uint64 size = 4;                         // 1..65,536
+  uint64 ring_epoch = 5;                   // positive
+}
+
+message CredentialControl {               // maximum 65,536 encoded bytes
+  uint32 schema_version = 1;               // exactly 2
+  uint64 control_revision = 2;             // positive
+  uint64 issuer_epoch = 3;                 // positive
+  VerificationRingRoot current = 4;        // exactly one
+  VerificationRingRoot next = 5;           // zero or one
+  VerificationRingRoot previous = 6;       // zero or one
+  optional int64 previous_last_issue_unix_seconds = 7;
+  repeated bytes revoked_kids = 8;          // 0..64; each exactly 16 bytes
+  bytes verifier_set_digest = 9;            // exactly 32 bytes
+  bytes acknowledgement_proof_digest = 10; // exactly 32 bytes
+}
+```
+
+`current` is present exactly once. `next` and `previous` are independently
+optional and cannot occur more than once. The previous-last-issue field is
+present if and only if `previous` is present. `revoked_kids` is binary-sorted,
+unique, and has at most 64 entries. `verifier_set_digest` is the
+domain-separated digest of the exact signed verifier-set envelope defined
+below. `acknowledgement_proof_digest` is the SHA-256 digest of the exact
+untagged credential-transition `COSE_Sign1` bytes defined below. Both fields
+are always present. Duplicate singular fields, unknown fields, alternate tags,
+and non-canonical encodings fail before generated decoding.
+
+Every `VerificationRingRoot.key` is the full physical key
+`P || "v2/control/key-rings/<digest-lowerhex>.cose"`; the leaf digest equals the
+root's `digest`. Exact-version GET and HEAD must return the same full key,
+`ObjectVersionID`, body digest, and size, and the verified ring payload epoch
+must equal `ring_epoch`. A root with a zero size or epoch, a mismatched key,
+metadata, body, or epoch, pairwise-equal slot roots, or duplicate slot epochs
+fails closed. A verifier accepts a ring only when this complete five-field root
+equals one explicitly bound slot. It never follows an unbound ring or falls
+back to a cached binding.
+
+Every successful credential-control CAS increments `control_revision` by
+exactly one. `issuer_epoch` never decreases and increments by exactly one when
+a promotion changes the signing ring or when the deny set grows. Installing
+`next` does not change `issuer_epoch`. The deny set is binary-sorted,
+append-only, and permanent for schema version 2. Retirement adds every `kid`
+from `previous` that is not already present, then removes `previous` and its
+last issue time in the same CAS. Before installing `next`, the controller proves
+that eventual retirement of current would keep this union at or below 64. If
+the bound cannot hold, rotation fails closed and requires a later root-key or
+schema ceremony; it never drops history. Preload installs only `next`.
+Promotion requires `next` and an empty `previous` slot, moves `next` to
+`current`, moves the old `current` to `previous`, clears `next`, and records the
+last issue time for the old current ring in the same CAS. No other slot
+transition is valid.
+
+Tags 1–10 and their meanings, wire types, bounds, presence, and cardinality are
+permanent for schema version 2. A tag is never reused, and a writer never emits
+an unknown field. An incompatible change requires a new schema and object
+contract introduced through `EXPAND`, `SWITCH`, and later `CONTRACT`; readers
+do not accept an alias, dual encoding, or mixed interpretation.
+
+#### Credential verifier and acknowledgement sets
+
+The credential verifier set is an untagged `COSE_Sign1` signed by the same
+pinned Ed25519 root that signs verification rings. Its protected header is the
+exact deterministic-CBOR map `{1: -8, 4: root_kid}`, its unprotected header is
+the exact empty map, and its external AAD is the exact ASCII bytes
+`walgit-credential-verifier-set-v1`. The decoded deterministic-CBOR payload has
+a maximum of 65,024 bytes, contains no text strings, and uses exactly these
+numeric keys:
+
+| Key | Exact value |
+|---:|---|
+| 1 | unsigned schema version, exactly `1` |
+| 2 | verifier-set UUIDv7, 16-byte byte string |
+| 3 | issued-at, signed 64-bit Unix seconds |
+| 4 | positive unsigned 64-bit verifier-set epoch |
+| 5 | array of 1–64 verifier-member maps |
+
+A verifier-member map has exactly these numeric keys:
+
+| Key | Exact value |
+|---:|---|
+| 1 | opaque member ID byte string, 1–256 bytes |
+| 2 | unsigned role bit mask, 1–15: bit 0 serving instance, bit 1 writer, bit 2 issuer, bit 3 verifier |
+| 3 | acknowledgement `kid`, 16-byte byte string |
+| 4 | Ed25519 acknowledgement public key, 32-byte byte string |
+| 5 | positive unsigned 64-bit membership epoch |
+
+Members sort first by raw member-ID bytes in lexicographic order, then by
+unsigned membership epoch in ascending numeric order, then by raw
+acknowledgement-`kid` bytes in lexicographic order. Member IDs and
+acknowledgement `kid` values are independently unique; duplicate public keys
+are invalid. Unknown keys, zero or unknown role bits, empty members, and
+non-canonical CBOR fail closed. The root uses strict RFC 8032 verification.
+Cloud Core permanently reserves the set UUID and member acknowledgement
+identities before signing. The bootstrap set epoch is exactly `1`. A
+verifier-set-update uses checked current epoch plus one and a new set UUID;
+every other transition retains the predecessor set bytes and digest. Rollback,
+skip, wrap, fork publication, UUID reuse, or a same-epoch changed set fails
+closed. Define the semantic digest:
+
+```text
+verifier_set_digest =
+  SHA-256("walgit-credential-verifier-set-digest-v1" ||
+          u32be(len(exact_untagged_verifier_set_COSE_Sign1_bytes)) ||
+          exact_untagged_verifier_set_COSE_Sign1_bytes)
+```
+
+The credential acknowledgement set is one deterministic-CBOR map with a
+maximum of 65,536 bytes and exactly these numeric keys:
+
+| Key | Presence and exact value |
+|---:|---|
+| 1 | required unsigned schema version, exactly `1` |
+| 2 | required `verifier_set_digest`, 32-byte byte string |
+| 3 | required `transition_projection_digest`, 32-byte byte string |
+| 4 | required unsigned transition kind, exactly the proof key 3 value |
+| 5 | required unsigned binding kind: `1` bootstrap or `2` predecessor |
+| 6 | bootstrap only: bootstrap-session UUIDv7, 16-byte byte string |
+| 7 | predecessor only: full physical credential-control key, 1–1,024 ASCII bytes |
+| 8 | predecessor only: `ObjectVersionID`, 1–1,024 bytes |
+| 9 | predecessor only: exact-body SHA-256 digest, 32 bytes |
+| 10 | predecessor only: exact-body size, unsigned 1–65,536 |
+| 11 | required array of 1–64 acknowledgement-member maps |
+
+An acknowledgement-member map has exactly these numeric keys:
+
+| Key | Presence and exact value |
+|---:|---|
+| 1 | required member ID byte string, 1–256 bytes |
+| 2 | required positive unsigned 64-bit membership epoch |
+| 3 | required unsigned role bit mask, 1–15 |
+| 4 | required acknowledgement time, signed 64-bit Unix seconds |
+| 5 | promote-next issuer only: last issued-at, signed 64-bit Unix seconds |
+| 6 | required strict Ed25519 signature, 64-byte byte string |
+
+The acknowledgement rows have exactly the verifier-set member count and the
+same order. Their member ID, membership epoch, and role mask equal the matching
+verifier member. Key 5 is present if and only if the transition is promote-next
+and the role mask contains the issuer bit. It is not later than key 4. For an
+issuer that emitted no envelope, key 5 is the current ring issued-at value.
+Binding kind `1` is valid only for transition kind bootstrap, requires key 6,
+and rejects keys 7–10. Binding kind `2` is required for every other transition,
+requires keys 7–10, and rejects key 6.
+
+Let `acknowledgement_binding_bytes` be the exact deterministic-CBOR encoding of
+acknowledgement-set keys 1–10, omitting key 11. Let
+`unsigned_acknowledgement_member_bytes` be the exact deterministic-CBOR encoding
+of that member's keys 1–5, omitting key 6. Each member signature uses its bound
+acknowledgement public key and strict RFC 8032 over these exact bytes:
+
+```text
+"walgit-credential-member-ack-v1" ||
+u32be(len(acknowledgement_binding_bytes)) || acknowledgement_binding_bytes ||
+u32be(len(unsigned_acknowledgement_member_bytes)) ||
+unsigned_acknowledgement_member_bytes
+```
+
+Every signature must verify. Unknown, missing, duplicate, extra, reordered, or
+wrong-member rows fail closed. Define:
+
+```text
+acknowledgement_set_digest =
+  SHA-256("walgit-credential-acknowledgement-set-digest-v1" ||
+          u32be(len(exact_acknowledgement_set_bytes)) ||
+          exact_acknowledgement_set_bytes)
+```
+
+#### Credential transition proof
+
+Every credential-control Create or CAS carries one
+`CredentialTransitionProof`. First form `transition_projection_bytes` as the
+exact deterministic protobuf encoding of the proposed `CredentialControl`
+fields 1–9 in tag order. Field 10,
+`acknowledgement_proof_digest`, is absent. No proposed `CasToken`, object key,
+`ObjectVersionID`, object digest, object size, provider response, or other
+metadata assigned by the future Create or CAS is part of the projection. All
+normal field bounds, presence rules, ordering rules, and semantic validation
+apply before projection. Define:
+
+```text
+transition_projection_digest =
+  SHA-256("walgit-credential-control-transition-v1" ||
+          u32be(len(transition_projection_bytes)) ||
+          transition_projection_bytes)
+```
+
+The proof is untagged `COSE_Sign1` signed by the same pinned Ed25519 root that
+signs verification rings. Its protected header is the exact
+deterministic-CBOR map `{1: -8, 4: root_kid}`. Its unprotected header is the
+exact empty map. Its external AAD is the exact ASCII bytes
+`walgit-credential-transition-proof-v1`. The decoded deterministic-CBOR payload
+is at most 7,680 bytes, contains no text strings, and uses these numeric keys:
+
+| Key | Presence and exact value |
+|---:|---|
+| 1 | required unsigned schema version, exactly `1` |
+| 2 | required proof UUIDv7, 16-byte byte string |
+| 3 | required unsigned transition kind: `1` bootstrap, `2` install-next, `3` promote-next, `4` retire-previous, `5` revoke-kid, `6` verifier-set-update, or `7` acknowledgement-update |
+| 4 | required issued-at, signed 64-bit Unix seconds |
+| 5 | required not-before, signed 64-bit Unix seconds |
+| 6 | required expiry, signed 64-bit Unix seconds |
+| 7 | required domain-separated `verifier_set_digest`, 32-byte byte string |
+| 8 | required domain-separated `acknowledgement_set_digest`, 32-byte byte string |
+| 9 | required `transition_projection_digest`, 32-byte byte string |
+| 10 | required unsigned projection byte length, 1–65,536 |
+| 11 | non-bootstrap only: predecessor full physical credential-control key, 1–1,024 ASCII bytes |
+| 12 | non-bootstrap only: predecessor `ObjectVersionID`, 1–1,024 bytes |
+| 13 | non-bootstrap only: predecessor exact-body SHA-256 digest, 32 bytes |
+| 14 | non-bootstrap only: predecessor exact-body size, 1–65,536 |
+| 15 | bootstrap only: cutover bootstrap-session UUIDv7, 16-byte byte string |
+
+Keys 1–10 are always present. Bootstrap has key 15 and omits keys 11–14.
+Every other kind has keys 11–14 and omits key 15. No other key, variant, or
+empty substitute is valid. Key 7 equals proposed field 9. Keys 9 and 10 equal
+the digest and length recomputed from the proposed control after removing only
+field 10. For a non-bootstrap transition, keys 11–14 equal the exact currently
+bound predecessor; for bootstrap, key 15 equals the bootstrap plan session.
+The verifier recomputes key 7 from the retained exact root-signed verifier-set
+envelope and key 8 from the retained exact acknowledgement-set bytes. It then
+verifies every acknowledgement row and requires both retained sets to bind the
+same projection, transition kind, and predecessor or bootstrap session as this
+proof. The verifier-set issued-at and every acknowledgement time are not later
+than proof issued-at; every acknowledgement time is within the proof's
+not-before-to-expiry interval. A supplied digest without its exact retained
+bytes fails closed.
+
+The root uses strict RFC 8032 verification. Deterministic-CBOR rejection rules
+for create intents apply unchanged. The proof requires
+`issued_at <= not_before <= expiry`, has a maximum ten-minute lifetime and
+30-second skew, and its UUIDv7 timestamp is within 30 seconds of issued-at.
+Cloud Core permanently reserves each proof UUID before signing. The exact
+proof envelope may retry only the same predecessor and projection. Reusing its
+UUID with changed bytes, using a stale predecessor, changing the projection,
+or replaying it after another transition fails closed.
+
+After proof verification, set proposed field 10 to
+`SHA-256(exact_untagged_CredentialTransitionProof_COSE_Sign1_bytes)` and encode
+the final deterministic `CredentialControl`. The proof never includes that
+field or metadata assigned to the resulting object, so neither the signature
+nor either digest is self-referential. The final control may differ from the
+validated projection only by field 10. Its conditional Create or CAS is still
+the sole credential commit point.
+
+Cloud Core's credential authority permanently retains the exact untagged
+verifier-set envelope, acknowledgement-set bytes, and untagged transition-proof
+envelope by their digests for recovery and audit. WalGit receives all three
+exact byte strings during Create or CAS, recomputes proof keys 7 and 8, verifies
+their signatures and bindings, and persists only the verifier-set and proof
+digests in `credential_control`. Retained evidence bytes are not bucket objects,
+mutable authorities, or alternate commit points.
+
+Each transition kind permits only its named state change plus
+`control_revision + 1` and the new field-10 proof digest. Install-next adds the
+one checked descendant and changes no issuer epoch. Promote-next performs the
+slot move above and increments `issuer_epoch` by one. Retire-previous removes
+the slot and timestamp, appends its data `kid` values to the deny set, and
+increments `issuer_epoch` by one if that set grows. Revoke-kid appends exactly
+one previously absent bound `kid` and increments `issuer_epoch` by one.
+Verifier-set-update changes only field 9. Acknowledgement-update changes no
+field in the projection except `control_revision`. Bootstrap uses only the
+frozen values above. Combining kinds or changing another field fails closed.
+
+Rotation first writes immutable `next`, CASes it into `credential_control`, and
+preloads it on every issuer and verifier. During preload, verifiers accept
+`current` and `next`, but the issuer signs only with `current`. A signed proof
+that every serving instance, writer, issuer, and other verifier loaded the
+exact control version is required before promotion. Each issuer then fences
+old-current issuance, reports its last issued-at value, and cannot issue again
+until it observes the promoted exact control version. The signed
+acknowledgement proof covers that complete issuer fence and verifier set. Its
+digest is written by the one atomic credential-control CAS that promotes
+`next` to `current` and moves the old `current` to `previous`.
+`previous_last_issue_unix_seconds` is the maximum attested issued-at value
+across all fenced issuers; when no issuer used the ring, it is the ring's
+issued-at value. The issuer then signs only with the new `current`; verifiers
+accept only the explicitly bound `current`, optional `next`, and optional
+`previous`. An issuer cannot emit a late old-ring envelope after the proof.
+
+There is at most one `previous`. Another promotion cannot occur while that slot
+is occupied. Its removal CAS is allowed only after the recorded last issue plus
+the maximum 15-minute capability lifetime plus 30 seconds of skew, and after a
+signed verifier proof confirms that no accepted unexpired envelope needs it.
+Unknown, unbound, stale, invalidly signed, broken-chain, wrong-audience,
+wrong-issuer, invalid-time, duplicate, or unsorted ring data fails closed.
+
+A revocation CAS adds the `kid` to the global deny set, which overrides all
+three ring slots. Cloud Core must distribute the exact new credential-control
+version and collect acknowledgements from every verifier within 30 seconds.
+Every verifier renews readiness against the current version; a verifier that
+does not acknowledge within 30 seconds leaves readiness and cannot serve or
+mutate. The root-signed kind-7 proof and its acknowledgement-update CAS bind
+those post-revocation acknowledgements. Only after that CAS can Cloud Core
+report revocation complete.
+Root-key rotation requires its own signed cutover or deployment ceremony. Ring
+rotation changes credential authority, not repository state or terminal
+`cutover_control`.
+
+### Lifecycle, visibility, and grants
 
 Lifecycle is `ACTIVE -> DELETING -> TOMBSTONED`. `DELETING` immediately blocks
 new user reads and writes and disappears from discovery. Only the fenced writer
@@ -153,10 +967,11 @@ after contention. A revocation that wins the CAS prevents a stale mutation
 from retrying.
 
 Configured static tokens use fixed-size prehashed values and constant-time
-comparison across the full configured set. Issued token MAC verification stays
-constant-time. Effective settings and every describe or dump surface expose
-only an allowlist and never serialize authentication, OAuth, broker, webhook,
-store, or session secrets.
+comparison across the full configured set. Any legacy issued-token MAC
+verification stays constant-time. V2 capabilities use the signed contract
+above. Effective settings and every describe or dump surface expose only an
+allowlist and never serialize authentication, OAuth, broker, webhook, store, or
+session secrets.
 
 ### One writer, epoch, and lease
 
@@ -189,6 +1004,71 @@ Versioning is mandatory. Every durable root records key, `ObjectVersionID`,
 digest, and size. Recovery and reclamation use exact-version HEAD, GET, and
 delete. They never treat an ETag or `CasToken` as a historical identity.
 
+Production eligibility for this AWS-native hard cut requires a general-purpose
+Amazon S3 bucket with versioning enabled before the gate and a fresh deployment
+prefix whose complete expected bootstrap history fits in one nontruncated
+`ListObjectVersions` response. The gate treats that strongly consistent
+completed-version inventory, conditional single-part writes, and exact-version
+reads as authoritative. It does not treat multipart-upload enumeration as
+authority. GCS remains supported for development and non-production contracts.
+Its non-production exact-delete contract requires Object Versioning enabled and
+soft-delete retention zero. The AWS-native production gate also depends on AWS
+Roles Anywhere activation, so GCS evidence cannot satisfy it.
+
+### Production bucket administrative safety
+
+Production pre-provisions and then freezes the bucket configuration used by the
+deployment prefix: versioning, lifecycle, encryption and KMS retention, the
+bootstrap role, the prefix-scoped runtime role, the bucket policy, the Roles
+Anywhere trust anchor, and a dedicated runtime profile. Runtime serving,
+writer, recovery, and reclamation identities cannot change that configuration.
+The profile is created disabled and has never been enabled. No other enabled
+profile or role-assumption path can issue credentials for the runtime role.
+These are trusted provisioning preconditions, not facts inferred from an IAM
+propagation wait or an audit log.
+
+`bucket_admin_control` is the global safety authority. It records an epoch,
+state, exact safety-configuration digest, proof digest, and the allowed
+administrative principal and policy digests. The safety digest is
+`SHA-256("walgit-bucket-safety-v1" || deterministic_cbor(config))`. The CBOR map
+uses integer keys 1–21 for schema version, provider account, endpoint, region,
+bucket, prefix, versioning state, lifecycle-rules digest,
+abandoned-multipart-days, encryption mode, KMS key ID, KMS key version, KMS
+retention seconds, object-version retention seconds, object-lock state, bucket
+policy digest, IAM policy digest, organization-policy digest, administrative
+principal-set digest, bootstrap-data-policy digest, and runtime-credential-
+authority digest. The last digest binds the dedicated role, disabled profile,
+trust anchor, certificate identity, and absence of another assumption path.
+IDs are bounded byte strings, times are unsigned 64-bit integers, enums
+are unsigned integers, and digests are exactly 32 bytes. Each nested rule or
+principal set is deterministic CBOR sorted by its encoded bytes; its field is
+the SHA-256 digest of those exact bytes. The digest preimage uses the complete
+RFC 8949 deterministic encoding of this map. Duplicate keys, indefinite-length
+items, floats, non-shortest encodings, non-canonical map order, unknown keys,
+missing keys, and trailing bytes fail closed.
+
+The bootstrap controller reads back the current configuration and roots its
+exact digest. That readback proves only what the AWS control plane reports at
+that instant. It does not prove IAM convergence, historical non-use, or the
+absence of a request that AWS admitted earlier. The hard cut therefore makes no
+IAM or bucket-policy change during bootstrap. It gets safety from a never-used
+prefix, no obtainable runtime credential, a bootstrap role that cannot start
+multipart uploads or delete versions, and conditional `PutObject` enforcement.
+
+The active bucket configuration is immutable in this slice. A later change that
+needs credential revocation or an IAM-policy transition requires a separate
+fenced-outage protocol and PR3 evidence. Until that protocol exists, the
+controller must fail closed instead of claiming that an IAM readback or elapsed
+time proves convergence. Terminal `cutover_control` does not change.
+
+Immediately before every `repo_control` publication and every reclamation
+delete, the actor reads the current exact `bucket_admin_control`, requires
+`STABLE`, and requires the frozen safety digest and runtime credential binding.
+Each published control version binds the bucket-admin epoch and safety digest.
+Readiness performs the same validation and fails on drift, an unavailable
+readback, a stale credential binding, or a non-`STABLE` state. This detects
+drift; it does not make an out-of-band IAM change synchronously safe.
+
 Ordinary request and maintenance paths cannot delete noncurrent versions. A
 writer-fenced typed reclaimer can exact-version-delete a catalog-proven
 unreachable version only after receipt, event, capacity, pin, recovery, and
@@ -198,33 +1078,112 @@ abort abandoned multipart uploads, but they cannot expire protected object
 versions. KMS key retention exceeds the maximum retained object-version
 horizon.
 
+Normal recovery and reclamation version enumeration requests at most 1,000
+entries per provider page. One bounded invocation processes at most 1,000 pages
+and stores a continuation cursor of at most 4,096 bytes before it resumes.
+Runtime cursors are rooted in control. Bootstrap is intentionally narrower: it
+accepts exactly one nontruncated `ListObjectVersions` page and fails if the
+expected graph does not fit. A one-page `ListMultipartUploads` call is only
+anomaly evidence. A nonempty or truncated result fails the gate, but an empty
+result is not part of the authoritative zero-data proof.
+
 ### Mutation receipt and settlement
 
-Every mutation with an external obligation creates an unresolved receipt core
-before the publishing CAS. The core binds the mutation ID, mutation kind,
+Every non-settlement repository mutation creates an unresolved receipt core
+before the publishing CAS. This includes mutations whose capacity and event
+obligations are both `NONE`, and Create with an explicit prior-control `NONE`.
+`INTERNAL_SETTLEMENT` is the only receiptless CAS and is forbidden in receipt
+rows. The core binds the mutation ID, mutation kind, a domain-separated digest
+of the exact request,
 prior `CasToken`, prior control `ObjectVersionID` or explicit `NONE` for
-Create, writer epoch, reservation ID, WAL sequence, and every immutable
-dependency digest. The candidate control roots the immutable receipt catalog.
+Create, the prior authorizing writer-fence epoch, WAL sequence, and every
+immutable dependency digest. For `WRITER_TAKEOVER`, the receipt therefore
+binds epoch E while the result binds the landed control at epoch E+1. It
+has two closed tagged unions:
+
+- capacity obligation is `NONE` or `CAPACITY`, where `CAPACITY` binds the exact
+  capacity-control epoch, shard key, shard `ObjectVersionID`, reservation ID,
+  tenant slice, mutation ID, and byte count; and
+- event obligation is `NONE` or `EVENT`, where `EVENT` binds the exact event
+  UUID, WAL sequence, subscriber-set digest, deterministic result key, and every
+  precomputed subscriber-body digest and size.
+
+No absent obligation is represented by an empty or guessed identifier. The
+candidate control roots the immutable receipt catalog.
+
+The exact request digest is:
+
+`SHA-256("walgit-repository-mutation-request-v1" || kind_u32_be || request_length_u64_be || exact_request)`.
+
+The domain has exactly the shown ASCII bytes and no terminator. `kind_u32_be`
+is the frozen nonnegative `MutationKind` value in four-byte big-endian form.
+`request_length_u64_be` is the exact request byte length in eight-byte
+big-endian form. The implemented request forms are closed:
+
+- `SETTINGS`: `exact_request` is the raw inline settings byte string.
+- `GRANTS`: `exact_request` is `count_u32_be`, followed in caller order by
+  `issuer_length_u32_be || issuer || subject_length_u32_be || subject ||
+  role_i32_be` for every grant. Caller order is digest-bound. Duplicate
+  `(issuer, subject)` entries are rejected; they are not sorted or collapsed.
+- `WRITER_TAKEOVER`: the frozen future request form is the raw new-holder byte
+  string. The dormant public capability API cannot execute this mutation. A
+  future implementation must supply a sealed lease/writer coordination
+  authority rather than an administrator capability.
 
 The successful control CAS decides repository state. A timeout or lost response
 does not make a landed CAS fail. After the CAS, an immutable result envelope at
-a deterministic mutation-ID key records the result control key,
-`ObjectVersionID`, digest, and size. This envelope is proof only. It cannot
-publish, authorize, charge capacity, emit an event, or change repository state.
+a deterministic mutation-ID key records the successful target
+`repo_control` key, `ObjectVersionID`, digest, and size. These fields identify
+the landed control version, not the result envelope itself. The envelope is
+proof only. It cannot publish, authorize, charge capacity, emit an event, or
+change repository state.
 
-Every later control version carries every unresolved receipt. A serialized
-internal-settlement control CAS roots the exact result envelope before it
-removes the unresolved core. Settlement waits until the related capacity state
-is terminal and the event envelope and archive are verified. The settlement
-CAS has no external obligation, creates no recursive unresolved receipt, and
-records its own mutation ID in control. If its outcome is ambiguous, the writer
-must resolve it with a fresh exact read before another CAS.
+No unrelated, takeover, or maintenance CAS may follow an unresolved receipt.
+After the successful mutation result envelope is materialized, a serialized
+internal-settlement control CAS roots that exact result and changes the receipt
+catalog row from `UNRESOLVED` to `SETTLED`. It records the exact settlement
+mutation ID in the row. The full row remains rooted
+indefinitely; settlement does not remove it. Settlement waits for a terminal capacity state
+only when the tag is `CAPACITY`. It waits for the event result, exact archives,
+and control-rooted archive watermark only when the tag is `EVENT`. A `NONE`
+obligation adds no wait. The settlement CAS has no external obligation, creates
+no recursive unresolved receipt, and records its own mutation ID in control.
+If its outcome is ambiguous, the writer must resolve it with a fresh exact read
+before another CAS.
 
 An event core does not contain its future result `ObjectVersionID`. A resolved
 envelope supplies that value after publication. Checkpoint, compaction, and
-receipt-catalog compaction cannot drop the core before the resolved envelope
-and required archive exist. A bounded receipt catalog applies backpressure
-before it reaches its limit.
+receipt-catalog compaction cannot remove a settled row. A flat bounded receipt
+catalog applies backpressure at 4,096 rows or the 512 KiB (524,288-byte)
+encoded bound,
+whichever comes first. Admission reserves space for the unresolved row's
+maximum valid settled result before the publishing CAS. A later evolution can
+replace this lower limit only with a separately specified canonical compaction rule.
+
+The persisted `MutationKind` numeric values are frozen:
+
+| Value | Kind |
+| ---: | --- |
+| 0 | `UNSPECIFIED` |
+| 1 | `CREATE` |
+| 2 | `PUSH` |
+| 3 | `REF_UPDATE` |
+| 4 | `LFS_FINALIZE` |
+| 5 | `POLICY` |
+| 6 | `SETTINGS` |
+| 7 | `GRANTS` |
+| 8 | `LIFECYCLE` |
+| 9 | `CHECKPOINT` |
+| 10 | `COMPACTION` |
+| 11 | `BUNDLE` |
+| 12 | `FOLLOW` |
+| 13 | `IMPORT` |
+| 14 | `REPAIR` |
+| 15 | `PIN` |
+| 16 | `EVENT` |
+| 17 | `RECLAMATION` |
+| 18 | `WRITER_TAKEOVER` |
+| 19 | `INTERNAL_SETTLEMENT` |
 
 ### Finite quota, capacity, and reclamation
 
@@ -234,32 +1193,195 @@ Duplicate content does not charge twice. Derived packs, bundles, checkpoints,
 temporary uploads, and recovery copies use separate system capacity. Global
 allocatable capacity excludes computed system and emergency reserves.
 
-Capacity uses a fixed, bounded set of repository-hashed shards. Shards are
-idempotent, bounded, and reconciled. They are not repository authority and
-cannot publish roots or authorize work. One writer means a repository has at
-most one active reservation.
+Capacity uses the fixed repository-hashed shards and the CAS-owned
+`capacity_control` allocation authority. Every `STABLE(e)` control version
+contains one global allocatable byte budget, one exact tenant-allocation catalog
+root, and exactly 256 binary-sorted shard budgets with exact epoch-start shard
+key, `ObjectVersionID`, digest, and size proofs. The checked shard-budget sum is
+no more than global allocatable capacity. A capacity shard binds the allocation
+epoch and its immutable budget. It cannot change that budget within the epoch.
+The first byte of `SHA-256(repository_uuid)` selects the shard.
+
+Each shard has a separate binary-sorted current tenant-account table. Every
+tenant with retained non-`ABORTED` usage has exactly one account, no account is
+extraneous, and its positive current slice is no greater than the immutable
+shard budget. Checked `RESERVED + COMMITTING + CHARGED` usage must fit both the
+current account and shard budget. Historical reservation rows retain their
+original allocation epoch and tenant slice without rewriting. Therefore rows
+from older epochs remain exact receipt proofs after redistribution, and mixed
+historical slices are valid when their aggregate fits the current account.
+`ABORTED` does not charge and an `ABORTED`-only tenant has no account.
+The future controller uses two distinct exact shard-object gates. The retained-
+budget gate loads the body rooted by the matching
+`CapacityShardBudget.shard_object` and binds its shard, prior allocation epoch,
+and budget. It works for `STABLE` and for the retained prior plan in both
+`PREPARING/DRAINING` and `PREPARING/APPLYING`. The mutable-current gate instead
+binds the loaded body to caller-observed provider key, `ObjectVersionID`,
+digest, and size, then compares shard, retained current epoch, and budget. It
+does not compare that mutable metadata with the historical STABLE epoch-start
+proof. After exact page and current-shard loads, the current-shard-view
+validator composes the mutable gate, requires every account to equal that
+tenant's exact page slice for the selected shard, and requires every current-
+epoch non-`ABORTED` reservation to repeat the same slice. Historical terminal
+rows keep their earlier proof slice. The admission-specific wrapper
+additionally requires `STABLE`. The composed STABLE successor gate binds that
+entire predecessor view, a legal transition at caller-observed `now`, and the
+candidate shard against the same page, epoch, and budget. The composed
+`PREPARING/DRAINING` gate permits only `RESERVED -> ABORTED(expired)`,
+`COMMITTING -> CHARGED`, or `COMMITTING -> ABORTED(conflict)`. It rejects new
+rows and `RESERVED -> COMMITTING`. Lower-level object, account, and successor
+validators are insufficient for publication on their own.
+
+Redistribution uses the closed control states and phases
+`STABLE(e) -> PREPARING/DRAINING(e+1) -> PREPARING/APPLYING(e+1) ->
+STABLE(e+1)`. The first control CAS retains the complete prior stable plan,
+binds the proposed catalog, global budget, and 256 shard budgets, and installs
+the exact global writer plus UUIDv7 admission fence. Only terminal reservation
+transitions are allowed while draining. The future controller must exact-load
+the current and proposed pages and run the cross-object validator so the sum of
+all tenant slices in each shard column fits that plan's shard budget.
+References alone cannot prove page contents.
+
+After it proves that all 256 exact current shards contain zero `RESERVED` or
+`COMMITTING` rows, the second control CAS enters `APPLYING` and binds exactly
+256 drained baseline proofs. A drained baseline retains the prior allocation
+epoch, budget, shard identity, and key, but its provider version, digest, and
+size can be newer than the historical `STABLE(e)` epoch-start proof because
+terminal transitions mutated the shard. The exact-baseline validator binds the
+loaded body to that proof, rechecks prior epoch and budget, and rejects any
+remaining nonterminal row. Each successor is deterministic from
+that exact drained body and the target plan: it preserves every terminal
+reservation byte-for-byte and replaces current tenant accounts with the exact
+target-page slices after proving they cover retained usage. Recovery accepts a
+shard only at its exact baseline or at that deterministic successor. A successful advance
+finishes with `STABLE(e+1)` binding all 256 exact new epoch-start successor
+proofs. A successful reversion first restores and exactly verifies every
+changed shard, then publishes `STABLE(e)` with the exact restored proofs; it
+does not reuse historical epoch-start `ObjectVersionID` values. A crash or
+ambiguous CAS stays fenced and never admits across mixed epochs.
+
+Shards are idempotent, bounded, and reconciled. They are not repository
+authority and cannot publish roots or authorize work. There is at most one
+`RESERVED` or `COMMITTING` row per repository. Commit-bearing rows also reject
+reuse of one mutation ID within the same repository, while another repository
+can use the same UUID in its independent namespace.
 
 A reservation moves through these states:
 
-1. `RESERVED` is provisional and can expire.
-2. `COMMITTING` is non-expiring and binds the expected control `CasToken` and
-   `ObjectVersionID`, writer epoch, mutation ID, kind, and exact byte count.
+1. `RESERVED` is provisional. It records explicit creation and expiry seconds,
+   with `created < expires` and a checked maximum lifetime of 900 seconds. The
+   shard successor validator receives caller-observed `now` and accepts a new
+   row only when `created <= now < expires`; it rejects future-dated creation.
+   No validator reads a clock.
+2. `COMMITTING` is non-expiring and binds writer epoch, mutation ID, kind, and
+   a closed predecessor. `CREATE` requires explicit `NONE`; every other
+   non-settlement kind requires the prior control `CasToken` and
+   `ObjectVersionID`.
 3. The writer publishes immutable payloads and then CASes `repo_control`.
 4. `CHARGED` records the successful control publication exactly once.
-5. `ABORTED` releases capacity only when durable historical proof shows that
-   another mutation won and the expected CAS can no longer succeed.
+5. `ABORTED` releases capacity through one explicit proof arm. Expiry repeats
+   the original creation/expiry window and records an observed `now >= expiry`.
+   Conflict repeats the exact commit binding and records the durable conflicting
+   landed control and mutation that makes the expected CAS impossible.
+
+The public shard successor validator accepts a byte-exact retry without a new
+revision. Every real successor advances `control_revision` by exactly one and
+changes exactly one reservation through `RESERVED -> COMMITTING`,
+`RESERVED -> ABORTED(expired)`, `COMMITTING -> CHARGED`, or
+`COMMITTING -> ABORTED(conflict)`. It preserves the shard, allocation epoch,
+budget, immutable reservation fields, all untouched rows, and all unaffected
+accounts. `RESERVED -> COMMITTING` requires
+`created_at <= observed_now < expires_at`. Expiry repeats the exact reserved
+window and binds the supplied observed `now`. Terminal rows and same-state rows
+cannot change.
+
+CHARGED and conflicting-commit ABORTED require public composition gates. Both
+exact-bind the prior COMMITTING shard body to caller-observed provider metadata,
+locate the exact reservation row, and bind every prepared receipt
+`CapacityObligation` field to that row and shard object. CHARGED additionally
+strict-loads the landed `RepoControl` and its exact flat receipt catalog. The
+catalog gate validates its content-addressed key, canonical body digest and
+size, flat-root counts, identity, one-unresolved maximum, and the exact
+representation of `last_internal_mutation_id`. The CHARGED mutation must be
+the rooted receipt row. Writer takeover binds landed epoch `E+1`; other
+CHARGED mutations bind `E`.
+
+A conflict gate accepts the prepared expected receipt separately because the
+failed candidate control never rooted it. It proves that expected mutation is
+absent as both a receipt and settlement ID in the exact current catalog, while
+the conflicting current ID is represented by that catalog. The durable
+`CapacityConflictClass` is closed and corroborated by the exact current
+control. `CREATE_CONTROL_EXISTS` requires Create with explicit `NONE` and
+accepts any control at the same derived by-path key, including an exact
+same-identity occupancy or a different-identity routing-key collision.
+`SAME_WRITER_VERSION_ADVANCED` requires non-Create with an exact prior,
+different landed `ObjectVersionID`, the same identity, and loaded writer epoch
+`E`. `WRITER_EPOCH_ADVANCED` requires the same facts at an exact typed-current
+writer epoch strictly greater than `E`. It accepts `E+1` and later epochs
+because successive takeovers can land and settle while this external
+COMMITTING row remains unresolved. Every arm binds canonical control
+key/body/digest/size and its current last mutation. The conflict proof must
+originate from a typed current provider GET at the abort decision. Its stored
+object version supports later exact replay, but protobuf validation alone
+cannot prove provider currentness.
 
 A lost result after the control CAS is success. Reconciliation uses the
 control receipt and exact object version to finish `CHARGED`. It resumes a
-still-possible `COMMITTING` reservation and never aborts it because of a clock
-or timeout. Concurrent shard reservations cannot exceed allocatable capacity.
+still-possible `COMMITTING` reservation and never aborts that non-expiring state
+because of a clock or timeout. `RepoControl.CapacityBinding` is the
+repository's last exact capacity witness, not a claim about the current shared
+shard. Admission independently loads the current hashed shard and compares its
+epoch, key, budget, and tenant slice. Receipt `CapacityObligation` binds the
+exact `COMMITTING` shard `ObjectVersionID`; settlement advances the repository
+binding to the exact `CHARGED` shard version.
+
+The current dormant tracer adds strict typed store loads plus only RESERVED
+admission and expiry. Admission starts from an exact strict
+`StoredRepoControl`; repository identity and tenant are never caller fields.
+Admission requires ACTIVE. Expiry also accepts a strict DELETING or
+TOMBSTONED control so a retained RESERVED row cannot block reclamation or
+capacity drainage.
+It derives the shard as the first byte of `SHA-256(repository_uuid)`, then loads
+current `CapacityControl`, its exact tenant-page `ObjectVersionID`, and the
+mutable current shard. The page and shard GETs run in parallel after the
+control GET. Admission requires STABLE and runs the complete composed gate
+before one conditional shard PUT. A new expiry transition can also run during
+PREPARING/DRAINING, but APPLYING rejects that write. After the complete current
+view validates, an exact already-expired replay remains idempotent during
+APPLYING or a later STABLE epoch and returns without a PUT. During APPLYING,
+the replay exact-loads the rooted drained baseline and target tenant page when
+needed. It accepts only the exact baseline object or the deterministic target
+successor derived from that baseline, target page, target epoch, and target
+budget. Unrelated or unproved target-epoch bodies fail closed. Expiry repeats
+the stored reservation window and records caller-supplied `now`; no code reads
+a clock.
+
+`CapacityReservationPurpose::{GitWrite,LfsFinalize}` is a closed domain-only
+admission discriminator. RESERVED persists fungible bytes, not purpose, and
+does not authorize repository work. A future runtime and COMMITTING slice must
+bind the discriminator to an authenticated capability and `MutationKind`.
+This tracer has no COMMITTING/CHARGED path, receipt integration, capacity-plan
+writer, initialization fallback, provider-specific operation, server/CLI/config
+route, V1 adapter, or runtime reader/writer. It also does not close the
+cross-key race between capacity-control admission fencing and a shard CAS;
+mixed-epoch runtime safety remains a future controller requirement. The
+boundary is greenfield: no production V2 capacity objects exist, no migration
+or mixed-version behavior is supported, and activation requires a later hard
+cut with all readers and writers on the same contract. Recovery for this
+dormant slice is code revert only.
 
 Reclamation is typed, bounded by objects and bytes per pass, and resumable from
-a control-rooted cursor. Candidate classes are closed enums, never caller
-prefixes. The protection closure includes current WAL roots, all immutable
-catalogs, LFS ownership, pins, event and recovery catalogs, and their exact
-versions. Every delete names an expected `ObjectVersionID`. Capacity refunds
-only after a verified delete. Identity and control are never reclaimed.
+a control-rooted cursor. A pass exact-version-deletes at most 1,000 objects and
+at most 5 TiB. It stops before either next item would exceed a limit and roots
+the next cursor. Candidate classes are closed enums, never caller prefixes. The
+protection closure contains catalogs and payloads currently rooted by control,
+their transitively rooted children, and exact versions retained by unresolved
+receipt, event, capacity, pin, recovery, reclamation, or retention obligations.
+An unrooted historical catalog is not protected merely because it once existed.
+It becomes reclaimable only after the typed traversal proves that no current or
+retained obligation reaches it. Every delete names an expected
+`ObjectVersionID`. Capacity refunds only after a verified delete. Identity and
+control are never reclaimed.
 
 ## Future Cloud Core provider contract
 
@@ -298,16 +1420,22 @@ purposes are not interchangeable. Cloud Core preserves per-app webhook secrets,
 provider webhook IDs, pending/active/delete/retry state, and current prepare,
 commit, rollback, and compensation behavior. Secrets remain encrypted through
 the existing envelope and AEAD references. Every operation checks opaque
-tenant, project, repository, generation, and canonical path identity. Errors
-remain bounded and never contain credentials or remote response bodies.
+tenant, project, repository, generation, canonical path bytes,
+`canonical_path_digest`, and `routing_digest`. Errors remain bounded and never
+contain credentials or remote response bodies.
 
 ## Future capabilities and read authorization
 
-A capability binds tenant, project, repository UUID, generation, purpose,
-token identity, authorization epoch, and expiry. Mutations reauthorize against
-the exact control version they CAS. New reads check current control visibility,
-lifecycle, grants, and authorization epoch. In-flight reads have a bounded
-timeout after revocation or deletion.
+A capability uses the signed envelope above. It binds tenant, project,
+repository UUID, generation, canonical path, `canonical_path_digest`,
+`routing_digest`, purpose, token identity, authorization epoch, expiry,
+verification-ring epoch and digest, and the issuing control key and
+`ObjectVersionID`, plus the exact repository-grant issuer and subject. Every
+capability-authorized operation matches that grant pair and its required role
+in current control. Mutations reauthorize against the exact control version
+they CAS and repeat the check after contention. New reads check current control
+visibility, lifecycle, exact grant, and authorization epoch. In-flight reads
+have a bounded timeout after revocation or deletion.
 
 WalGit does not issue presigned URLs that outlive repository authorization.
 LFS upload can stream to an immutable candidate, but finalize reauthorizes and
@@ -319,15 +1447,64 @@ cancellation checks.
 
 The publishing control CAS includes a stable event core with repository UUID,
 generation, WAL sequence, mutation ID, and the complete all-ref change set.
-The later immutable result envelope adds the successful control
-`ObjectVersionID`. `PushEvent` is versioned and preserves current repository,
-ref, branch, before, after, commit, pusher, forced, created, deleted, and
-compare semantics. Only branch events start builds. Tags and other ref events
-remain observable but do not enqueue a build.
+One atomic ref transaction has at most 256 changes, all inline. A larger
+transaction fails as `REF_TRANSACTION_TOO_LARGE` before any durable write; no
+chunked event publication exists. The later immutable result
+envelope adds the successful control `ObjectVersionID`. `PushEvent` is versioned
+and preserves current repository, ref, branch, before, after, commit, pusher,
+forced, created, deleted, and compare semantics. Only branch events start
+builds. Tags and other ref events remain observable but do not enqueue a build.
+
+Before any candidate payload, receipt, reservation, or control write, the
+writer freezes the set of at most 64 active subscribers and computes the exact
+webhook body for every subscriber. `exact_body_bytes` is the RFC 8785 JSON
+Canonicalization Scheme encoding of that subscriber's versioned `PushEvent`;
+ref changes are ordered by binary ref-name bytes and duplicate ref names are
+invalid. Every body must be at most 1,048,576 bytes. Any oversized or
+non-deterministic body rejects the whole ref transaction as
+`EVENT_BODY_TOO_LARGE` or `EVENT_ENCODING_INVALID`. No partial ref transaction
+or event is durable.
 
 An ordered cursor controls delivery only. It never decides repository
-correctness. Fresh HMAC material authenticates every retry while the stable
-event ID preserves idempotency.
+correctness. The only delivery transport is an HTTPS `POST` to the registered
+callback. HTTP, redirects, queues, polling, and alternate methods are not
+delivery substitutes. A callback URL cannot contain user information, a query,
+or a fragment. TLS and callback-host validation fail closed.
+
+Each delivery has the stable 16-byte event UUID and a new unique 16-byte UUIDv7
+delivery ID. Each retry uses a fresh delivery ID, timestamp, and HMAC while the
+event ID stays stable. Let `LP(x) = u32be(len(x)) || x`. The exact HMAC input is:
+
+```text
+LP("walgit-webhook-v1") ||
+LP("POST") ||
+LP(normalized_path) ||
+SHA-256(exact_body_bytes) ||
+event_uuid_raw16 ||
+delivery_uuid_raw16 ||
+i64be(unix_timestamp_seconds) ||
+hmac_kid_raw16
+```
+
+`normalized_path` is the callback URL path only. An empty path becomes `/`.
+Normalization removes RFC 3986 dot segments, uppercases percent-escape hex,
+decodes percent-encoded unreserved bytes, and preserves escaped reserved bytes,
+including `/`. Query and fragment are excluded. The signature is the 32-byte
+`HMAC-SHA256` result, encoded as base64url without padding. The headers are
+`X-WalGit-Event-ID` and `X-WalGit-Delivery-ID` as lowercase canonical UUID
+strings, `X-WalGit-Timestamp` as decimal Unix seconds, `X-WalGit-Key-ID` as 32
+lowercase hex digits, and `X-WalGit-Signature` as that base64url value. The body
+digest covers the exact transmitted bytes.
+
+The receiver accepts a timestamp only within five minutes of its current time
+and keeps a delivery-ID replay entry for at least 15 minutes after first
+acceptance. A duplicate delivery ID is rejected before business processing.
+Webhook HMAC keys are separate from COSE keys and encrypted through the existing
+AEAD references. Each webhook binds exactly one `current` HMAC key and at most
+one `previous` key. Senders use only `current`; receivers accept only the bound
+pair. Rotation preloads the new key, atomically makes it `current`, and retains
+the old key as `previous` for at most 15 minutes after its last issue. A second
+rotation waits until `previous` is removed.
 
 Cloud Core handles one delivery in one database transaction. That transaction
 records an idempotent inbox row and deterministic per-ref and per-subscriber
@@ -335,64 +1512,440 @@ outbox rows. Cloud Core returns 2xx and advances its cursor only after commit.
 Deployment application is idempotent. Retries, crashes during fanout, and
 out-of-order release cannot lose or duplicate deployment effects.
 
-Before enqueue, a build intent pins the primary repository and every named Git
-context through control. It returns pin identity, exact object version, SHA,
-and expiry. The event CAS adds a reachability hold for at least the greater of
-30 days and the full retry horizon. The queue carries exact SHAs, pin IDs,
-object versions, and credential references for every context. There is no
-branch fallback. The runner verifies every pin and SHA before use. Orphan-pin
-reconciliation and LFS dependency closure are mandatory.
+For every build-eligible branch event, at event publication the writer records
+an exact configured
+`event_to_build_intent_delay`, `max_queue_delay`, `retry_horizon`, and
+`max_build_completion_horizon`. The first value is at most 30 days. Each of the
+last three values is at most 30 days, and their sum is at most 90 days. The
+writer defines `ready_deadline = event_publication_time +
+event_to_build_intent_delay`. The publishing event CAS roots a conservative
+primary-repository `event_build_retention_floor = ready_deadline +
+max_queue_delay + retry_horizon + max_build_completion_horizon`. The floor is
+therefore at most 120 days after publication and cannot be shortened. It
+retains the exact primary event after-SHA and its Git and LFS closure through
+that time. It is computed from configuration known at publication; it never
+contains or depends on a future build-intent ID, pin ID, pin expiry, or named-
+context decision.
+Tags, deleted branches, and other non-build events record a terminal `NO_BUILD`
+outcome and do not carry this build-retention floor.
+
+Each immutable subscriber archive body records repository identity, event ID,
+delivery outcome, committed time, subscriber identity, body digest, and
+retention deadline. It does not record its own store identity. Its retention
+deadline is the latest of committed time plus 30 days, the subscriber
+obligation, the full delivery retry horizon, and, when present, the
+control-rooted `event_build_retention_floor`. A verified archive watermark has at most 64
+archive-root references and records the subscriber set, highest complete WAL
+sequence, each archive's exact key, `ObjectVersionID`, digest, and size,
+committed time, and retention deadline. Each reference is at most 4,096 encoded
+bytes, and the complete watermark is at most 524,288 encoded bytes. One
+`repo_control` CAS must root that exact watermark before a checkpoint can
+compact future event state, settlement can mark its receipt `SETTLED`, or
+reclamation can delete any event dependency. The receipt row remains rooted
+indefinitely in this flat-catalog slice. Archive, watermark, settlement, and reclamation
+retention use the conservative event floor. They do not wait for an unknown
+future pin. Missing, ambiguous, expired-but-unverified, or partially archived
+state applies backpressure and remains live.
+
+For a build-eligible branch event, Cloud Core first creates a durable
+`PREPARING` build-intent row in its database. The row binds an idempotency key,
+the exact event and primary event SHA, every named-context selector and
+configuration revision, `ready_deadline`, all four configured horizons, and the
+event retention floor. No build outbox row exists in `PREPARING`.
+
+By `ready_deadline`, every exact primary and named-context pin must exist and be
+recorded. One Cloud Core database transaction then conditionally changes the
+intent from `PREPARING` to `READY` and creates its deterministic exact build
+outbox row. If any pin or record is missing at the deadline, one database
+transaction instead records terminal `NO_BUILD_DEADLINE_EXPIRED` on the event
+and intent and creates deterministic compensation-outbox rows for every partial
+pin. Terminal state permanently rejects a later `READY` transition, pin
+attachment, outbox creation, or enqueue.
+
+Every event-specific pin request binds the build-intent ID and
+`ready_deadline`. WalGit rejects a request admitted at or after that deadline,
+and Cloud Core never accepts a pin result after it. If a pre-deadline pin CAS is
+paused or its result is ambiguous until after terminal state, exact-read
+resolution can classify it only as a compensatable orphan. It cannot satisfy
+the intent or authorize `READY` or enqueue. Reconciliation performs each
+compensation through that repository's fenced `repo_control` CAS. It cannot
+remove a closure retained by another obligation.
+
+A selector is either `EXACT_SHA` or `CURRENT_REF`. The primary event selector
+is `EXACT_SHA` and equals the event's exact after-SHA. A named `CURRENT_REF`
+selector remains unresolved until its build pin CAS. That CAS resolves the ref
+head from the exact `repo_control` version it updates and stores the resolved
+SHA in the pin and intent. No selector is resolved earlier, re-resolved after
+the CAS, or replaced by a branch fallback.
+
+Each configured named `EXACT_SHA` context has a standing, fenced configuration-
+time pin before that configuration becomes eligible for events. The standing
+pin roots the unchanged exact SHA and its Git and LFS closure. Before each event
+can use that configuration revision, Cloud Core proves that the pin expires no
+earlier than that event's `ready_deadline + max_queue_delay + retry_horizon +
+max_build_completion_horizon`; it renews the pin through an exact fenced CAS
+first or keeps the configuration ineligible. The build intent records that
+exact standing pin as its named-context pin by `ready_deadline`.
+
+Configuration removal atomically makes the revision ineligible for new events
+and records its last eligible event and required pin horizon. Reconciliation
+keeps or renews the standing pin through that event's `ready_deadline` plus the
+remaining queue, retry, and completion horizon, then releases it through a
+fenced compensation CAS. Ambiguous renewal or release requires an exact read.
+Removal cannot release a closure retained by a build, event, recovery, or other
+configuration.
+
+Every repository's pin independently roots its exact Git and LFS closure. The
+planned enqueue time is no later than `ready_deadline + max_queue_delay`. Each
+pin expiry is no earlier than the planned enqueue time plus `retry_horizon +
+max_build_completion_horizon`. Queue, retry, and completion horizons still sum
+to at most 90 days. A short pin must be renewed before `READY`; after the
+deadline, the intent becomes terminal instead of renewing or enqueueing late.
+
+The queue carries the recorded exact SHAs, pin IDs, control versions, expiries,
+and credential references for every context. The runner verifies all of them
+before use. Reconciliation resumes a non-expired `PREPARING` intent, performs
+terminal compensation, or repairs the one READY/outbox transaction. It never
+enqueues a partially pinned, expired, terminal, or late build.
 
 ## Future recovery contract and fault model
 
-Recovery restores bottom-up into new immutable target objects and catalogs. A
-signed mapping records every source key and `ObjectVersionID` to its target key
-and `ObjectVersionID`. Target catalogs contain no old references. Recovery
-sets `FENCED` in control, verifies the complete Git, WAL, LFS, event, pin, and
-catalog closure, and publishes the recovered root with one exact final control
-CAS.
+`P || "v2/recovery/recovery_control.pb"` is the sole global recovery authority.
+Its CAS state machine is:
 
-If control is missing, Cloud Core can authorize same-identity recovery only
-with a signed recovery intent under a global fence. Recovery never invents a
-new UUID, generation, tenant, project, or path. An all-version scan proves that
-no restored catalog refers to an old target before the fence is removed.
+```text
+IDLE(g0)
+  -> PREPARING(g1, recovery_id)
+  -> FENCED(g1)
+  -> RESTORING(g1)
+  -> VERIFYING(g1)
+  -> RELEASING_COMMIT(g1)
+  -> IDLE(g2, last_result = COMMITTED)
+
+PREPARING | FENCED | RESTORING | VERIFYING
+  -> REVERTING(g1)
+  -> RELEASING_ABORT(g1)
+  -> IDLE(g2, last_result = ABORTED)
+```
+
+The first CAS binds the recovery UUID, tenant, project, repository UUID and
+generation, canonical path bytes, both path digests, source control key and
+exact version or explicit `NONE`, target namespace, signed intent digest, and
+recovery epoch. From `PREPARING` until the final `IDLE` CAS, every repository
+create, mutation, and reclamation admission for that identity or path reads this
+authority and rejects work outside the recovery controller. Ordinary reads keep
+the one-`repo_control` path; when control exists, the recovery CAS also sets its
+lifecycle to `FENCED`.
+
+`PREPARING` revokes target writer and reclaimer credentials, collects every
+serving and writer acknowledgement, and drains admitted requests before the CAS
+to `FENCED`. Recovery then restores bottom-up into new immutable target objects
+and catalogs. A signed mapping records every source key and
+`ObjectVersionID` to its target key and `ObjectVersionID`. Target catalogs
+contain no old references. Exact parent roots in `recovery_control` and
+`repo_control` bind journals, mappings, catalogs, and payload references.
+`VERIFYING` proves the complete Git, WAL, LFS, event, pin, catalog, receipt, and
+capacity closure plus a zero-old-reference all-version scan. One exact final
+`repo_control` CAS publishes the recovered repository root.
+
+`RELEASING_COMMIT` issues and loads a new writer and authorization epoch;
+`RELEASING_ABORT` restores and verifies the prior authority without publishing
+the candidate. Only the final exact `IDLE` CAS releases the create, mutation,
+and reclamation fence. Every state roots bounded idempotent step proofs. A crash
+or ambiguous CAS resumes or reverts from a fresh exact read and never releases
+on time, lease expiry, or an unrooted side effect.
+
+If `repo_control` is missing, Cloud Core can authorize same-identity recovery
+only with the signed recovery intent through this state machine. Recovery never
+invents a new UUID, generation, tenant, project, or path.
 
 The zero-acknowledged-loss claim covers corruption and logical overwrite or
 delete within one correctly versioned bucket. It excludes loss of the bucket,
 account, region, KMS key, or a permanently deleted object version. Those risks
 require independent replication or backup and are not hidden by the RPO claim.
 
-An RTO of four hours is valid only after exact-provider throughput and sizing
-equations pass with two-times headroom. Writer scratch sizing uses fixed-thin,
-index, and expanded-object peaks rather than a fixed guess.
+An RTO of four hours is valid only after exact selected AWS S3
+throughput and sizing equations pass with two-times headroom. Writer scratch
+sizing uses fixed-thin, index, and expanded-object peaks rather than a fixed
+guess.
 
 ## Future cutover state machine
+
+### Fresh-prefix bootstrap
+
+V2 production uses one brand-new UUID-derived deployment prefix `P` in one
+general-purpose Amazon S3 bucket. `P` has never been used by a development,
+test, failed-production, or prior-production attempt. V2 does not adopt,
+backfill, translate, or import V1 `manifest.pb` repositories.
+
+Provisioning finishes before the bounded bootstrap gate starts:
+
+- bucket versioning is enabled and has been left stable for at least 15
+  minutes; AWS documents that a first enable can take up to 15 minutes to
+  propagate, so the gate does not spend its budget waiting for it
+  ([S3 versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/manage-versioning-examples.html));
+- lifecycle rules cannot expire a current version, noncurrent version, or
+  delete marker under `P`; an `AbortIncompleteMultipartUpload` rule may remain;
+- no replication, batch job, event target, or other service can write under
+  `P`;
+- bucket and organization policies admit data-plane writes under `P` only from
+  the bootstrap role and the dedicated runtime role;
+- the bootstrap role is prefix-scoped, cannot delete a version or start a
+  multipart upload, and can write only with `If-None-Match: *` or `If-Match`;
+  the bucket policy enforces the same conditional-write requirement
+  ([S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)); and
+- the dedicated runtime role has no other assumption path. Its dedicated Roles
+  Anywhere profile is disabled and has never been enabled. No runtime session
+  or runtime writer credential exists.
+
+The never-used prefix and never-enabled profile are deployment invariants. AWS
+does not expose a synchronous historical proof for either one. The signed
+bootstrap authority-precondition document records those assertions and binds
+the exact account, bucket, prefix, roles, trust anchor, certificate identity,
+profile, policies, versioning, lifecycle, encryption, and KMS configuration.
+Configuration readback must match the document, but readback is an observation,
+not an IAM-convergence proof.
+
+Before the first write, the controller issues exactly one
+`ListObjectVersions` request with prefix `P`, no delimiter, and `MaxKeys=1000`.
+The response must be nontruncated and contain no object version and no delete
+marker. This is the initial completed-version inventory. Amazon S3 documents
+strong consistency for LIST operations
+([S3 consistency](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)).
+The controller also issues one `ListMultipartUploads` request as anomaly
+evidence. A nonempty or truncated response fails the gate. An empty response is
+not authoritative proof because AWS does not document that API as a strongly
+consistent inventory. Safety does not depend on it: neither the bootstrap role
+nor any runtime identity can initiate a multipart upload under `P`.
+
+The first durable action is one conditional, single-part `PutObject` Create of
+`P || "v2/control/cutover_control.pb"` in `OPEN(g0)`. It binds the target
+provider configuration, bootstrap session UUID, authority-precondition digest,
+and initial inventory. An ambiguous Create is resolved only by an exact read of
+its key, `ObjectVersionID`, digest, and session. The next action is one
+conditional, single-part `If-Match` update from `OPEN` to `PREPARING`. No
+runtime credential, workload, route, or consumer change may occur before that
+CAS lands. Bootstrap performs no IAM or bucket-policy mutation.
+
+Before any other control-plane Create, a `PREPARING` CAS roots an inline
+bootstrap creation plan. The plan has at most 262 rows: 256 capacity shards plus
+exactly one initial key ring, `credential_control`, `bucket_admin_control`,
+`capacity_control`, empty tenant-capacity catalog page, and `recovery_control`.
+No other type is valid.
+
+Every plan row is appended by CAS before its matching Create and binds the exact
+deterministic key, body digest, size, type, dependency-row indexes, and state
+`PLANNED`. One CAS can append a bounded batch. The first dependency stage has
+260 independent rows: 256 shards, the key ring, empty tenant catalog,
+`bucket_admin_control`, and `recovery_control`. After their assigned versions
+are known, the next CAS resolves that stage and appends the exact
+`credential_control` and `capacity_control` parent rows. The plan is append-only
+within one cutover generation and fits inside the 1 MiB `cutover_control` bound.
+
+For the initial credential-control row, the resolved key-ring version first
+fills the frozen bootstrap `current` root. The controller then forms the
+field-10-free projection, verifies the root-signed bootstrap transition proof
+for this bootstrap session, inserts the exact proof digest as field 10, and only
+then appends the final control key, body digest, and size to stage two. Cloud
+Core retains the proof bytes; they are not a 263rd plan row or a bucket object.
+
+Each initial object uses one conditional, single-part `PutObject` Create. No
+bootstrap object uses multipart upload, unconditional overwrite, or Delete.
+Every `cutover_control` update is one conditional, single-part `If-Match`
+`PutObject`. One stage runs at most 32 Creates concurrently. Success returns its
+assigned `ObjectVersionID`; one batched cutover CAS changes all completed rows
+to `RESOLVED` and binds each exact target
+key, `ObjectVersionID`, digest, size, and type. Thus the healthy two-stage plan
+needs at most three plan CASes: append stage one, resolve stage one while
+appending stage two, and resolve stage two. An ambiguous Create is resolved by
+exact read: absence retries Create, an exact byte match records the returned
+`ObjectVersionID`, and any mismatch fails the hard cut. If the process crashes
+after Create but before the resolving CAS, each still-`PLANNED` exact row makes
+its matching object retry-resolvable rather than orphaned. No planned object is
+operational authority before its row is `RESOLVED` and its own authoritative
+parent roots it.
+
+With all plan rows resolved and runtime access still disabled, the controller
+issues the final completed-version inventory: exactly one
+`ListObjectVersions` request with prefix `P`, no delimiter, and `MaxKeys=1000`.
+The response must be nontruncated. It must contain no delete marker. The
+controller exact-version GETs and hashes every returned object version, then
+verifies the complete allowlisted control-plane graph:
+
+- the complete `cutover_control` transition, digest, generation, bootstrap
+  session, creation-plan, and row-resolution chain;
+- every `bucket_admin_control` and `credential_control` version and each exact
+  verification-ring version that those controls root;
+- every `capacity_control` version, its exact empty tenant catalog page, and all
+  256 capacity shards rooted by the bootstrap chain; and
+- every `recovery_control` version rooted by the bootstrap chain.
+
+The graph must close from exact parent references. An object or historical
+version is allowed only when its key, `ObjectVersionID`, digest, size, type,
+transition predecessor, generation, and bootstrap session match that graph.
+During retry, each unresolved `PLANNED` row permits only its one exact matching
+object while the controller resolves the batch. Repository-data counts remain
+zero. Any other current object, noncurrent object version, delete marker,
+control transition, or orphaned object fails the hard cut. Retry never assumes
+cleanup and never deletes an unexpected entry. A failed production prefix is
+quarantined permanently. A later attempt uses a new prefix, bootstrap session,
+runtime role, and never-enabled profile.
+
+The inventory uses exact provider-returned key and `ObjectVersionID` bytes. Let
+`LP(x) = u32be(len(x)) || x`; `u8` is one unsigned byte and `u64be` is one
+unsigned 64-bit big-endian integer. Let
+`E = LP("walgit-cutover-completed-version-entry-v2")`. A completed object
+version has this encoding:
+
+```text
+object = E || u8(1) || LP(key) || LP(ObjectVersionID) ||
+         u8(is_latest) || u64be(size) ||
+         SHA-256(exact_version_content)
+```
+
+`is_latest` is exactly `0` or `1`. Exact-version GET supplies the object content
+digest, and exact-version HEAD, GET, and list sizes must agree. The controller
+sorts the entries in unsigned lexicographic byte order and rejects an exact
+duplicate. With sorted entries `e1` through `en`, the completed-version digest
+is:
+
+```text
+SHA-256(LP("walgit-cutover-completed-versions-v2") ||
+        LP(e1) || ... || LP(en) || u64be(n))
+```
+
+One inventory record has this exact encoding:
+
+```text
+LP("walgit-cutover-inventory-v2") ||
+u8(phase) || u64be(item_count) || completed_version_digest_raw32 ||
+u64be(repository_data_count) || u64be(allowlisted_graph_count)
+```
+
+`phase` is `1` for the initial inventory and `2` for the final inventory. The
+record is exactly 88 bytes. The initial record has zero items, zero repository
+data, zero allowlisted graph objects, and the digest of the empty completed-
+version set. The final record has zero repository data and identifies every
+version in the allowlisted graph. A truncated response cannot produce a record.
+The contract contains only these two one-page completed-version inventories.
+It has no production pagination or request-admission evidence.
+
+The final proof uses a dedicated pinned 32-byte Ed25519 bootstrap public key.
+Define `bootstrap_kid = first16(SHA-256("walgit-bootstrap-ed25519-kid-v1" ||
+bootstrap_public_key))`; it is the first 16 digest bytes in wire order and is
+encoded as a 16-byte CBOR byte string. The production candidate and `OPEN` bind
+that exact public key and key ID before an inventory. The proof is an untagged
+`COSE_Sign1` with the exact deterministic-CBOR protected map
+`{1: -8, 4: bootstrap_kid}`, an
+empty unprotected map, an attached payload, and external AAD equal to the exact
+ASCII bytes `walgit-cutover-proof-v2`. It uses the same deterministic-CBOR and
+strict Ed25519 rejection rules as create intents. No verification-ring key can
+substitute for the dedicated bootstrap key.
+
+The proof payload is one deterministic-CBOR integer-keyed map. All configured
+identifiers are byte strings containing the exact bound bytes, not normalized
+text. It has only these required keys:
+
+| Key | Type and value |
+|---:|---|
+| 1 | unsigned proof schema, exactly `2` |
+| 2 | bootstrap-session UUIDv7, 16-byte byte string |
+| 3 | unsigned cutover generation |
+| 4 | exact prior cutover key byte string, 1–1,024 bytes |
+| 5 | exact prior cutover `ObjectVersionID` byte string, 1–1,024 bytes |
+| 6 | exact prior cutover `CasToken` byte string, 1–256 bytes |
+| 7 | unsigned intended transition, exactly `1` for rooting the inventory proof while `PREPARING` |
+| 8 | provider byte string, 1–128 ASCII bytes |
+| 9 | provider account byte string, 1–256 bytes |
+| 10 | endpoint byte string, 1–2,048 ASCII bytes |
+| 11 | region byte string, 1–256 ASCII bytes |
+| 12 | bucket byte string, 1–256 ASCII bytes |
+| 13 | deployment-prefix byte string, 0–256 ASCII bytes |
+| 14 | fixed integer-keyed mode map described below |
+| 15 | 32-byte bootstrap authority-precondition digest |
+| 16 | 32-byte production-image digest |
+| 17 | 32-byte resolved creation-plan digest |
+| 18 | exact 88-byte initial inventory record |
+| 19 | 32-byte initial inventory-record digest |
+| 20 | exact 88-byte final inventory record |
+| 21 | 32-byte final inventory-record digest |
+
+The key-14 map has exactly six byte-string values: key 1 addressing mode, key 2
+credential mode, key 3 versioning mode, key 4 lifecycle mode, key 5 encryption
+mode, and key 6 KMS mode. Each value is 1–128 ASCII bytes. The declared envelope
+limit remains 65,536 bytes. A contract linter computes the exact maximum from
+the 21 required keys and rejects a schema change that exceeds that limit.
+
+After the creation-plan resolution CAS, the controller reads and fixes the
+exact prior cutover key, `ObjectVersionID`, and `CasToken`. No durable write
+occurs between the final inventory and proof construction. It then builds and
+signs the deterministic payload locally, embeds the exact proof in the next `cutover_control`
+candidate, and uses the bound prior token for the proof-rooting CAS while state
+remains `PREPARING`. The payload does not include the candidate control's
+future `ObjectVersionID`, digest, or size, or the proof envelope's digest, so it
+has no self-digest cycle. The store result supplies the new control version.
+Any session, generation, prior key, prior version, prior token, transition,
+provider configuration, key ID, or inventory mismatch rejects replay. An
+ambiguous CAS is resolved by an exact control read before another attempt. No standalone
+proof object exists. A crash repeats the final inventory and graph verification
+before `PREPARED`. The proof does not claim IAM propagation, request ordering,
+or multipart absence.
+
+AWS can synchronously establish the conditional S3 write result, the current
+completed-version inventory, and exact-version bytes. Current profile and IAM
+readbacks are configuration observations only. IAM changes are eventually
+consistent
+([IAM troubleshooting](https://docs.aws.amazon.com/IAM/latest/UserGuide/troubleshoot.html)),
+and CloudTrail does not guarantee event ordering
+([CloudTrail events](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-events.html))
+or provide an admission-complete request watermark. CloudTrail and S3 access
+logs remain audit evidence and never satisfy the bootstrap authority proof.
+
+Repository creation stays fenced until `ACTIVE`. Every later repository starts
+as a new immutable UUID with generation
+1 from a valid signed create intent at the routing-digest-derived control key.
+No read, write, recovery, or discovery path can adopt V1 state. There is no
+legacy identity migration or path-reuse exception.
+
+A crash before `PREPARING` leaves only the `OPEN` control write and resolves
+only the control CAS. A crash after `PREPARING` resumes from the exact control
+and plan. A terminal validation failure writes `ABORTED` when possible and
+quarantines the prefix. It does not restore, delete, or reuse anything under
+that prefix.
+
+### Cutover transitions
 
 One signed `cutover_control` record is the global cutover authority. Its state
 machine is:
 
 ```text
 OPEN(g0) -> PREPARING(g1) -> PREPARED(g1) -> ACTIVE(g1)
-                         \-> ABORTED(g1) -> PREPARING(g2)
+OPEN | PREPARING | PREPARED -> ABORTED
 ```
 
-`ACTIVE` is terminal. Each generation validates linearly at repository commit
-and build enqueue. The CAS to `PREPARING` happens before any external side
-effect. Every ingress fence, Forgejo barrier, drain, worker stop, retry stop,
-credential revocation, scale, route change, and proof is idempotent. Its exact
-configuration or evidence digest is rooted while state remains `PREPARING`.
+`ACTIVE` and `ABORTED` are terminal for `P`. Each generation validates linearly
+at repository commit and build enqueue. After the conditional `OPEN` Create, the CAS to `PREPARING`
+happens before any external cutover effect other than those two required control
+writes. The inventory proof and all bootstrap control writes happen while the
+runtime profile remains disabled. Their exact configuration and evidence
+digests are rooted while state remains `PREPARING`.
 
-Before `PREPARED`, Cloud Core verifies the signed zero-data condition, makes
-the old path read-only, drains or terminates active mutations, stops workers
-and retries, revokes mutation credentials, and records all high-water marks.
-It scales Forgejo to zero before a second zero-session proof. Both providers
-remain fenced during the route switch.
+Before `PREPARED`, Cloud Core verifies the signed zero-data condition and the
+complete resolved creation plan. The old service remains unchanged and keeps
+the production route. No V2 runtime session, workload, consumer, or route is
+active.
 
-A crash in `PREPARING` or `PREPARED` deterministically resumes or reverts from
-the rooted proofs. Revert restores and verifies the complete legacy route,
-credentials, workers, and session state before CAS to `ABORTED`. A new attempt
-uses a new generation. `ACTIVE` is the last cutover action, binds preparation,
-route, workload, image, and generation digests, and has no return transition.
+A crash in `PREPARING` or `PREPARED` deterministically resumes from the rooted
+proofs. A nonrecoverable failure moves to terminal `ABORTED` and quarantines
+`P`; a new attempt uses a new prefix and generation. `ACTIVE` is the storage-
+authority commit, not the last external action. Only after its CAS lands may
+Cloud Core call `EnableProfile`, obtain a Roles Anywhere session, exact-read the
+rooted controls, start the candidate workload and consumers, pass readiness,
+and switch the route. A disabled profile cannot create a new session; activation
+uses the AWS `EnableProfile` operation
+([Roles Anywhere EnableProfile](https://docs.aws.amazon.com/rolesanywhere/latest/APIReference/API_EnableProfile.html)).
+Failure after `ACTIVE` delays availability and resumes those idempotent
+post-activation effects. It cannot reopen bootstrap or reuse the prefix.
 
 Forgejo databases, persistent volumes, and buckets remain intact after
 `ACTIVE`. Their deletion requires separate explicit approval.
@@ -404,73 +1957,199 @@ security, and cutover result binds its exact image digest. Promotion attests
 that same digest without a rebuild or mutable tag. Cloud Core verifies the
 signature, attestations, test identity, and digest before accepting the image.
 
-Critical PR jobs and required status checks have a 15-minute P95 budget. Exact
-provider evidence runs production-locally as parallel bounded jobs. No
-provider job has a timeout above 15 minutes. The complete provider workflow,
-including fail-closed cleanup, has a 30-minute budget. A 60-minute fallback is
-not allowed. Linting rejects larger timeouts, and timing evidence enforces the
-budgets.
+Every required PR, provider, evidence, recovery, cutover, and promotion gate
+declares `timeout-minutes` of at most 15. The AWS bootstrap gate gives test work
+at most 12 minutes and reserves at least the final 3 minutes for fail-closed
+evidence upload and cleanup of its disposable test prefix. A production prefix
+is never cleaned. Versioning's initial 15-minute stabilization is a completed
+provisioning prerequisite, not a CI sleep. The required gate has a 15-minute
+wall-clock cap. A 30-minute or 60-minute fallback is not allowed. Linting
+rejects a missing or larger timeout, a test budget above 12 minutes, or an
+evidence reserve below 3 minutes.
 
-The PR2 exact-provider primitive gate proves:
+The PR2 exact-production-provider primitive gate runs only against the selected
+AWS S3 provider and proves the bounded bootstrap primitives that this contract
+uses:
 
-- objects larger than 5 GiB and the calculated 10,000-part boundary;
-- concurrent conditional Create and Update and conditional multipart
-  completion;
-- refreshable credential rotation;
-- failed and abandoned multipart cleanup;
+- concurrent conditional single-part Create and Update, including exact AWS
+  conditional-conflict handling;
 - Range, HEAD, ETag, and explicit conditional-failure behavior;
 - versioning enabled and stable `ObjectVersionID` results;
-- paginated version enumeration;
-- exact-version HEAD, GET, and delete; and
-- delete-marker behavior and cleanup isolation.
+- one-page nontruncated empty and allowlisted `ListObjectVersions`
+  inventories, exact-version HEAD/GET, delete-marker rejection, and failure
+  when the graph exceeds one page;
+- conditional `OPEN -> PREPARING`, all planned conditional single-part control
+  writes, and a final proof CAS while the runtime profile remains disabled; and
+- `ACTIVE` before `EnableProfile`, runtime credential issue, workload start,
+  readiness, consumer start, or route switch.
+
+PR3 separately proves multipart data paths above 5 GiB, the calculated
+10,000-part boundary, conditional multipart completion, abandoned-upload
+cleanup, long-running credential refresh, and production-scale recovery. Those
+paths are required for serving large repositories but are not part of the
+single-part bootstrap authority proof. PR3 keeps the same 15-minute required-
+job cap; it must use bounded parallel or accelerated evidence rather than an
+hour-long CI soak.
 
 The later production gate proves full-scale object counts, throughput,
 retention, event replay and fanout, build pins, restore, cutover, and recovery
-on the exact provider and exact production candidate digest.
+on the exact selected AWS S3 provider and exact production candidate
+digest.
 
 ## Future vertical acceptance
 
 These scenarios are required by later gates. PR1 does not implement them.
 
+- A raw-path conformance corpus proves exact one-time decoding, binary path
+  identity, global uniqueness, routing-digest-derived control lookup,
+  management-route separation, `canonical_path_digest` verification,
+  independent raw and routing digest collision failures, and permanent
+  tombstone path denial.
+- Namespace tests prove every V2 object uses its closed full physical key.
+  Empty and non-empty `P` vectors prove that the V2 adapter strips `P` exactly
+  once for a configured prefixed store call, restores it exactly once on every
+  metadata, exact-version, and listing result, and rejects prefix mismatch,
+  relative-key authority, and `P || P || S`. Immutable bodies bind identity and
+  semantic content but never their own key, `ObjectVersionID`, digest, or size.
+  Each authoritative parent binds those exact values for its target. Standard
+  raw Git pack, LFS, and bundle bytes remain unmodified. No host, capacity,
+  lease, event, or recovery object can replace the routing-digest-derived
+  control authority.
+- Byte-vector tests prove every allowed leaf and reject every unlisted leaf.
+  They verify deterministic protobuf bytes, raw payload bytes, complete signed
+  envelope bytes, exact verification-ring COSE bytes, and the credential-control
+  transition projection as distinct digest preimages.
+- Descriptor tests prove that every variable field, message, repeated field,
+  and catalog has the stated numeric bound. Boundary tests prove exact
+  inline-to-catalog transitions, mutually exclusive representations, bounded
+  cold reads, backpressure, and compact-or-reject behavior. The linter expands
+  64 maximum 4,096-byte archive-root references with maximum keys and
+  `ObjectVersionID` values and proves that the complete watermark stays within
+  524,288 bytes.
+- Cross-language deterministic-CBOR and COSE vectors cover create and
+  capability payloads, independent keys 14 and 17, swapped or conflated digest
+  rejection, required grant keys 35 and 36, exact grant-pair and purpose-role
+  checks, every rejected encoding, UUIDv7 and time boundaries, same-control-key
+  exact replay and changed-byte conflict, exact data and root `kid` headers, all
+  slot/state matrix cells, key-ring signatures, current/next preload, atomic
+  promotion, bounded previous retirement, the 30-second revocation deadline,
+  stale verifiers, and immediate deny-set enforcement. Credential-control wire
+  vectors cover tags 1–10, required and optional presence, maximum revoked-key
+  cardinality and ordering, proof digests, complete ring-root metadata and body
+  binding, legal evolution, and rejection of every other slot transition.
+- Ring-lineage vectors cover the exact bootstrap values, checked
+  `current + 1` installation, exact prior-ring digest, promotion, and
+  retirement. Negative vectors cover rollback, fork publication, skipped and
+  wrapped or overflowing epochs, duplicate ring/root/key identities, digest
+  collision, deny-set overflow, and retired-key reuse.
+- Cross-language credential-transition vectors cover the exact field-10-free
+  protobuf projection and domain-separated digest; the exact root-signed
+  verifier-set COSE headers, AAD, numeric payload, bounded member rows, sorting,
+  and domain-separated digest; and the exact acknowledgement-set map, member
+  signature preimages, one-to-one ordering, and domain-separated digest. They
+  also cover proof keys 7/8 recomputation from retained bytes, the proof's
+  untagged COSE headers, external AAD, numeric payload variants, pinned-root
+  signature, predecessor full key/version/digest/size, bootstrap session, final
+  field-10 insertion, and exact retry. Negative vectors cover a self-cycle,
+  future object metadata, projection or predecessor corruption, missing,
+  duplicate, extra, reordered, wrong-role, and bad-signature members,
+  unknown/duplicate/missing CBOR keys, digest-only evidence, changed-byte
+  proof-ID reuse, stale-proof replay, and wrong-root signatures.
 - A valid signed create intent creates the exact UUID, generation, path,
-  visibility, quota, and initial admin once. Unsigned, altered, expired,
-  cross-tenant, cross-project, and replay-conflict requests publish nothing.
+  canonical path digest, routing digest, visibility, quota, and initial admin
+  once. Cloud Core vectors prove permanent global intent-ID uniqueness before
+  signing; WalGit vectors prove that replay state is scoped to the one derived
+  `repo_control` key and creates no global index. Unsigned, altered, expired,
+  cross-tenant, cross-project, and same-key replay-conflict requests publish
+  nothing.
 - Every client and system mutation becomes visible only through one
   `repo_control` CAS. Mutable side state cannot publish, authorize, or replace a
   root.
-- A successful CAS with a lost response, followed by another control CAS,
-  retains the unresolved receipt, materializes the exact result envelope,
-  settles it once, and never creates a recursive settlement receipt.
+- A successful CAS with a lost response is followed only by result
+  materialization and the receiptless settlement CAS. Settlement preserves the
+  row as `SETTLED` and never creates a recursive settlement receipt. Tagged
+  `NONE`, `CAPACITY`, and `EVENT` obligations wait for exactly their present
+  dependencies and no absent dependency. The maximum-key,
+  maximum-`ObjectVersionID`, 64-subscriber case settles only after its exact
+  watermark is rooted, and reclamation cannot delete any referenced archive
+  before that settlement and retention deadline.
 - Grant revocation racing a push has one linear winner. A stale push cannot
   reauthorize or publish after revocation.
 - Writer takeover fences every former-writer surface. Lease clock skew and
   expiry alone never grant write authority.
-- Exact logical quota boundaries, duplicate Git and LFS objects, shard
-  contention, all reservation crash points, and verified refunds preserve
-  finite capacity.
+- Exact logical quota boundaries, duplicate Git and LFS objects, all reservation
+  crash points, and verified refunds preserve finite capacity. Cross-shard tests
+  exhaust many shards simultaneously and prove the immutable shard budgets,
+  tenant slices, and global allocation cannot oversubscribe. Redistribution
+  rejects any nonterminal reservation and resumes safely across every shard CAS.
 - Typed reclamation stays within object and byte budgets, resumes from its
-  cursor, preserves every live root and pin, and exact-version-deletes only
-  eligible versions.
+  cursor, preserves every current, transitive, and obligation-retained root, and
+  exact-version-deletes only eligible versions. A superseded unrooted historical
+  catalog becomes eligible after its last retention obligation expires.
 - Bucket lifecycle tests prove that only abandoned multipart uploads expire
   automatically. KMS tests prove that every retained object version remains
   decryptable for its full retention horizon.
-- Event tests cover lost CAS responses, post-CAS materialization, archive
-  verification, fresh retry HMAC, fanout crashes before and after the Cloud
-  Core transaction, and out-of-order delivery.
-- Build tests move the primary branch and every named Git context after
-  enqueue. The runner still consumes only the queued exact SHAs and verified
-  pins, including their LFS closure.
-- Recovery tests restore from every journal phase, prove no old references,
-  recover missing control only under the signed global fence, and reject faults
-  outside the stated one-bucket loss model.
-- Cutover tests include open Forgejo sessions, worker and retry activity,
-  crashes at every state and external step, verified abort restoration, stale
-  generation requests, and terminal `ACTIVE` behavior.
+- Bucket-administration tests change versioning, lifecycle, KMS, encryption,
+  IAM, and provider policy only after the global `PREPARING` fence. They inject
+  drift immediately before publication and reclamation and prove fail-closed
+  readiness and no capacity refund. A writer paused after safety validation is
+  denied after credential revocation and cannot publish when it resumes.
+- Event tests cover HTTPS-POST-only delivery, canonical path and HMAC vectors,
+  five-minute freshness, unique delivery IDs, 15-minute replay retention,
+  current/previous HMAC rotation, 256-change and 1 MiB body boundaries, 64
+  active-subscriber boundary and backpressure, deterministic per-subscriber
+  bodies, rejection before any durable write, lost CAS responses, post-CAS
+  materialization, fanout crashes, out-of-order delivery, retention deadlines,
+  and the exact control-rooted archive watermark before every removal path.
+  The maximum-key, maximum-`ObjectVersionID`, 64-subscriber watermark passes
+  settlement and remains protected from reclamation until its exact deadline.
+- Build tests ACK an event, stall each primary or named pin and the READY/outbox
+  transaction across `ready_deadline`, and race reclamation against the
+  control-rooted 120-day primary event floor. By the deadline, all exact pins
+  and the one READY/outbox transaction exist, or one terminal no-build decision
+  durably schedules partial-pin compensation. Late pin results, READY, outbox,
+  and enqueue remain denied after crashes and ambiguous CAS outcomes.
+- Standing-pin tests refuse to activate a named `EXACT_SHA` configuration before
+  its exact Git/LFS closure is pinned, renew it through the last eligible event's
+  ready deadline and remaining horizon, and remove it without releasing another
+  obligation's closure. `CURRENT_REF` tests move and reclaim the ref before and
+  after its build pin CAS and prove that only the SHA resolved by that CAS stays
+  rooted. Maximum queue, retry, completion, and named-context horizons preserve
+  every exact closure consumed by the runner.
+- Recovery tests crash at every global recovery-control state and credential
+  drain, restore from every journal phase, prove no old references, recover
+  missing control only under the signed global fence, and release create,
+  mutation, and reclamation only after the terminal exact CAS. They reject
+  faults outside the stated one-bucket loss model.
+- Cutover tests crash at every control and post-activation step, reject stale
+  generation requests, quarantine every failed prefix, and prove terminal
+  `ACTIVE` and `ABORTED` behavior. They prove that no runtime session, workload,
+  consumer, or route exists before `ACTIVE`.
+- Bootstrap tests prove the never-used prefix and never-enabled profile
+  preconditions; one nontruncated empty initial inventory; conditional
+  single-part `OPEN`, `PREPARING`, plan, and proof writes; and one nontruncated
+  final inventory containing only the exact allowlisted graph. They exercise
+  the 262-row creation-plan bound, 32-Create concurrency bound, three healthy
+  plan CASes, and a crash after every Create but before its batched resolving
+  CAS. They reject a truncated inventory, delete marker, repository object,
+  unplanned or mismatched control version, V1 object, multipart anomaly, or
+  cleanup/reuse of a failed production prefix. Shared cross-language vectors
+  cover the exact LP/u8/u64 inventory encoding, content corruption,
+  lexicographic order, duplicate rejection, the exact 88-byte record,
+  deterministic proof payload bytes, the dedicated bootstrap `kid` and COSE
+  signature, and replay rejection across session, generation, prefix, prior
+  control version, prior `CasToken`, or transition. A vector also proves that
+  the proof excludes its candidate control and envelope digests and therefore
+  has no self-digest cycle.
+- GCS tests remain development and non-production only. They prove Object
+  Versioning and zero soft-delete retention where exact deletion is tested and
+  prove that they cannot satisfy the AWS-native Roles Anywhere activation gate.
 - Secret and revocation tests cover Git, LFS, API, settings, policy, webhook,
   build, and capability surfaces.
-- Bound tests fill control, pack, tail, grant, receipt, catalog, queue, and
-  error limits and prove compact-or-reject behavior.
 - Exact-provider tests bind the selected endpoint and candidate digest and
   exercise every PR2 primitive plus the later scale and recovery gates.
 - Promotion tests prove that production consumes the exact candidate digest
-  that passed all evidence, with no rebuild or mutable-tag substitution.
+  that passed all evidence, with no rebuild or mutable-tag substitution. CI
+  lint tests reject every required gate above 15 minutes, every provider test
+  budget above 12 minutes, and every evidence reserve below 3 minutes. No
+  30-minute or 60-minute fallback exists.

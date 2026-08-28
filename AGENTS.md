@@ -309,7 +309,8 @@ decision in §4 — or the PR is; never "fix later".
   pack; blob bytes are all that cross the mount / range reads. Superseded with its base.
 - **D19** **The serving runtime is untouchable.** (1) control-plane store objects (manifest, log, checkpoints,
   leases, bundle list, policy, render cache) never share a transport or a permit with bulk bytes (packs, idx,
-  side-files, bundles, LFS, ranged reads: their own pools under `store.gcs.bulk_concurrency`); (2) pack
+  side-files, bundles, LFS, ranged reads: their own pools under each provider's `bulk_clients` and
+  `bulk_concurrency` settings); (2) pack
   materialization never runs on the serving runtime (`sync::on_bulk_runtime`) and never queues as a writer on
   `RepoHandle::rw` — the refs phase needs only `sync_mutex`, pack removal is `try_write()` (a queued writer on a
   tokio RwLock blocks every new reader; one 24-minute clone once starved every info/refs for minutes).
@@ -413,7 +414,7 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   materialization runs on the **bulk runtime** (`sync::on_bulk_runtime`). The runtime watchdog logs "async runtime
   stalled" with `inflight` and `tasks_running`: `inflight = 0` at a late tick ⇒ the platform paused the process,
   `inflight > 0` ⇒ a real stall — look at `lock_wait_max_ms` and `walgit_lock_wait_seconds{lock}`. Bulk bytes never
-  share a transport with the control plane (`store.gcs.bulk_clients`, `bulk_concurrency`).
+  share a transport with the control plane (`store.{gcs,s3}.bulk_clients`, `bulk_concurrency`).
 - **Correct is not sufficient.** Every protocol change (publish, sync, leases, checkpoints, bundles) is also
   judged on critical-path round trips against the bucket — read `docs/ROUNDTRIPS.md`, update its budget table, put
   before/after depth in the commit, keep verification on the failure path, assert request budgets in the sim.

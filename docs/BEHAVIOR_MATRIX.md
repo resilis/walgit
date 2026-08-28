@@ -8,13 +8,15 @@ with a dedicated test. This matrix does not make untested provider claims.
 
 Run the repository-wide checks with `just warnings`, `just test`, `just e2e`,
 and `just ci`. Run `just test-s3` against the local disposable store. Run
-`just test-s3-provider` against the exact selected provider only after setting
-the required `WALGIT_TEST_S3_*` environment variables for an approved
+`just test-s3-provider` against the exact selected AWS S3 provider only after
+setting the required `WALGIT_TEST_S3_*` environment variables for an approved
 disposable bucket and unique prefix. Run
 `just test-gcs <bucket>` only against an approved disposable bucket and unique
-prefix. Exact-provider primitive conformance is a PR2 merge gate. Full-scale
-recovery and production-candidate evidence remain later PR3 gates. PR1 does
-not implement the V5.3 control, event, recovery, or cutover contracts.
+prefix for development or non-production evidence. Production exact-provider
+primitive conformance runs only against AWS S3 and is a PR2 merge gate.
+Full-scale recovery and production-candidate evidence
+remain later PR3 gates. PR1 does not implement the V5.9 control, identity,
+signing, event, recovery, or cutover contracts.
 
 | Surface | Owner | Entrypoint | PR1 preservation decision | Test or evidence |
 |---|---|---|---|---|
@@ -29,7 +31,7 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | LFS upstream/read-through | `walgit-server` | `lfs_upstream.rs` | Preserve authenticated read-through and persistence | `cargo test -p walgit-server --test lfs_upstream` |
 | Receive size | `walgit-server` / store | receive-pack ingest and pack PUT | Preserve 64 GiB configured limit and streaming; no 4 GiB limit | `rg -n "64GiB|receive" walgit.example.toml crates`; S3 contract large-object plan |
 | Bundle-uri | `walgit-bundle` / server | v2 command, `bundles/list`, `bundles/catchup` | Preserve clone/catch-up families and narration | `cargo test -p walgit-bundle`; `just e2e` |
-| 30 GiB+ packs/bundles | bundle / store | compose, multipart PUT/copy | Preserve streaming and multipart; no local materialization or 4 GiB cap | `cargo test -p walgit-store --test contract`; exact-provider >5 GiB gate remains required |
+| 30 GiB+ packs/bundles | bundle / store | compose, multipart PUT/copy | Preserve streaming and multipart; no local materialization or 4 GiB cap | `cargo test -p walgit-store --test contract`; exact-provider >5 GiB evidence moves to PR3 |
 | Upstream follow | server / Git / WAL | `follow.rs`, maintainer loop | Preserve same publish path and fast-forward rule | `cargo test -p walgit-server --test follow` |
 | Mirror CLI | `walgit-cli` | `walgit mirror` | Preserve HTTP mirror behavior | `cargo test -p walgit-cli`; CLI help inspection |
 | Remote reader | `walgit-wal` / Git | `remote.rs`, `upload_gix.rs` | Preserve range-backed bases and bounded cache | `cargo test -p walgit-git --test upload_gix_remote`; `cargo test -p walgit-server --test web_api` |
@@ -41,15 +43,26 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | Credential helper | installer | host-derived helper and token file | Preserve 0600 token and scoped Git config | `just e2e`; `tests/lib-auth.sh` |
 | Policy | server / WAL | `policy.json`, policy API/CLI | Preserve rule language and fail-before-publish behavior | `cargo test -p walgit-server --test policy` |
 | Repository settings | server / WAL / CLI | settings API and `walgit repo settings` | Preserve WAL publication and inline effective config | `cargo test -p walgit-server --test web_api`; CLI tests |
-| Effective settings secrecy | server | settings HTTP API | Return only safe repository settings sections, hide raw upstream settings from non-operators, preserve operator-owned upstream settings across ordinary edits/clears, reject credentials in upstream URLs, and reserve upstream overrides for principals that are both tenant admins and platform operators | Settings/auth tests and route review |
+| Effective settings secrecy | config / server / CLI | `/{o}/{r}/api[-browser]/settings/{effective,describe,validate}`; effective settings CLI; config dump | Settings boundaries use the exact four-section `EffectiveSettingsView`, and config dump uses the separate credential-safe `SafeConfigView`; no boundary serializes runtime `Config`. Non-operators do not receive raw upstream settings, ordinary edits and clears preserve operator-owned upstream settings, upstream URLs reject credentials, and upstream overrides require both tenant Admin and platform-operator authority. This is local serialization and authorization evidence, not provider or runtime-readiness evidence. | `cargo test -p walgit-config`; settings/auth tests; `cargo test -p walgit-server --test e2e settings_views_are_exact_and_secret_free_on_both_api_lanes -- --exact`; projection/code review |
 | Auth `none` | config / server | `server.auth.mode=none` | Preserve loopback-only validation | `cargo test -p walgit-config` |
-| Auth `token` | config / server | bearer/basic static tokens | Preserve credential transport; require principal-to-tenant reader/writer/admin grants | auth unit tests; tenant isolation e2e |
-| Auth `oidc` | config / server | discovery, browser session, `wgt_` token | Preserve allowlist and validation; resolve the same tenant grants after identity verification | auth unit/e2e tests; tenant isolation e2e |
+| Auth `token` | config / server | bearer/basic static tokens | Startup resolves once, rejects empty or duplicate resolved values, retains only domain-separated fixed-width digests, and checks every configured digest without match-dependent loop control. Bearer/Basic, OIDC robot precedence, issued tokens, forwarding, and HMAC behavior remain preserved. The authenticated principal resolves to tenant reader, writer, or admin grants. Provider evidence and V2 runtime readiness remain separate gates. | `cargo test -p walgit-server auth::tests --lib`; `cargo test -p walgit-config`; tenant-isolation e2e; later provider/runtime gates |
+| Auth `oidc` | config / server | discovery, browser session, `wgt_` token | Preserve the allowlist and validation, then resolve the same tenant grants after identity verification | auth unit/e2e tests; tenant-isolation e2e |
 | WAL operator CLI | `walgit-cli` / WAL | `walgit wal ls/show/materialize` | Preserve provenance and `--at-seq` | CLI unit tests; CLI help inspection |
 | Import CLI | `walgit-cli` | `walgit import` | Preserve direct/staged import behavior | `cargo test -p walgit-cli`; `docs/INTEGRITY.md` review |
 | Repair and fsck | CLI / Git / maintainer | `fsck`, `repair` units | Preserve connectivity audit and upstream repair | `cargo test -p walgit-server --test maintain`; `docs/INTEGRITY.md` review |
-| Versioned recovery | future control / store | exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 production approval | Future exact-provider version tests and recovery vertical acceptance in `docs/PRODUCTION_ARCHITECTURE.md` |
-| Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Tenant Admin only; auto-create on push also requires Admin while Writer can push existing repositories | tenant isolation e2e |
+| Versioned recovery | future global recovery authority / repository control / store | `recovery_control`, exact object versions, recovery catalogs and final control CAS | Not implemented by PR1; V5.9 adds the exact global CAS fence, credential drain, crash recovery, and terminal release; exact-version primitives gate PR2, while end-to-end restore and the bounded fault model gate PR3 | Future recovery-state, missing-control, credential-drain, exact-provider version, and terminal-release tests |
+| Repository create/delete | server / WAL | `PUT` / `DELETE` repo root | Tenant Admin only; auto-create on push also requires Admin while Writer can push existing repositories. V2 identity, lifecycle, and reclamation remain dormant future work. | tenant-isolation e2e; future control gate |
+| V2 direct repository identity | future control / Cloud Core | canonical transport path to routing-digest-derived `repo_control`; UUID/generation payload namespace | Not implemented by PR1; V2 keeps `SHA-256(C)` as the canonical identity digest, uses a separate domain-separated routing digest for keys, and enforces binary global uniqueness plus a non-reusable tombstone while preserving current PR1 routes until the hard cut. V5.9 defines authoritative keys as full physical `P`-prefixed keys and one adapter that validates and strips `P` exactly once for configured prefixed-store calls, then restores it exactly once on returned keys | Future shared transport corpus, both-digest derivation and binding, independent identity/routing collision errors, empty/non-empty prefix round trips, no-`P || P` namespace, and tombstone gate |
+| V2 bounded control schema | future protobuf / control | `repo_control`, typed inline state, immutable catalog roots | Not implemented by PR1; every variable field, message, repeated field, and catalog uses the exact V5.9 numeric bound, exhaustive physical leaf grammar, exact digest preimage, and compact-or-reject behavior; immutable bodies never require their own store identity, parent references carry exact target roots, and standard raw Git/LFS/bundle payloads stay unmodified | Future descriptor-linter, decoder-allocation, key-grammar, parent/child root, byte-digest, raw-payload, watermark/proof boundary, inline/catalog `oneof`, and backpressure gate |
+| V2 normal-read authority | dormant `walgit-control` / `walgit-store::v2_control` | one routing-digest-derived strict control GET, exact authenticated capability, then exact rooted catalog versions only when required | This slice adds dormant exact inline-grant authorization. It compares every sealed repository/control binding, including canonical-path and routing digests plus the current stored-control `ObjectVersionId`, then applies the closed purpose/role matrix. Grant catalogs fail closed. The domain controller uses the real strict store adapter; no V1 or runtime path is activated. | `cargo test -p walgit-control`; `cargo test -p walgit-identity`; future runtime activation and provider gate |
+| Mutation receipt settlement | dormant `walgit-control` / immutable results | every non-settlement mutation; closed `NONE` / `CAPACITY` / `EVENT` obligations | Every ordinary mutation roots `UNRESOLVED`, including `NONE` / `NONE`. A successful landed-control result must be materialized before the sole receiptless `INTERNAL_SETTLEMENT` CAS preserves the full row as `SETTLED`, including the exact settlement mutation ID and immutable result. No unrelated CAS is admitted while a row is unresolved. The flat catalog applies backpressure at 4,096 permanent rows or the 512 KiB (524,288-byte) encoded bound, and pre-CAS admission reserves the maximum valid settled-result space. The public capability API supports SETTINGS and GRANTS only; WRITER_TAKEOVER remains deferred to a future sealed lease/writer authority. | `cargo test -p walgit-control`; `cargo test -p walgit-proto --test v2_receipts`; future capacity/event obligation and canonical catalog-evolution gate |
+| Finite capacity allocation | dormant `walgit-proto`, `walgit-store::v2_capacity`, and `walgit-control::capacity`; future global controller | `capacity_control`, one flat tenant page, exactly 256 capacity shards | Schema v1 retains the strict bounded allocation and recovery contract. The dormant tracer exact-loads current control, its rooted tenant-page version, and the mutable hashed shard; then it exposes only new RESERVED admission under STABLE and new RESERVED expiry under STABLE or PREPARING/DRAINING. Admission requires an ACTIVE repository; expiry also accepts a strict DELETING or TOMBSTONED repository-control snapshot so retained rows cannot block reclamation or drainage. An exact already-expired replay remains idempotent after a valid current-view load during APPLYING or a later STABLE epoch, without a PUT. Repository identity, tenant, shard, epoch, budget, slice, and key derive from exact strict repository/capacity state. The request supplies UUIDv7, bytes, explicit creation, expiry, and observed time, plus a closed non-persisted `GitWrite | LfsFinalize` discriminator. One conditional shard PUT and at most one resolution GET return a typed terminal classification without retry/rebase. COMMITTING, CHARGED, conflict abort, receipt integration, plan/control writes, cross-key admission fencing, provider/runtime wiring, V1, migration, and production activation remain deferred behind the greenfield hard cut. | `cargo test -p walgit-store --no-default-features --test v2_capacity_store`; `cargo test -p walgit-control capacity_tests::`; future admission-fence, COMMITTING/receipt, mixed-epoch, and runtime gates |
+| Typed reclamation | future repository control / store | current and transitive roots plus retained obligations | Not implemented by PR1; protection does not retain every historical catalog forever, but exact-version deletion remains fenced, bounded, and impossible while any current or retained obligation reaches the target | Future superseded-catalog eligibility, live-root closure, receipt/event/capacity/pin/recovery retention, pagination, and refund gate |
+| Signed create and capabilities | dormant `walgit-identity`; future Cloud Core / control | deterministic CBOR, attached untagged COSE Sign1, Ed25519 verification ring | PR2 adds a pure dormant verifier with allocation-safe canonical parsing, exact rooted-ring and slot/state/deny binding, envelope-specific create/capability authentication, and one all-or-nothing verifier-set/acknowledgement/projection/transition API. Key eligibility uses signed `issued_at` without key skew; envelope validity uses explicit `now`, checked `expiry - issued_at`, and only the 30-second envelope skew. Ring/verifier IDs require UUIDv7 form without an unstated time rule; data/ack kids stay opaque. Authentication is not repository authorization, and no V1/server/store/config/route/runtime path is activated. Cloud Core uniqueness, repository grant/lifecycle/CAS authorization, binding CAS, distribution/readiness, and runtime rotation remain later slices. | `cargo test -p walgit-identity`; `cargo test -p walgit-proto --test v2_credential`; future cross-language producer vectors, every purpose/role cell, binding-CAS, runtime stale-ring/rotation, and 30-second revocation gate |
+| Bucket administrative safety | future global control / AWS S3 | `bucket_admin_control`, frozen safety digest, bootstrap authority preconditions | Not implemented by PR1; the greenfield gate pre-provisions and freezes versioning, lifecycle, KMS, policy, bootstrap role, runtime role, and a never-enabled Roles Anywhere profile. Current readback is observation, not proof of IAM convergence or historical non-use. Later active-policy change remains unimplemented PR3 scope and fails closed. | Future frozen-config drift, disabled-profile, no-alternate-assumption-path, conditional-write policy, and post-`ACTIVE` activation gate |
+| Durable webhook delivery | future event / Cloud Core | bounded inline event, HTTPS POST, canonical HMAC tuple, replay cache, archive watermark | Not implemented by PR1; V5.9 caps an atomic transaction at 256 changes, active subscribers at 64, every precomputed deterministic body at 1 MiB, and the watermark at 524,288 bytes with at most 64 exact archive refs of at most 4,096 bytes each; it preserves HMAC rotation, causal retention, and exact parent-rooted archives | Future size/subscriber/max-reference boundaries, pre-publication rejection, HMAC vectors, replay, key rotation, fanout crash, retention, settlement, reclamation, and watermark gate |
+| Exact build pins | future Cloud Core build intent / repository control | durable `PREPARING -> READY` intent, standing named exact-SHA pins, primary and named build pins, exact outbox | Not implemented by PR1; the event CAS preserves the primary 120-day floor, but every exact pin and the one READY/outbox transaction must land by `ready_deadline` or terminal no-build permanently rejects late pin, READY, outbox, and enqueue; named exact-SHA configuration is event-eligible only while its standing fenced Git/LFS pin covers the last event horizon | Future deadline-stall, late-action denial, partial-pin compensation, standing-pin activation/removal/renewal, exact-SHA/current-ref resolution, ref-move/reclamation, and maximum-horizon gate |
+| No-production-data V2 hard cut | future cutover / AWS S3 | never-reused prefix, disabled runtime profile, conditional single-part bootstrap writes, two one-page completed-version inventories, and one inline signed proof | Not implemented by PR1; the initial inventory is nontruncated and empty before the first write. Every planned control Create uses `If-None-Match: *`; every update uses `If-Match`. The final inventory exact-loads the allowlisted version graph with zero repository data and no delete marker. A one-page `ListMultipartUploads` result is anomaly evidence only. `ACTIVE` lands before `EnableProfile`, runtime credentials, workload, consumers, readiness, or route switch. A failed production prefix is never cleaned or reused. | Future provisioning-precondition, ordering, plan boundary, lost-Create resolution, one-page overflow, exact-version graph/history, byte-vector, corruption/replay, disabled-profile, `ACTIVE`-before-enable, V1-rejection, quarantine, and no-fallback gate |
 | Placement | config / server | serve/maintain include/exclude | Preserve prefix routing and explicit placement | `cargo test -p walgit-server --test routing_prefix --test maintain` |
 | Push broker | server | forwarding and trusted principal | Preserve broker fallback and opaque client credential lane | `just e2e`; config/code review |
 | Drain | server / maintainer | SIGTERM phases, `/readyz` | Preserve serving during phase 1 and refusal in phase 2 | `cargo test -p walgit-server --test drain` |
@@ -62,12 +75,12 @@ not implement the V5.3 control, event, recovery, or cutover contracts.
 | HTTP/2 | server | h2c or TLS ALPN | Preserve direct standalone support | server/config code review; later runtime probe |
 | Standalone | CLI / server | `walgit-server --config`, one binary | Preserve no-edge operation and self-signed default shape | `walgit config check --config walgit.standalone.toml`; `just e2e` |
 | Memory store | `walgit-store` | `MemoryStore` | Preserve full object-store contract | `cargo test -p walgit-store --test contract -- memory_contract` |
-| GCS store | `walgit-store` | `GcsStore` | Preserve GCS behavior and native conditional compose | memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized |
-| S3 store | `walgit-store` | `S3Store` | Harden default credentials, exact lengths, retry mapping, atomic final conditions, bounds and cleanup | unit tests; protected CI against disposable local RustFS via `just test-s3`; PR2 exact-provider primitive gate |
-| S3 credentials | `walgit-store` | SDK chain or configured env names | Empty override names preserve the refreshable default chain and temporary credentials; complete custom access/secret and optional session token override it; incoherent partial overrides fail without printing values | `cargo test -p walgit-store --lib` |
-| S3 endpoint/region/addressing | config / store | endpoint, region, path/virtual style | Preserve exact configured values; make contract test parameters explicit | required `WALGIT_TEST_S3_*` environment plus `just test-s3-provider` |
-| S3 multipart cleanup | store | create/upload/complete/abort | Abort on read, upload, condition, and completion failures; max 10,000 parts; require provider `AbortIncompleteMultipartUpload` lifecycle cleanup | unit/contract tests; exact-provider cleanup gate |
-| CI and supply chain | repository | `.github/workflows` | PR1 delivers pinned PR/main quality and audit jobs, a protected disposable RustFS contract, and signed development/main images built only from the exact successful main CI SHA; PR forks never publish, and no PR1 image is production-deployable. Future gates require critical PR jobs at 15-minute P95, parallel provider jobs capped at 15 minutes, a fail-closed provider workflow capped at 30 minutes, and promotion of the one tested digest without rebuild or mutable tags | actionlint and workflow review; branch protection, timing, exact-provider, recovery, signature, attestation, and exact-digest promotion remain later evidence |
+| GCS store | `walgit-store` | `GcsStore` | Preserve the shared closed control/bulk data classifier, GCS behavior, and native conditional compose for development and non-production only; exact-delete tests require Object Versioning enabled and soft-delete retention zero. GCS cannot satisfy the AWS-native Roles Anywhere production gate. | classifier/memory/unit gates; `just test-gcs <approved-disposable-bucket>` when authorized; future production-ineligibility gate |
+| S3 store | `walgit-store` | `S3Store` | Preserve independent control and bounded bulk SDK/HTTP pools, the closed shared data classifier, ranged-read bulk routing, streamed-body permit lifetime, no cross-lane fallback, exact lengths, retry mapping, credential-safe allowlisted diagnostics, atomic final conditions, bounds and cleanup | classifier/lane unit tests; protected CI against disposable local RustFS with a held-body isolation proof via `just test-s3`; PR2 exact-provider primitive gate |
+| S3 credentials | `walgit-config` / `walgit-store` | closed `default_chain` or `explicit_env` mode | `default_chain` requires empty custom names and preserves the refreshable SDK chain. `explicit_env` requires validated access/secret names and an optional session-token name; every named value must resolve non-empty, and missing, empty, or non-Unicode values fail without ambient-identity fallback or value disclosure. Config and direct store construction share one static validator. | `cargo test -p walgit-config s3`; `cargo test -p walgit-store --lib explicit_credentials`; protected disposable RustFS S3 contract |
+| S3 endpoint/region/addressing | config / store | explicit endpoint origin, region, DNS-compatible bucket, canonical prefix, path/virtual style | Static validation runs before credential or network access. The required explicit endpoint prevents ambient AWS endpoint configuration from selecting the provider; it uses exact canonical origin syntax with no path or trailing slash, and non-loopback endpoints require HTTPS. Region, bucket, prefix, and multipart part size use bounded closed syntax. Contract-test parameters remain explicit. | config boundary tests; required `WALGIT_TEST_S3_*` environment plus `just test-s3-provider` |
+| S3 multipart cleanup | store | create/upload/complete/abort | Abort on read, upload, condition, and completion failures; max 10,000 parts; require provider `AbortIncompleteMultipartUpload` lifecycle cleanup | unit/contract tests; exact-provider PR3 cleanup gate |
+| CI and supply chain | repository | `.github/workflows` | PR1 delivers pinned PR/main quality and audit jobs, a protected disposable RustFS contract, and signed development/main images built only from the exact successful main CI SHA; PR forks never publish, and no PR1 image is production-deployable. Future gates require `timeout-minutes <= 15` on every required PR/provider/evidence/recovery/cutover/promotion job and on the complete bootstrap gate, provider test work `<= 12` minutes, evidence reserve `>= 3` minutes, no 30- or 60-minute fallback, and promotion of one tested digest | actionlint and timeout-budget linter; branch protection, timing, evidence, exact-provider, recovery, signature, attestation, and exact-digest promotion remain later evidence |
 
 ## Bounded dependency advisory exception
 
@@ -80,20 +93,49 @@ not occur in this use. Remove the exception as soon as the AWS SDK permits
 
 ## Future provider, recovery, and production evidence
 
-Before PR2 merges, run the S3 contract against the selected provider with its
-real endpoint, region, addressing mode, credential mode, temporary bucket, and
-unique prefix. Prove credential rotation, a payload larger than 5 GiB, the
-calculated 10,000-part boundary, concurrent conditional Create and Update,
-conditional multipart completion, failed and abandoned multipart cleanup,
-Range/HEAD/ETag behavior, mandatory versioning, stable `ObjectVersionID`
-results, paginated version enumeration, exact-version HEAD/GET/delete, and
-delete-marker behavior. Never run these checks against a production data
-prefix.
+Before PR2 merges, run the bounded bootstrap contract against AWS S3 with the
+real account, endpoint, region, addressing mode, credential mode, temporary
+bucket, and unique disposable prefix. Prove concurrent conditional single-part
+Create and Update, exact conditional-conflict handling, Range/HEAD/ETag
+behavior, mandatory versioning, stable `ObjectVersionID` results, exact-version
+HEAD/GET, and delete-marker rejection. Prove one nontruncated empty initial
+`ListObjectVersions` page before the first write and one nontruncated final page
+whose exact-version hashes contain only the allowlisted control graph. Prove
+that a truncated page fails instead of paginating. Prove every initial control
+Create has a prior exact plan row and that a lost Create is resolved into the
+graph rather than orphaned. The anomaly-only `ListMultipartUploads` page must
+fail when nonempty or truncated, but its empty result must never be accepted as the
+authoritative zero-data proof. Run the simulation only in an approved
+disposable prefix, never against a production data prefix.
 
-PR3 must separately prove production-scale object counts, throughput,
-retention, event replay and fanout, exact build pins, recovery, and the stated
-fault model on the exact selected provider. Every result must bind the one
-production candidate image digest. Promotion must attest that same digest
-without a rebuild or mutable-tag substitution. These future jobs follow the
-15-minute per-job and 30-minute provider-workflow budgets in the production
-charter and fail closed when cleanup or evidence is incomplete.
+GCS contract tests remain development and non-production evidence. When they
+exercise exact deletion, they require Object Versioning enabled and soft-delete
+retention zero. GCS evidence cannot satisfy the AWS-native production gate or
+its Roles Anywhere activation ordering.
+
+The later V2 bootstrap gate runs only against an authorized brand-new production
+prefix on AWS S3. Before the gate, versioning has been stable for at least 15
+minutes, the lifecycle and conditional-write policy are frozen, the bootstrap
+role cannot delete or start multipart uploads, and the dedicated runtime Roles
+Anywhere profile has never been enabled. The gate binds the initial empty
+inventory, conditional `OPEN`, `PREPARING`, every resolved row in the at-most-
+262-row creation plan, the exact allowlisted final inventory, candidate image,
+and deterministic-CBOR proof signed by the pinned Ed25519 bootstrap key. Shared
+vectors cover the exact 88-byte inventory record, content corruption, ordering,
+duplicates, signature, prior-control, prefix, and session/generation replay
+failures. Any truncated inventory, unexpected object version, delete marker,
+multipart anomaly, V1 state, or unresolved plan row fails the hard cut. The
+prefix is quarantined without cleanup or reuse. `ACTIVE` must land before
+`EnableProfile`, runtime credential issue, workload or consumer start,
+readiness, or route switch. V2 has no legacy adoption migration.
+
+PR3 must separately prove multipart payloads above 5 GiB, the calculated
+10,000-part boundary, conditional multipart completion, abandoned-upload
+cleanup, long-running credential refresh, production-scale object counts,
+throughput, retention, event replay and fanout, exact build pins, recovery, and
+the stated fault model on AWS S3. Every result binds the one production
+candidate image digest. Promotion attests that same digest without a rebuild or
+mutable-tag substitution. Every required job and the complete bootstrap gate
+stay at or below 15 minutes; test work uses at most 12 minutes and reserves at
+least 3 minutes for evidence and disposable-prefix cleanup. A production prefix
+is never cleaned. There is no 30-minute or 60-minute fallback.

@@ -46,6 +46,8 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Checkpoint | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
 | Settings publish (D24) | refs sync (conditional GET) → log slot PUT → manifest CAS; readers pay nothing extra (settings ride inline on the manifest) | 3 rounds; read: 0 | `publish.rs::publish_settings_impl` |
 | Lease acquire | 1 GET → 1 CAS put (or 1 Create when absent) | 2 | `coord.rs::try_acquire` |
+| Dormant V2 `repo_control` load / write | load: 1 strict GET; Create/update: 1 conditional PUT; only after 412 or another ambiguous response, exactly 1 fresh strict GET classifies the outcome | 1 happy-path request; 2 on conflict/ambiguity; no HEAD, LIST, retry, or rebase | `v2_control.rs` |
+| Dormant V2 capacity reserve / expiry | caller already holds exact `StoredRepoControl`; 1 current capacity-control GET → exact tenant-page GET ∥ current hashed-shard GET → 1 conditional shard PUT; only after 412, ambiguity, or unusable success metadata, 1 strict current-shard GET classifies the outcome. An APPLYING terminal replay adds exact target-page and rooted-baseline GETs in one parallel round only when those objects differ from the already-loaded page/current shard, then returns without a PUT. | Write: 3 sequential rounds / 4 requests happy path; 4 rounds / 5 requests on conflict or ambiguity. APPLYING replay: 2–3 rounds / 3–5 GETs. No HEAD, LIST, retry, rebase, or exact-page current fallback. | `v2_capacity.rs`, `walgit-control::capacity` |
 | Publish, local commit (2026-08-23) | unchanged in round trips: after the manifest CAS the ref txns are applied to the local copy **before** the new manifest version is advertised, both under `sync_mutex` (the refs phase of every sync); the reverse order let a reader cache the old refs under the new version, and without the lock a concurrent sync replayed the same entry (two `update-ref`, a lock collision). A landed CAS is answered `ok` whatever the local apply does — the next sync replays (one conditional GET that then returns 200, no extra write). | 0 extra | `publish.rs::process_batch` |
 | Weekly compose: refs at the base's seq (`refs_at_seq`, 2026-08-23) | checkpoint `refs.pb` at that seq: 1 GET; else newest checkpoint ≤ seq (2 GETs) + the log entries through the seq (already cached by the refs sync in practice) — replayed in memory, never a local write | 1, or 2 + tail | `log_reader.rs::refs_at_seq`, `bundles.rs::compose_full_from_base` |
 | Maintainer bundle pass, refs level (retention + settle closed slots) | 1 list GET → at most 1 CAS (retention) → at most **1 CAS for every verdict of the pass** (`record_skipped_many`; was one CAS per settled slot until 2026-08-22: a rig repo with 9,654 closed slots paid 9,654 CAS per pass and, past the 4,096-verdict cap, forever) | ≤ 3 | `walgit-bundle/src/lib.rs::settle_closed_slots`, `ops.rs::record_skipped_many` |
@@ -55,6 +57,14 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | S3 multipart PUT | 1 create → upload parts → 1 conditional complete; after a conditional-complete 412 or exact conditional 409 only, abort then 1 destination HEAD | N + 2 happy path; no destination probe | `s3.rs::multipart_put` |
 | S3 compose | source HEADs for layout → upload/copy parts → 1 conditional complete; after a conditional-complete 412 or exact conditional 409 only, abort then 1 destination HEAD | sources + about one copy call per contiguous GiB (up to the calculated 5 GiB cap); fragmented sources coalesce to the bounded multipart target; +2 create/complete calls and **one fewer destination HEAD for Create** on the happy path | `s3.rs::compose` |
 | S3 conditional delete | 1 conditional DELETE; after a 412 only, 1 HEAD distinguishes absent from moved | 1 happy path; **one fewer HEAD** | `s3.rs::delete` |
+| S3 exact-version HEAD | 1 HEAD; an exact delete-marker 405 with complete AWS headers returns directly, while an ambiguous RustFS 405 pages version history until the named key/version is proved | 1 normal path; listing is bounded to 1,000 pages on the delete-marker failure path only | `s3.rs::head_version` |
+| Dormant S3 completed-version inventory page | exactly 1 `ListObjectVersions` request for one caller-owned page; strict decoding is local and does no per-entry request | 1 request, at most 1,000 entries; no internal pagination, retry, HEAD, cleanup, or hot-path use | `s3.rs::list_s3_version_evidence_page` |
+| Dormant S3 multipart anomaly page | exactly 1 `ListMultipartUploads` request for one caller-owned page; strict decoding is local | 1 request, at most 1,000 entries; non-authoritative and no internal pagination, retry, cleanup, or hot-path use | `s3.rs::list_s3_multipart_evidence_page` |
+
+S3 lane selection and bulk admission are local. Independent control/bulk
+transports add no provider request or sequential round trip to these budgets.
+Multipart and compose acquire one bulk permit for each provider call; a ranged
+GET retains one permit for its returned body lifetime.
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
 counts at push **5**, warm refs **1**, cold refs with one tail segment **2**, and checkpoint **4**. Cold open used to spend an
@@ -67,6 +77,16 @@ single PUT, CompleteMultipartUpload, and DeleteObject requests. It removed the
 old destination HEAD from compose Create and conditional delete. Source HEADs
 remain necessary for compose layout; every copied or ranged source is pinned
 to the version that HEAD returned. No CAS object's write rate changed.
+
+The dormant S3 inventory boundaries add no user-visible or write-path request.
+The future greenfield bootstrap makes two explicit, single-page
+`ListObjectVersions` calls: one before the first write and one after the planned
+control graph is complete. Either truncated result fails; bootstrap does not
+paginate. Exact-version verification adds one GET per returned version off the
+serving path. A separate one-page `ListMultipartUploads` call is only anomaly
+evidence: nonempty or truncated fails, but empty is not authoritative proof.
+This slice performs only the one provider request requested by each dormant
+page call and does not activate that bootstrap protocol.
 
 AWS can report an exact `ConditionalRequestConflict` (409) when concurrent
 conditional destination writes race. Walgit resolves that response with one

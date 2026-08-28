@@ -276,7 +276,7 @@ enum RepoAction {
         action: PolicyAction,
     },
     /// Per-repo settings in the WAL (D24): TOML overrides of [bundles],
-    /// [maintenance], [compaction] on top of the host config.
+    /// [maintenance], [compaction], and [upstream] on top of the host config.
     Settings {
         #[command(subcommand)]
         action: SettingsAction,
@@ -289,7 +289,7 @@ enum SettingsAction {
     Show {
         /// `owner/name`.
         repo: String,
-        /// Print the effective config (host ⊕ settings) as TOML instead.
+        /// Print the four effective repo-configurable sections as TOML instead.
         #[arg(long)]
         effective: bool,
     },
@@ -421,7 +421,7 @@ enum ConfigAction {
         #[arg(long)]
         strict: bool,
     },
-    /// Print the effective config as TOML.
+    /// Print a credential-safe diagnostic projection; secret values are omitted.
     Dump,
 }
 

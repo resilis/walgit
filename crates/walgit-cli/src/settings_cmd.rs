@@ -21,7 +21,12 @@ pub async fn run(action: SettingsAction, cfg: &Arc<Config>) -> Result<()> {
             let h = registry.open(&id).await?;
             h.sync_refs().await?;
             if effective {
-                println!("{}", toml::to_string_pretty(&*h.effective_config())?);
+                println!(
+                    "{}",
+                    h.effective_config()
+                        .effective_settings_view()
+                        .to_toml_string()?
+                );
                 return Ok(());
             }
             match h.settings() {

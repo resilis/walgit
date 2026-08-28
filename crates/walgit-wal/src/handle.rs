@@ -12,7 +12,7 @@ use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 use tracing::Instrument;
 use walgit_git::{LocalRepo, RepoId};
 use walgit_proto::v1::Manifest;
-use walgit_store::{Prefixed, Version};
+use walgit_store::{CasToken, Prefixed};
 
 use crate::error::WalError;
 use crate::progress::{ProgressRx, ProgressTx, Reporter};
@@ -57,7 +57,7 @@ pub struct RepoHandle {
 
     // Current manifest (last known). Short critical sections, no await.
     pub(crate) manifest: PLRwLock<Arc<Manifest>>,
-    pub(crate) manifest_version: PLMutex<Option<Version>>,
+    pub(crate) manifest_version: PLMutex<Option<CasToken>>,
 
     // Persistent local state.
     pub(crate) state: PLMutex<RepoState>,
@@ -134,7 +134,7 @@ impl RepoHandle {
         store: Prefixed,
         cfg: Arc<walgit_config::Config>,
         manifest: Manifest,
-        version: Option<Version>,
+        version: Option<CasToken>,
         state: RepoState,
         tasks: Arc<Tasks>,
         blocks: Arc<BlockCache>,
@@ -354,7 +354,7 @@ impl RepoHandle {
         self.manifest.read().clone()
     }
 
-    pub fn manifest_version(&self) -> Option<Version> {
+    pub fn manifest_version(&self) -> Option<CasToken> {
         self.manifest_version.lock().clone()
     }
 

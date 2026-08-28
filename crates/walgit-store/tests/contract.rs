@@ -10,13 +10,15 @@
 //! when `WALGIT_TEST_S3_ENDPOINT` is set. `GcsStore` is tested when
 //! `WALGIT_TEST_GCS_BUCKET` is set (StoreGcs adds that wrapper).
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use walgit_store::{
-    DynStore, GetOptions, GetResult, PutBody, PutMode, PutOptions, StoreError, memory::MemoryStore,
+    ComposeSource, DynStore, GetOptions, GetResult, ObjectStoreExt, ObjectVersionKind, PutBody,
+    PutMode, PutOptions, StoreError, memory::MemoryStore,
 };
 
 /// Run the full contract suite against `store` under `prefix`.
@@ -44,6 +46,233 @@ pub async fn run_contract(store: DynStore, prefix: &str) {
     test_declared_length_mismatch(&store, &p("declared-length")).await;
     test_multipart_path(&store, &p("multi")).await;
     test_compose(&store, &p("compose")).await;
+    store
+        .verify_versioning()
+        .await
+        .expect("the contract requires bucket versioning");
+    test_version_history(&store, &p("versions")).await;
+    if store.backend() == "s3" {
+        test_s3_delete_marker_history(&store, &p("delete-markers")).await;
+    }
+}
+
+async fn test_version_history(store: &DynStore, key: &str) {
+    let first = put_bytes(store, key, b"same-payload".as_slice(), PutMode::Create).await;
+    let second = put_bytes(store, key, b"same-payload".as_slice(), PutMode::Overwrite).await;
+    let third = put_bytes(store, key, b"same-payload".as_slice(), PutMode::Overwrite).await;
+    let first_id = first
+        .object_version_id
+        .clone()
+        .expect("version-aware PUT must return ObjectVersionID");
+    let second_id = second
+        .object_version_id
+        .clone()
+        .expect("overwrite must return ObjectVersionID");
+    let third_id = third
+        .object_version_id
+        .clone()
+        .expect("second overwrite must return ObjectVersionID");
+    if store.backend() == "s3" {
+        assert_eq!(
+            first.version, second.version,
+            "identical single-part bytes must exercise the same-ETag case"
+        );
+        assert_eq!(second.version, third.version);
+    }
+    assert_ne!(first_id, second_id, "same bytes need distinct version IDs");
+    assert_ne!(second_id, third_id, "each overwrite needs a new version ID");
+
+    let old = store
+        .get_version(key, &first_id, None)
+        .await
+        .expect("exact-version GET");
+    let (old_meta, old_body) = collect_body(old).await;
+    assert_eq!(old_meta.object_version_id, Some(first_id.clone()));
+    assert_eq!(&old_body[..], b"same-payload");
+    assert_eq!(
+        store
+            .head_version(key, &first_id)
+            .await
+            .expect("exact-version HEAD")
+            .expect("old version exists")
+            .object_version_id,
+        Some(first_id.clone())
+    );
+
+    store
+        .delete_version(key, &first_id)
+        .await
+        .expect("exact-version delete");
+    assert!(
+        store
+            .head_version(key, &first_id)
+            .await
+            .expect("head deleted exact version")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .head(key)
+            .await
+            .expect("head current")
+            .expect("current survives deleting old version")
+            .object_version_id,
+        Some(third_id.clone())
+    );
+
+    let mut cursor = None;
+    let mut history = Vec::new();
+    let mut saw_continuation = false;
+    for _ in 0..16 {
+        let page = store
+            .list_versions(key, cursor.as_ref(), 1)
+            .await
+            .expect("paginated version listing");
+        history.extend(page.versions);
+        cursor = page.next;
+        saw_continuation |= cursor.is_some();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "version listing did not terminate");
+    assert!(saw_continuation, "limit=1 must force continuation paging");
+    assert_eq!(history.len(), 2);
+    let listed_ids: HashSet<_> = history
+        .iter()
+        .map(|version| version.object_version_id.as_str())
+        .collect();
+    assert_eq!(listed_ids.len(), history.len(), "duplicate version IDs");
+    assert_eq!(
+        listed_ids,
+        HashSet::from([second_id.as_str(), third_id.as_str()])
+    );
+    let latest: Vec<_> = history
+        .iter()
+        .filter(|version| version.kind == ObjectVersionKind::Object && version.is_latest)
+        .collect();
+    assert_eq!(latest.len(), 1, "exactly one live generation is latest");
+    let current = latest
+        .first()
+        .expect("current generation must be enumerated");
+    assert_eq!(current.object_version_id, third_id);
+
+    let multipart_key = format!("{key}-multipart");
+    let multipart = put_bytes(
+        store,
+        &multipart_key,
+        Bytes::from(vec![0x5a; 6 * 1024 * 1024]),
+        PutMode::Create,
+    )
+    .await;
+    let multipart_id = multipart
+        .object_version_id
+        .clone()
+        .expect("multipart completion must return ObjectVersionID");
+    assert_eq!(
+        store
+            .head_version(&multipart_key, &multipart_id)
+            .await
+            .expect("multipart exact head")
+            .expect("multipart version exists")
+            .object_version_id,
+        Some(multipart_id.clone())
+    );
+
+    store.delete_version(key, &second_id).await.unwrap();
+    store.delete_version(key, &third_id).await.unwrap();
+    store
+        .delete_version(&multipart_key, &multipart_id)
+        .await
+        .unwrap();
+}
+
+async fn test_s3_delete_marker_history(store: &DynStore, key: &str) {
+    let first = put_bytes(store, key, b"first".as_slice(), PutMode::Create).await;
+    let second = put_bytes(store, key, b"second".as_slice(), PutMode::Overwrite).await;
+    let first_id = first.object_version_id.clone().expect("first S3 VersionId");
+    let second_id = second
+        .object_version_id
+        .clone()
+        .expect("second S3 VersionId");
+    store.delete(key, None).await.expect("create delete marker");
+    assert!(store.head(key).await.expect("head marker").is_none());
+
+    let mut cursor = None;
+    let mut history = Vec::new();
+    let mut saw_continuation = false;
+    for _ in 0..16 {
+        let page = store
+            .list_versions(key, cursor.as_ref(), 1)
+            .await
+            .expect("list paginated marker history");
+        history.extend(page.versions);
+        cursor = page.next;
+        saw_continuation |= cursor.is_some();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "mixed S3 pagination did not terminate");
+    assert!(saw_continuation, "limit=1 must force mixed pagination");
+    assert_eq!(history.len(), 3);
+    let listed_ids: HashSet<_> = history
+        .iter()
+        .map(|version| version.object_version_id.as_str())
+        .collect();
+    assert_eq!(listed_ids.len(), history.len(), "duplicate mixed versions");
+    assert!(listed_ids.contains(first_id.as_str()));
+    assert!(listed_ids.contains(second_id.as_str()));
+
+    let marker = history
+        .iter()
+        .find(|version| version.kind == ObjectVersionKind::DeleteMarker && version.is_latest)
+        .expect("latest S3 delete marker");
+    let marker_id = marker.object_version_id.clone();
+    assert!(listed_ids.contains(marker_id.as_str()));
+    assert_eq!(
+        history.iter().filter(|version| version.is_latest).count(),
+        1,
+        "only the delete marker is latest"
+    );
+    assert!(
+        history
+            .iter()
+            .filter(|version| { version.kind == ObjectVersionKind::Object && !version.is_latest })
+            .count()
+            == 2
+    );
+    assert!(
+        store
+            .head_version(key, &marker_id)
+            .await
+            .expect("exact marker HEAD")
+            .is_none()
+    );
+    let (_, hidden) = store
+        .get_version(key, &second_id, None)
+        .await
+        .expect("historical GET behind marker")
+        .bytes()
+        .await
+        .expect("collect hidden version")
+        .expect("hidden version body");
+    assert_eq!(&hidden[..], b"second");
+    store
+        .delete_version(key, &marker_id)
+        .await
+        .expect("delete exact marker");
+    assert_eq!(
+        store
+            .head(key)
+            .await
+            .expect("head restored current")
+            .expect("prior current restored")
+            .object_version_id,
+        Some(second_id.clone())
+    );
+    store.delete_version(key, &first_id).await.unwrap();
+    store.delete_version(key, &second_id).await.unwrap();
 }
 
 /// A backend must never complete a shortened object or ignore bytes beyond a
@@ -107,7 +336,7 @@ async fn test_compose(store: &DynStore, key: &str) {
     let body = Bytes::from(body);
     let h = format!("{key}.hdr");
     let b = format!("{key}.body");
-    store
+    let header_meta = store
         .put(
             &h,
             PutBody::Bytes(header.clone()),
@@ -115,7 +344,7 @@ async fn test_compose(store: &DynStore, key: &str) {
         )
         .await
         .expect("put header");
-    store
+    let body_meta = store
         .put(
             &b,
             PutBody::Bytes(body.clone()),
@@ -123,10 +352,22 @@ async fn test_compose(store: &DynStore, key: &str) {
         )
         .await
         .expect("put body");
+    let sources = [
+        ComposeSource::try_from(header_meta).expect("exact header source"),
+        ComposeSource::try_from(body_meta).expect("exact body source"),
+    ];
+    let overwritten_header = store
+        .put(
+            &h,
+            PutBody::Bytes(Bytes::from_static(b"overwritten")),
+            PutOptions::from(PutMode::Overwrite),
+        )
+        .await
+        .expect("overwrite source after capturing exact reference");
     let meta = store
         .compose(
             key,
-            &[h.clone(), b.clone()],
+            &sources,
             PutOptions {
                 mode: PutMode::Create,
                 immutable: true,
@@ -146,18 +387,20 @@ async fn test_compose(store: &DynStore, key: &str) {
     assert_eq!(&got[header.len()..], &body[..], "composed body differs");
     // Create on an existing object is a precondition failure.
     let again = store
-        .compose(
-            key,
-            &[h.clone(), b.clone()],
-            PutOptions::from(PutMode::Create),
-        )
+        .compose(key, &sources, PutOptions::from(PutMode::Create))
         .await;
     assert!(
         matches!(again, Err(StoreError::PreconditionFailed { .. })),
         "{again:?}"
     );
-    for k in [key, h.as_str(), b.as_str()] {
-        let _ = store.delete(k, None).await;
+    let mut cleanup = sources.to_vec();
+    cleanup.push(ComposeSource::try_from(overwritten_header).expect("new header version"));
+    cleanup.push(ComposeSource::try_from(meta).expect("composed version"));
+    for temporary in cleanup {
+        store
+            .delete_version(&temporary.key, &temporary.object_version_id)
+            .await
+            .expect("exact compose-test cleanup");
     }
 }
 
@@ -351,7 +594,7 @@ async fn test_get_if_none_match(store: &DynStore, key: &str) {
         .get(
             key,
             GetOptions {
-                if_none_match: Some(walgit_store::Version::new("different")),
+                if_none_match: Some(walgit_store::CasToken::new("different")),
                 ..Default::default()
             },
         )
@@ -374,7 +617,7 @@ async fn test_get_if_match_mismatch(store: &DynStore, key: &str) {
         .get(
             key,
             GetOptions {
-                if_match: Some(walgit_store::Version::new("wrong-etag")),
+                if_match: Some(walgit_store::CasToken::new("wrong-etag")),
                 ..Default::default()
             },
         )
@@ -479,7 +722,7 @@ async fn test_delete(store: &DynStore, key: &str) {
 
     // Put then conditional delete with wrong version → fail.
     let meta = put_bytes(store, key, b"delete-me".as_slice(), PutMode::Create).await;
-    let wrong = walgit_store::Version::new("wrong");
+    let wrong = walgit_store::CasToken::new("wrong");
     let err = store.delete(key, Some(wrong)).await;
     assert!(err.is_err(), "delete with wrong version should fail");
     assert!(
@@ -511,7 +754,7 @@ async fn test_delete(store: &DynStore, key: &str) {
 
     // Conditional delete of absent key → NotFound.
     let err = store
-        .delete(key, Some(walgit_store::Version::new("anything")))
+        .delete(key, Some(walgit_store::CasToken::new("anything")))
         .await;
     assert!(err.is_err(), "conditional delete absent should fail");
     assert!(
@@ -814,36 +1057,161 @@ async fn test_s3_multipart_failures_and_conditions(store: &DynStore, prefix: &st
 async fn s3_test_client(cfg: &walgit_config::StoreConfig) -> aws_sdk_s3::Client {
     use aws_sdk_s3::config::{Credentials, Region};
 
+    let explicit_credentials = s3_contract_explicit_credentials(cfg, |name| std::env::var(name))
+        .unwrap_or_else(|message| panic!("{message}"))
+        .map(|(access, secret, token)| {
+            Credentials::new(access, secret, token, None, "walgit-contract-explicit-env")
+        });
     let region = Region::new(cfg.s3.region.clone());
-    let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region.clone())
-        .load()
-        .await;
+        .endpoint_url(&cfg.s3.endpoint)
+        .use_fips(false)
+        .use_dual_stack(false);
+    if let Some(credentials) = explicit_credentials.clone() {
+        loader = loader.credentials_provider(credentials);
+    }
+    let shared = loader.load().await;
     let mut builder = aws_sdk_s3::config::Builder::from(&shared)
         .region(region)
+        .endpoint_url(&cfg.s3.endpoint)
+        .use_fips(false)
+        .use_dual_stack(false)
         .force_path_style(cfg.s3.force_path_style)
         .behavior_version_latest();
-    if !cfg.s3.access_key_env.is_empty() {
-        let access = std::env::var(&cfg.s3.access_key_env)
-            .expect("configured S3 contract access-key variable");
-        let secret = std::env::var(&cfg.s3.secret_key_env)
-            .expect("configured S3 contract secret-key variable");
-        let token = (!cfg.s3.session_token_env.is_empty()).then(|| {
-            std::env::var(&cfg.s3.session_token_env)
-                .expect("configured S3 contract session-token variable")
-        });
-        builder = builder.credentials_provider(Credentials::new(
-            access,
-            secret,
-            token,
-            None,
-            "walgit-contract-explicit-env",
-        ));
-    }
-    if !cfg.s3.endpoint.is_empty() {
-        builder = builder.endpoint_url(&cfg.s3.endpoint);
+    if let Some(credentials) = explicit_credentials {
+        builder = builder.credentials_provider(credentials);
     }
     aws_sdk_s3::Client::from_conf(builder.build())
+}
+
+#[cfg(feature = "s3")]
+type S3ContractCredentials = (String, String, Option<String>);
+
+#[cfg(feature = "s3")]
+fn s3_contract_explicit_credentials(
+    cfg: &walgit_config::StoreConfig,
+    read: impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<S3ContractCredentials>, &'static str> {
+    cfg.validate_s3()
+        .map_err(|_| "invalid static S3 contract configuration")?;
+    if cfg.s3.credential_mode == walgit_config::S3CredentialMode::DefaultChain {
+        return Ok(None);
+    }
+
+    let required = |name: &str, error| {
+        read(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or(error)
+    };
+    let access = required(
+        &cfg.s3.access_key_env,
+        "configured S3 contract access-key credential is missing or invalid",
+    )?;
+    let secret = required(
+        &cfg.s3.secret_key_env,
+        "configured S3 contract secret-key credential is missing or invalid",
+    )?;
+    let token = if cfg.s3.session_token_env.is_empty() {
+        None
+    } else {
+        Some(required(
+            &cfg.s3.session_token_env,
+            "configured S3 contract session-token credential is missing or invalid",
+        )?)
+    };
+    Ok(Some((access, secret, token)))
+}
+
+fn s3_contract_credential_mode(
+    value: &str,
+) -> Result<walgit_config::S3CredentialMode, &'static str> {
+    match value {
+        "default" => Ok(walgit_config::S3CredentialMode::DefaultChain),
+        "explicit" => Ok(walgit_config::S3CredentialMode::ExplicitEnv),
+        _ => Err("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit"),
+    }
+}
+
+#[cfg(feature = "s3")]
+#[derive(Debug)]
+struct S3ContractSettings {
+    endpoint: String,
+    bucket: String,
+    region: String,
+    force_path_style: bool,
+    credential_mode: walgit_config::S3CredentialMode,
+    credential_mode_label: &'static str,
+    access_key_env: String,
+    secret_key_env: String,
+    session_token_env: String,
+    configured_prefix: String,
+}
+
+#[cfg(feature = "s3")]
+fn s3_contract_env(
+    read: &mut impl FnMut(&str) -> Result<String, std::env::VarError>,
+    name: &str,
+) -> Result<Option<String>, &'static str> {
+    match read(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("S3 contract environment input must be valid Unicode")
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+fn load_s3_contract_settings(
+    mut read: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<S3ContractSettings>, &'static str> {
+    let Some(endpoint) = s3_contract_env(&mut read, "WALGIT_TEST_S3_ENDPOINT")? else {
+        return Ok(None);
+    };
+    let bucket = s3_contract_env(&mut read, "WALGIT_TEST_S3_BUCKET")?
+        .unwrap_or_else(|| "walgit-test".into());
+    let region =
+        s3_contract_env(&mut read, "WALGIT_TEST_S3_REGION")?.unwrap_or_else(|| "us-east-1".into());
+    let force_path_style =
+        match s3_contract_env(&mut read, "WALGIT_TEST_S3_FORCE_PATH_STYLE")?.as_deref() {
+            None | Some("true") => true,
+            Some("false") => false,
+            Some(_) => return Err("WALGIT_TEST_S3_FORCE_PATH_STYLE must be true or false"),
+        };
+    let credential_mode_value = s3_contract_env(&mut read, "WALGIT_TEST_S3_CREDENTIAL_MODE")?
+        .unwrap_or_else(|| "default".into());
+    let credential_mode = s3_contract_credential_mode(&credential_mode_value)?;
+    let (credential_mode_label, access_key_env, secret_key_env, session_token_env) =
+        match credential_mode {
+            walgit_config::S3CredentialMode::DefaultChain => {
+                ("default", String::new(), String::new(), String::new())
+            }
+            walgit_config::S3CredentialMode::ExplicitEnv => (
+                "explicit",
+                s3_contract_env(&mut read, "WALGIT_TEST_S3_ACCESS_KEY_ENV")?
+                    .unwrap_or_else(|| "AWS_ACCESS_KEY_ID".into()),
+                s3_contract_env(&mut read, "WALGIT_TEST_S3_SECRET_KEY_ENV")?
+                    .unwrap_or_else(|| "AWS_SECRET_ACCESS_KEY".into()),
+                s3_contract_env(&mut read, "WALGIT_TEST_S3_SESSION_TOKEN_ENV")?.unwrap_or_default(),
+            ),
+        };
+    let configured_prefix = s3_contract_env(&mut read, "WALGIT_TEST_S3_PREFIX")?
+        .unwrap_or_else(|| "contract-test".into());
+
+    Ok(Some(S3ContractSettings {
+        endpoint,
+        bucket,
+        region,
+        force_path_style,
+        credential_mode,
+        credential_mode_label,
+        access_key_env,
+        secret_key_env,
+        session_token_env,
+        configured_prefix,
+    }))
 }
 
 // ---- test wrappers -----------------------------------------------------
@@ -857,51 +1225,53 @@ async fn memory_contract() {
 #[cfg(feature = "s3")]
 #[tokio::test]
 async fn s3_contract() {
-    let endpoint = match std::env::var("WALGIT_TEST_S3_ENDPOINT") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
-            return;
-        }
-    };
-    let bucket = std::env::var("WALGIT_TEST_S3_BUCKET").unwrap_or_else(|_| "walgit-test".into());
-    let region = std::env::var("WALGIT_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-    let force_path_style = std::env::var("WALGIT_TEST_S3_FORCE_PATH_STYLE")
-        .map(|value| value.parse::<bool>().expect("true or false"))
-        .unwrap_or(true);
-    let credential_mode =
-        std::env::var("WALGIT_TEST_S3_CREDENTIAL_MODE").unwrap_or_else(|_| "default".into());
-    let (access_key_env, secret_key_env, session_token_env) = match credential_mode.as_str() {
-        "default" => (String::new(), String::new(), String::new()),
-        "explicit" => (
-            std::env::var("WALGIT_TEST_S3_ACCESS_KEY_ENV")
-                .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".into()),
-            std::env::var("WALGIT_TEST_S3_SECRET_KEY_ENV")
-                .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".into()),
-            std::env::var("WALGIT_TEST_S3_SESSION_TOKEN_ENV").unwrap_or_default(),
-        ),
-        other => panic!("WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit, got {other}"),
+    let settings = load_s3_contract_settings(|name| std::env::var(name))
+        .unwrap_or_else(|message| panic!("{message}"));
+    let Some(S3ContractSettings {
+        endpoint,
+        bucket,
+        region,
+        force_path_style,
+        credential_mode,
+        credential_mode_label,
+        access_key_env,
+        secret_key_env,
+        session_token_env,
+        configured_prefix,
+    }) = settings
+    else {
+        eprintln!("skipping s3_contract: WALGIT_TEST_S3_ENDPOINT not set");
+        return;
     };
 
-    // Unique prefix per run.
-    let prefix_base =
-        std::env::var("WALGIT_TEST_S3_PREFIX").unwrap_or_else(|_| "contract-test".into());
-    let prefix = format!("{prefix_base}-{}", uuid::Uuid::new_v4().simple());
+    // Validate the exact configured deployment prefix, then isolate this run
+    // below it. The run child is an object-key namespace, not another
+    // deployment-prefix segment, so a valid 63-byte configured segment stays
+    // valid instead of being lengthened by the UUID.
+    let run_child = format!("contract-run-{}", uuid::Uuid::new_v4().simple());
+    let prefix = if configured_prefix.is_empty() {
+        format!("repos/{run_child}/contract")
+    } else {
+        format!("{configured_prefix}/repos/{run_child}/contract")
+    };
     eprintln!(
-        "[s3_contract] endpoint={endpoint} region={region} path_style={force_path_style} bucket={bucket} prefix={prefix} credentials={credential_mode}"
+        "[s3_contract] provider parameters loaded: path_style={force_path_style} credentials={credential_mode_label}"
     );
 
     let cfg = walgit_config::StoreConfig {
         backend: walgit_config::StoreBackend::S3,
         bucket: bucket.clone(),
-        prefix: prefix.clone(),
+        prefix: configured_prefix,
         s3: walgit_config::S3Config {
             endpoint: endpoint.clone(),
             region,
+            credential_mode,
             access_key_env,
             secret_key_env,
             session_token_env,
             force_path_style,
+            bulk_clients: 2,
+            bulk_concurrency: 1,
         },
         multipart_threshold: bytesize::ByteSize::mib(5),
         multipart_part_size: bytesize::ByteSize::mib(5),
@@ -915,20 +1285,44 @@ async fn s3_contract() {
         .expect("S3Store::new");
     let store: DynStore = Arc::new(store);
 
+    test_s3_control_lane_isolation(&store, &prefix).await;
+
     run_contract(store.clone(), &prefix).await;
     test_s3_multipart_failures_and_conditions(&store, &prefix).await;
 
-    // Cleanup: delete all objects under the prefix.
-    let to_delete: Vec<_> = futures::stream::iter(
-        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
-            .collect::<Vec<_>>()
-            .await,
-    )
-    .filter_map(|r| async move { r.ok() })
-    .collect::<Vec<_>>()
-    .await;
-    for m in to_delete {
-        store.delete(&m.key, None).await.expect("contract cleanup");
+    // Cleanup exact historical versions when versioning is enabled. Deleting
+    // only current objects would leave noncurrent versions and delete markers.
+    if store.verify_versioning().await.is_ok() {
+        loop {
+            let page = store
+                .list_versions(&format!("{prefix}/"), None, 1_000)
+                .await
+                .expect("list versions for cleanup");
+            if page.versions.is_empty() {
+                break;
+            }
+            for version in page.versions {
+                store
+                    .delete_version(&version.key, &version.object_version_id)
+                    .await
+                    .expect("delete exact version during cleanup");
+            }
+        }
+    } else {
+        let to_delete: Vec<_> = futures::stream::iter(
+            walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
+                .collect::<Vec<_>>()
+                .await,
+        )
+        .filter_map(|r| async move { r.ok() })
+        .collect::<Vec<_>>()
+        .await;
+        for meta in to_delete {
+            store
+                .delete(&meta.key, None)
+                .await
+                .expect("contract cleanup");
+        }
     }
     let leftovers = walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
         .collect::<Vec<_>>()
@@ -949,6 +1343,157 @@ async fn s3_contract() {
         incomplete.uploads().is_empty(),
         "contract cleanup left incomplete multipart uploads under the disposable prefix"
     );
+}
+
+#[cfg(feature = "s3")]
+async fn test_s3_control_lane_isolation(store: &DynStore, repo_root: &str) {
+    let control_keys = [
+        format!("{repo_root}/manifest.pb"),
+        format!("{repo_root}/events/cursor.json"),
+    ];
+    let bulk_key = format!("{repo_root}/wal/lane-probe.pack");
+    for control_key in &control_keys {
+        put_bytes(
+            store,
+            control_key,
+            Bytes::from_static(b"control"),
+            PutMode::Create,
+        )
+        .await;
+    }
+    put_bytes(
+        store,
+        &bulk_key,
+        Bytes::from_static(b"bulk"),
+        PutMode::Create,
+    )
+    .await;
+
+    let held = store
+        .get(&bulk_key, GetOptions::default())
+        .await
+        .expect("first bulk GET");
+    let held_body = match held {
+        GetResult::Object { body, .. } => body,
+        GetResult::NotModified { .. } => panic!("unconditional bulk GET was not modified"),
+    };
+
+    let waiting_store = store.clone();
+    let waiting_key = bulk_key.clone();
+    let mut waiting =
+        tokio::spawn(async move { waiting_store.get(&waiting_key, GetOptions::default()).await });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err(),
+        "the second bulk GET must remain queued while the first body is open"
+    );
+
+    for control_key in &control_keys {
+        let control = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.get(control_key, GetOptions::default()),
+        )
+        .await
+        .expect("control GET must not wait behind the held bulk body")
+        .expect("control GET");
+        let (_, bytes) = collect_body(control).await;
+        assert_eq!(bytes, Bytes::from_static(b"control"), "{control_key}");
+    }
+
+    drop(held_body);
+    let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("queued bulk GET resumes after body drop")
+        .expect("queued bulk task")
+        .expect("second bulk GET");
+    let (_, bytes) = collect_body(resumed).await;
+    assert_eq!(bytes, Bytes::from_static(b"bulk"));
+}
+
+#[test]
+fn invalid_s3_contract_credential_mode_is_source_free() {
+    const SENTINEL: &str = "credential-mode-secret-sentinel";
+    let error = s3_contract_credential_mode(SENTINEL).unwrap_err();
+    assert_eq!(
+        error,
+        "WALGIT_TEST_S3_CREDENTIAL_MODE must be default or explicit"
+    );
+    assert!(!error.contains(SENTINEL));
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn non_unicode_s3_contract_settings_are_source_free_and_never_skip() {
+    const SENTINEL: &str = "provider-setting-secret-sentinel";
+    const INPUTS: &[&str] = &[
+        "WALGIT_TEST_S3_ENDPOINT",
+        "WALGIT_TEST_S3_BUCKET",
+        "WALGIT_TEST_S3_REGION",
+        "WALGIT_TEST_S3_FORCE_PATH_STYLE",
+        "WALGIT_TEST_S3_CREDENTIAL_MODE",
+        "WALGIT_TEST_S3_ACCESS_KEY_ENV",
+        "WALGIT_TEST_S3_SECRET_KEY_ENV",
+        "WALGIT_TEST_S3_SESSION_TOKEN_ENV",
+        "WALGIT_TEST_S3_PREFIX",
+    ];
+
+    for invalid_input in INPUTS {
+        let result = load_s3_contract_settings(|name| {
+            if name == *invalid_input {
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    SENTINEL,
+                )))
+            } else {
+                match name {
+                    "WALGIT_TEST_S3_ENDPOINT" => Ok("https://s3.example.test".into()),
+                    "WALGIT_TEST_S3_CREDENTIAL_MODE" => Ok("explicit".into()),
+                    _ => Err(std::env::VarError::NotPresent),
+                }
+            }
+        });
+        let error = result.expect_err("non-Unicode provider input must fail");
+        assert_eq!(error, "S3 contract environment input must be valid Unicode");
+        assert!(!error.contains(SENTINEL));
+    }
+
+    let absent = load_s3_contract_settings(|_| Err(std::env::VarError::NotPresent))
+        .expect("a genuinely absent endpoint may skip the optional contract");
+    assert!(absent.is_none());
+}
+
+#[cfg(feature = "s3")]
+#[test]
+fn non_unicode_s3_contract_credentials_are_source_free() {
+    const SENTINEL: &str = "credential-secret-sentinel";
+    let mut cfg = walgit_config::StoreConfig {
+        backend: walgit_config::StoreBackend::S3,
+        bucket: "contract-bucket".into(),
+        ..Default::default()
+    };
+    cfg.s3.endpoint = "https://s3.example.test".into();
+    cfg.s3.credential_mode = walgit_config::S3CredentialMode::ExplicitEnv;
+    cfg.s3.access_key_env = "CONTRACT_ACCESS_KEY".into();
+    cfg.s3.secret_key_env = "CONTRACT_SECRET_KEY".into();
+
+    let error = s3_contract_explicit_credentials(&cfg, |name| {
+        if name == "CONTRACT_ACCESS_KEY" {
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                SENTINEL,
+            )))
+        } else {
+            Ok("other-secret-sentinel".into())
+        }
+    })
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        "configured S3 contract access-key credential is missing or invalid"
+    );
+    assert!(!error.contains(SENTINEL));
+    assert!(!error.contains("other-secret-sentinel"));
 }
 
 #[cfg(feature = "gcs")]
@@ -983,20 +1528,34 @@ async fn gcs_contract() {
 
     run_contract(store.clone(), &prefix).await;
 
-    // Cleanup: delete all objects under the prefix.
-    let to_delete: Vec<_> = futures::stream::iter(
-        walgit_store::ObjectStore::list(store.as_ref(), &prefix, None)
-            .collect::<Vec<_>>()
-            .await,
-    )
-    .filter_map(|r| async move { r.ok() })
-    .collect::<Vec<_>>()
-    .await;
-    let count = to_delete.len();
-    for m in &to_delete {
-        let _ = store.delete(&m.key, None).await;
+    // Cleanup every exact generation. Soft delete is rejected at startup, so
+    // a successful exact delete permanently removes the named generation.
+    let cleanup_prefix = format!("{prefix}/");
+    let mut count = 0usize;
+    loop {
+        let page = store
+            .list_versions(&cleanup_prefix, None, 1_000)
+            .await
+            .expect("list GCS generations for cleanup");
+        if page.versions.is_empty() {
+            assert!(page.next.is_none());
+            break;
+        }
+        for version in page.versions {
+            store
+                .delete_version(&version.key, &version.object_version_id)
+                .await
+                .expect("exact-delete GCS contract generation");
+            count += 1;
+        }
     }
-    eprintln!("[gcs_contract] cleanup done ({count} objects deleted)");
+    let final_page = store
+        .list_versions(&cleanup_prefix, None, 1)
+        .await
+        .expect("verify empty GCS generation inventory");
+    assert!(final_page.versions.is_empty());
+    assert!(final_page.next.is_none());
+    eprintln!("[gcs_contract] cleanup done ({count} generations exact-deleted)");
 }
 
 /// Control plane must stay fast under bulk load (prod 2026-08-20: a 184-byte
@@ -1043,7 +1602,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
         .get(
             &big_key,
             GetOptions {
-                if_none_match: Some(walgit_store::Version::new("1")),
+                if_none_match: Some(walgit_store::CasToken::new("1")),
                 range: Some(0..16),
                 ..Default::default()
             },
@@ -1104,7 +1663,7 @@ async fn gcs_control_plane_not_starved_by_bulk() {
             .get(
                 &big_key,
                 GetOptions {
-                    if_none_match: Some(walgit_store::Version::new("1")),
+                    if_none_match: Some(walgit_store::CasToken::new("1")),
                     range: Some(0..16),
                     ..Default::default()
                 },

@@ -860,8 +860,9 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
     )?;
 
     // Plan before: only the two newest hourly slots are wanted (D21, 2026-08-22) — the older ones
-    // are not work even though they are missing; the closed one of the two is empty (the weekly
-    // holds everything up to now-ish).
+    // are not work even though they are missing. The closed one of the two is empty (the weekly
+    // holds everything up to now-ish). Within SLOT_CLOSE_GRACE after the hour, the newest retained
+    // slot is correctly Pending rather than Missing.
     let ctx = walgit_bundle::slots::PlanContext {
         first_state: h.first_state_time(),
         can_full: true,
@@ -869,14 +870,27 @@ async fn one_pass_settles_all_closed_empty_slots() -> anyhow::Result<()> {
         wrong_host_reason: None,
     };
     let rows = server.state.bundles.plan(&id, now, ctx).await?;
-    let missing_before = rows
-        .iter()
-        .filter(|r| r.strategy == "hourly" && r.status == walgit_bundle::slots::SlotStatus::Missing)
-        .count();
+    let hourly_before: Vec<_> = rows.iter().filter(|r| r.strategy == "hourly").collect();
     assert_eq!(
-        missing_before,
+        hourly_before.len(),
         walgit_bundle::slots::INCREMENTALS_KEPT,
         "only the newest slots are planned: {rows:?}"
+    );
+    assert!(
+        hourly_before.iter().all(|r| matches!(
+            r.status,
+            walgit_bundle::slots::SlotStatus::Missing | walgit_bundle::slots::SlotStatus::Pending
+        )),
+        "the newest slots must be actionable or inside the close grace: {rows:?}"
+    );
+    let missing_before = hourly_before
+        .iter()
+        .filter(|r| r.status == walgit_bundle::slots::SlotStatus::Missing)
+        .count();
+    assert!(
+        (walgit_bundle::slots::INCREMENTALS_KEPT - 1..=walgit_bundle::slots::INCREMENTALS_KEPT)
+            .contains(&missing_before),
+        "the older retained slot must be closed and actionable: {rows:?}"
     );
 
     // ONE pass.

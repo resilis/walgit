@@ -57,7 +57,7 @@ message Manifest {
 }
 
 // D24: per-repository settings — a TOML document restricted to the sections a
-// repository may override (`bundles`, `maintenance`, `compaction`); the
+// repository may override (`bundles`, `maintenance`, `compaction`, `upstream`); the
 // effective configuration is the host's walgit.toml with this merged on top
 // (`Config::with_settings`). Validated at publish; invalid settings are
 // never published.

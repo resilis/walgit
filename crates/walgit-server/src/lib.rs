@@ -48,6 +48,11 @@ use walgit_store::DynStore;
 use crate::error::ApiError;
 use crate::repo::{RepoRoute, parse_repo_route};
 
+/// Remove the request URL before an HTTP client error can reach logs or callers.
+pub(crate) fn redact_request_url(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
+}
+
 /// Shared server state.
 pub struct AppState {
     pub cfg: Arc<walgit_config::Config>,
@@ -95,7 +100,7 @@ impl AppState {
             store,
             registry,
             bundles,
-            auth: auth::Authenticator::new(&cfg),
+            auth: auth::Authenticator::new(&cfg)?,
             semaphores: middleware::RepoSemaphores::new(cfg.server.max_concurrent_per_repo),
             inflight: Arc::new(middleware::Inflight::default()),
             caches: cache::ServerCaches::new(&cfg),
@@ -728,6 +733,29 @@ impl walgit_bundle::BundleSource for RegistryBundleSource {
 
 #[cfg(test)]
 mod listen_tests {
+    #[test]
+    fn request_errors_do_not_retain_url_credentials() {
+        let raw = "https://request-user:request-pass@errors.example/request-path?request-query#request-fragment";
+        let error = reqwest::Client::new()
+            .get(raw)
+            .header("invalid\nheader", "value")
+            .build()
+            .expect_err("invalid header must produce a request error")
+            .with_url(raw.parse().expect("valid test URL"));
+        assert!(error.url().is_some(), "fixture must retain the request URL");
+
+        let text = super::redact_request_url(error).to_string();
+        for sentinel in [
+            "request-user",
+            "request-pass",
+            "request-path",
+            "request-query",
+            "request-fragment",
+        ] {
+            assert!(!text.contains(sentinel), "request error leaked {sentinel}");
+        }
+    }
+
     #[tokio::test]
     async fn ipv4_loopback_also_accepts_ipv6() {
         let m = super::TcpAccept::bind("127.0.0.1:0".parse().unwrap())

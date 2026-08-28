@@ -201,11 +201,12 @@ async fn exchange_code(
         match client.post(token_endpoint).form(form).send().await {
             Ok(r) => return Ok(r),
             Err(e) if attempt < 2 && (e.is_connect() || e.is_timeout()) => {
+                let e = crate::redact_request_url(e);
                 tracing::warn!(attempt, error = %e, "oauth token exchange retrying");
                 last = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(crate::redact_request_url(e)),
         }
     }
     Err(last.expect("retry left an error"))
@@ -272,7 +273,7 @@ async fn callback(
     let tok: TokenResponse = match resp.json().await {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(error = %e, "oauth token response unreadable");
+            tracing::warn!(error = %crate::redact_request_url(e), "oauth token response unreadable");
             return (StatusCode::BAD_GATEWAY, "token exchange failed").into_response();
         }
     };

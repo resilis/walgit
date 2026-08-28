@@ -19,13 +19,239 @@ Read `AGENTS.md` first (design §1–§2, decisions §3; the original layout/pha
 - `walgit-proto`: prost types from `proto/walgit/v1/wal.proto` (Manifest, LogSegmentRef, LogEntry, PackRef,
   RefTransaction/RefUpdate, Checkpoint(+Ref), RefSnapshot/Ref, Lease, BundleList/BundleEntry); `keys::*`;
   `frame::{encode_entries,decode_entries}` (uvarint-framed log encoding); `time::*`; `keys::POLICY` / `policy_key` (`policy.json` rule language, `docs/POLICY.md`).
-- `walgit-store`: `ObjectStore` trait (`Version` opaque CAS token, `GetOptions{if_none_match,if_match,range}`,
-  `GetResult::{NotModified,Object}`, `PutMode::{Overwrite,Create,Update(Version)}`, `PutBody::{Bytes,Stream,File}`,
-  `PutOptions`, `StoreError::{NotFound,PreconditionFailed{current},Retryable,InvalidArgument,Other}`,
-  `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, `util::{collect,once,file_stream,backoff,retry}`),
-  placeholder modules `coord.rs`, `gcs.rs`, `s3.rs`.
+- `walgit-proto::v2`: dormant additive `RepoControl`, `VerificationRingRoot`,
+  and `CredentialControl` types from `proto/walgit/v2/control.proto`;
+  descriptor-visible message, byte, and count bounds from
+  `proto/walgit/v2/options.proto`; the strict
+  `v2::{encode_repo_control,decode_repo_control,preflight_repo_control}` and
+  `v2::{encode_credential_control,decode_credential_control,preflight_credential_control}`
+  codecs; the dormant capacity
+  `v2::{encode,decode,preflight}_{tenant_capacity_catalog_page,capacity_shard,capacity_control}`
+  codec families; distinct canonical-path, routing, protobuf-object, raw-payload,
+  signed-envelope, and verification-ring digest types; and the exhaustive
+  `v2::keys` grammar with a closed key-kind-to-digest mapping from the frozen
+  V5.9 production architecture. Credential encode and decode plus
+  `v2::validate_credential_control` take the validated configured
+  `DeploymentPrefix`; local semantic validation binds each full physical ring
+  key to that prefix, its lower-hex digest leaf, root metadata field bounds,
+  slot cardinality and epochs, the exact bootstrap values, and the sorted
+  permanent deny set. Raw preflight runs before generated decode and rejects
+  unknown, duplicate, reordered, non-canonical, or unbounded protobuf input
+  while preserving explicit optional signed timestamp zero.
+  `validate_credential_control_transition_structure` checks only the locally
+  visible shape of the six non-bootstrap successor kinds: install-next,
+  promote-next, retire-previous, revoke-kid, verifier-set-update, and
+  acknowledgement-update. It is not transition authorization. Ring lineage,
+  UUID and key non-reuse, prior-ring digest, exact retirement union, bound-key
+  revocation, retirement timing, verifier-set evolution, and acknowledgement
+  proof requirements need verified immutable-ring and signed-proof evidence;
+  future runtime code must fail closed when that evidence is absent. V2 is not
+  read or written by the V1 registry, WAL, server, CLI, bundle, policy, or
+  coordination paths. These dormant types and APIs do not create a production
+  V2 object, activate a mutation path, or create a legacy-adoption migration.
+
+  The dormant capacity schema is version 1. One immutable flat tenant page is
+  binary-sorted and unique, with at most 4,096 rows and 524,288 exact encoded
+  bytes. Each allocation has exactly 256 positive slices whose checked sum
+  equals its finite total. `CapacityObjectRef` is the distinct global exact
+  key/`ObjectVersionID`/digest/size reference; it never reuses the
+  repository-scoped `TargetObjectRef`. Capacity controls and shards are at most
+  1 MiB. A stable control binds a positive global budget, an exact tenant page,
+  exactly 256 sorted positive shard budgets, and exact epoch-start shard
+  proofs. The checked budget sum cannot exceed the global budget. The pure
+  cross-object validator exact-binds loaded current and target pages, computes
+  all 256 checked tenant-slice column sums, and requires each column to fit its
+  shard budget and the aggregate to fit the global budget.
+
+  A shard has at most 4,096 sorted retained reservations and 4,096 sorted
+  current tenant accounts. Every non-`ABORTED` byte is checked against the
+  shard budget and the one non-extraneous current account for its tenant.
+  Historical terminal rows keep their original epoch and slice across
+  redistribution. `RESERVED` and `COMMITTING` must use the current shard epoch;
+  terminal rows can use a nonzero earlier epoch. `RESERVED` has an explicit
+  checked lifetime of at most 900 seconds. `COMMITTING` is non-expiring and
+  uses a closed predecessor: `CREATE` requires explicit `NONE`; every other
+  non-settlement mutation requires the exact prior control CAS token and
+  object version. `ABORTED` has separate expiry and conflicting-commit proof
+  arms. Commit mutation IDs are unique per repository across retained rows. A
+  public successor validator accepts only a byte-exact retry or one legal
+  reservation transition with shard revision `+1`. It freezes the shard,
+  epoch, budget, immutable reservation fields, untouched rows, and unaffected
+  accounts. The caller supplies observed `now`: creation requires
+  `created_at <= now < expires_at`, `RESERVED -> COMMITTING` requires the same
+  live window, and expiry repeats the original window and records that exact
+  `now >= expires_at`. Terminal rows cannot change.
+
+  The retained-shard-budget object validator exact-binds an epoch-start body
+  to the matching `CapacityShardBudget.shard_object` for both STABLE and the
+  retained prior plan in either PREPARING phase. A separate mutable-shard
+  object validator exact-binds the current body to caller-observed provider
+  metadata, then compares shard, current control epoch, and budget without
+  equating that metadata to the historical epoch-start proof. The pure
+  current-shard-view validator composes the mutable object gate and requires
+  every tenant account to equal the exact current page slice. Every current-
+  epoch non-`ABORTED` reservation must repeat that exact slice; older terminal
+  proof rows keep their historical slice. The admission wrapper requires
+  STABLE. Publication uses the composed STABLE successor gate so a new row
+  cannot bypass the exact current page, account, epoch, budget, object, or
+  caller-observed time checks. PREPARING publication uses the separate
+  DRAINING gate, which permits only an expiry, charge, or conflict abort.
+  Lower-level object and successor helpers are not publication gates.
+  Before CHARGED or conflicting-commit ABORTED is accepted, the future
+  controller must run the state-specific composition gate. Both gates exact-
+  bind the prior COMMITTING shard and prepared `CapacityObligation`. CHARGED
+  also exact-binds the current `RepoControl` and its rooted receipt catalog;
+  conflict exact-binds a typed current GET and catalog, proves the prepared
+  mutation is absent, and proves the conflicting current mutation is present.
+  `CREATE_CONTROL_EXISTS` accepts any exact control at the by-path key.
+  `SAME_WRITER_VERSION_ADVANCED` requires a different object version at epoch
+  `E`; `WRITER_EPOCH_ADVANCED` requires a different object version at an exact
+  typed-current writer epoch strictly greater than `E`. This includes `E+1`
+  and later epochs after successive takeovers. All arms match canonical body
+  key/digest/size and the current catalog's represented last mutation. The
+  controller obtains the conflicting proof from a typed current GET at the
+  abort decision; the durable proof can later exact-load that object version.
+  Proto validation cannot prove provider currentness by itself.
+
+  Redistribution has only `STABLE`, `PREPARING/DRAINING`, and
+  `PREPARING/APPLYING` cells. DRAINING retains the exact prior stable plan and
+  binds the target plan plus writer/admission fence. APPLYING additionally
+  binds all 256 exact current drained baselines. Their provider metadata can be
+  newer than the historical epoch-start proofs, but shard, prior epoch, budget,
+  and key stay fixed. The exported APPLYING current-shard gate exact-loads the
+  current and target pages plus the rooted drained baseline. It accepts only
+  that exact baseline object or its deterministic target successor, which
+  preserves terminal reservation bytes and replaces only current accounts
+  from the target page. The future global controller must use this gate for
+  advance and recovery across all 256 shards.
+  The dormant store and domain controller below implement only RESERVED
+  admission and RESERVED expiry. Provider-specific operations, V1
+  compatibility, routes, configuration, migration, runtime activation, and
+  the global redistribution controller remain absent. This is a greenfield
+  hard-cut contract; the deferred multilevel 65,536-row topology requires a
+  later explicit phase.
+- `walgit-identity`: dormant pure V2 credential verification. It depends only
+  on `walgit-proto` plus bounded hash, Ed25519, and error utilities. Its strict
+  cursor rejects unknown, duplicate, reordered, non-minimal, indefinite,
+  tagged, text-valued, floating, simple, trailing, and oversized CBOR before
+  allocation. Envelope-specific APIs accept only attached untagged
+  `COSE_Sign1`; bind exact rooted ring objects and the full slot/state/deny
+  matrix; authenticate create intents and capabilities; and verify the exact
+  verifier-set, acknowledgement-set, projection, predecessor/bootstrap, and
+  transition-proof chain through one all-or-nothing result. Data-key validity
+  uses signed `issued_at` without key skew. Envelope time uses explicit `now`
+  with the frozen 30-second skew and checked `expiry - issued_at` lifetime.
+  Ring and verifier-set IDs require UUIDv7 form but no timestamp proximity.
+  Data and acknowledgement kids are opaque; only the root kid is derived.
+  `AuthenticatedCapability` is not repository authorization. No V1, server,
+  store, configuration, CLI, route, or runtime path calls this crate.
+- `walgit-store`: `CasToken` is the opaque conditional-write identity. `ObjectVersionId` is the distinct
+  immutable history identity carried by `ObjectMeta::object_version_id`
+  and `GetOptions::object_version_id`. `ObjectStore` provides exact-version GET/HEAD/delete and bounded opaque
+  `list_versions` pagination over objects and provider delete markers. `ComposeSource` pins each input by key,
+  size, CAS token, and object-version ID. `ObjectStoreExt`, `Prefixed`, `memory::MemoryStore`, and
+  `util::{collect,once,file_stream,backoff,retry}` preserve the shared implementation surface.
+  The dormant S3 inventory boundary exposes separate strict single-page
+  `ListObjectVersions` and `ListMultipartUploads` DTOs with opaque provider
+  cursors. Each method issues exactly one ungrouped S3 request for at most 1,000
+  entries, preserves exact marker presence and bytes, and fails closed on an
+  incomplete or inconsistent response. `Prefixed` adds the configured physical
+  prefix once and removes it exactly once from evidence item keys; it never
+  rewrites opaque cursors. Other backends return `UnsupportedCapability`.
+
+  The future AWS-native bootstrap caller accepts only one nontruncated versions
+  page before the first write and one after its planned control graph is
+  complete; it does not follow either cursor. It exact-loads every final object
+  version and rejects delete markers, repository data, unexpected control
+  history, or a graph larger than one page. The multipart page is
+  non-authoritative anomaly evidence: nonempty or truncated fails, but empty
+  cannot prove multipart absence. Safety instead requires a never-reused prefix,
+  no obtainable runtime credential, a bootstrap role without multipart/delete
+  permission, and conditional single-part bootstrap writes. `ACTIVE` must land
+  before a future controller enables the never-enabled Roles Anywhere profile
+  or starts any runtime consumer. A failed production prefix is quarantined and
+  never cleaned or reused. None of that caller, state machine, provisioning,
+  profile activation, cleanup policy, runtime route, or provider-pass claim is
+  implemented by these dormant page methods.
+- `walgit-store::v2_control`: dormant strict persistence for the V2 repository
+  authority. `ControlStore` receives a store that is already scoped to the
+  configured `DeploymentPrefix`. It validates the full persisted
+  `repo_control_key`, removes that prefix exactly once for store calls, and
+  returns an opaque `StoredRepoControl` with a `ControlBinding` containing the
+  full key, distinct `CasToken` and `ObjectVersionId`, exact protobuf digest,
+  and size. `load` performs one strict GET. `create` permits only ACTIVE
+  revision one and uses `PutMode::Create`. `compare_and_swap` accepts one
+  exact stored snapshot, validates the exact successor, and uses only that
+  snapshot's `CasToken`. The successor freezes identity, create binding, key,
+  object format, and cutover generation; advances the revision by one; uses a
+  new mutation ID; and follows `ACTIVE -> DELETING -> TOMBSTONED`.
+
+  A successful write returns its provider binding without another read. A 412
+  or ambiguous response permits exactly one fresh strict GET and returns a
+  typed committed, exact-replay, conflict, not-committed, or indeterminate
+  outcome. After a 412 update, an exact current successor is committed and any
+  other strict current value is a conflict. Only an ambiguous update that still
+  observes its exact prior CAS/version binding can be not-committed; an absent
+  key after an ambiguous Create stays indeterminate. The adapter never retries,
+  rebases, calls `coord::cas_update`, or uses LIST. An indeterminate outcome
+  fences the caller from another CAS until later receipt settlement resolves
+  it. No V1 registry, WAL, server, CLI, route, or runtime path constructs this
+  adapter yet.
+- `walgit-store::v2_capacity`: dormant strict persistence for exact capacity
+  reads and transition-specific shard writes. It loads current
+  `CapacityControl`, exact rooted tenant pages by `ObjectVersionId`, and
+  current or exact `CapacityShard` bodies. Each load checks the configured
+  prefix exactly once, strict canonical bytes, provider key, separate bounded
+  `CasToken` and `ObjectVersionId`, digest, and size. The public write surface
+  contains only RESERVED admission and RESERVED expiry CAS methods. Each uses
+  one conditional PUT against the exact loaded shard and at most one strict
+  current GET after a 412, ambiguous error, or unusable success response. It
+  returns committed, conflict, not-committed, or indeterminate and never
+  retries, rebases, uses HEAD/LIST, or falls back from an exact catalog version
+  to current state.
+- `walgit-control`: dormant V2 repository authorization and mutation domain.
+  Authorization consumes only an `AuthenticatedCapability`, compares every
+  sealed repository/control binding including the current stored-control
+  `ObjectVersionId`, requires the exact inline issuer/subject grant, applies
+  the closed purpose/role matrix, and fails closed on grant catalogs. The
+  public controller supports only `SETTINGS`, `GRANTS`, and receiptless
+  `INTERNAL_SETTLEMENT`. `WRITER_TAKEOVER` stays unavailable to administrator
+  capabilities until a future sealed lease/writer coordination authority is
+  specified. Every ordinary mutation roots an
+  `UNRESOLVED` receipt. No later ordinary CAS is admitted until the exact
+  landed-control result is materialized and a settlement CAS preserves the
+  row as `SETTLED`, with the exact settlement mutation ID and result. The flat
+  catalog has both a 4,096-item cap and a 512 KiB
+  encoded cap. Either cap can apply earlier, and admission reserves the
+  maximum valid settled-result space before publish. The crate uses the
+  real `walgit-store::v2_control` adapter and remains disconnected from V1,
+  server routes, providers, credentials, and deployment.
+  Its separate dormant `capacity` module implements only new `RESERVED`
+  admission and `RESERVED -> ABORTED(expired)`. Both start from an exact strict
+  `StoredRepoControl`; callers cannot supply tenant, repository identity,
+  shard, epoch, budget, slice, or key. Admission derives them from the exact
+  ACTIVE repository identity, current STABLE capacity control, exact rooted
+  tenant page, and current hashed shard. Expiry accepts an exact strict ACTIVE,
+  DELETING, or TOMBSTONED repository-control snapshot so retained RESERVED rows
+  cannot block repository reclamation or capacity drainage. The request supplies a UUIDv7 reservation
+  ID, positive bytes, explicit creation, expiry, and observed time. Their
+  checked lifetime must be `1..=900` seconds. The request also supplies the
+  closed domain-only purpose `GitWrite | LfsFinalize`. Purpose is not persisted in
+  RESERVED and does not authorize work; the future runtime/COMMITTING slice
+  must bind it to capability purpose and `MutationKind`. Expiry receives
+  explicit `now` and repeats the exact stored window. A new expiry transition
+  runs only in STABLE or PREPARING/DRAINING. After a valid current-view load,
+  an exact already-expired replay returns the rooted shard without a PUT in
+  APPLYING or a later STABLE epoch. APPLYING replay exact-loads the rooted
+  drained baseline and target page when they differ from the already-loaded
+  current objects, then accepts only the baseline or its deterministic target
+  successor. This slice does not implement CREATE admission,
+  COMMITTING, CHARGED, conflict abort, capacity-control/catalog writes, or the
+  cross-key global admission fence.
 - `walgit-config`: `Config` for walgit.toml (+ `WALGIT__` env overrides, `PORT`); `Config::with_settings` accepts
-  only `[bundles]`, `[maintenance]`, `[compaction]`, `[upstream]`, and `[integrations]` in repo-scoped settings.
+  only `[bundles]`, `[maintenance]`, `[compaction]`, and `[upstream]` in repo-scoped settings. Public settings
+  serialization uses the closed `EffectiveSettingsView`; diagnostic config dumps use the separate
+  credential-safe `SafeConfigView`. Neither boundary serializes `Config` directly.
 
 ## walgit-git (owner: GitEngine)
 
@@ -135,10 +361,10 @@ pub async fn cas_update<T: prost::Message + Default, F>(store: &dyn ObjectStore,
 /// Read a protobuf object with its version. Ok(None) if absent.
 pub async fn get_message<T: prost::Message + Default>(store: &dyn ObjectStore, key: &str)
     -> Result<Option<(ObjectMeta, T)>, CoordError>;
-pub async fn get_message_if_changed<T>(store, key, known: &Version) -> Result<Option<(ObjectMeta, T)>, CoordError>;
+pub async fn get_message_if_changed<T>(store, key, known: &CasToken) -> Result<Option<(ObjectMeta, T)>, CoordError>;
 
 /// Lease = walgit_proto::v1::Lease at `key`, acquired by Create or by Update over an expired lease.
-pub struct LeaseGuard; // holds store handle, key, holder id, current Version; Drop => best-effort release
+pub struct LeaseGuard; // holds store handle, key, holder id, current CasToken; Drop => best-effort release
 impl LeaseGuard {
   pub async fn heartbeat(&mut self, ttl: Duration) -> Result<(), CoordError>;      // CAS-extend expires_at
   pub async fn release(self) -> Result<(), CoordError>;                            // CAS delete
@@ -162,9 +388,44 @@ pub struct GcsStore; impl GcsStore { pub async fn new(cfg: &walgit_config::Store
 // lib.rs
 pub async fn open_store(cfg: &walgit_config::Config) -> anyhow::Result<DynStore>; // by cfg.store.backend, applies Prefixed(cfg.store_prefix())
 ```
+S3 and GCS constructors fail closed unless bucket versioning is enabled. GCS
+also requires soft-delete retention to be absent or exactly zero so an exact
+generation delete is permanent. WalGit verifies these prerequisites but never
+changes bucket policy.
+
+S3 credential selection is closed before any credential or network access.
+`default_chain` requires empty custom variable names and delegates only to the
+refreshable AWS SDK chain. `explicit_env` requires bounded portable access and
+secret variable names plus an optional session-token name; every named value
+must resolve non-empty or construction fails without falling back or exposing
+the value. The same static validator also closes region, DNS-compatible bucket,
+deployment-prefix, multipart-part-size, and endpoint syntax. The endpoint is
+required and bound explicitly so ambient AWS endpoint configuration cannot
+select the provider. It uses exact canonical origin syntax with no path or
+trailing slash, and non-loopback endpoints require HTTPS. `Config::validate`
+and `S3Store::new` call this validator before credential or network access.
+S3 SDK diagnostics retain only the internal operation, transport category,
+numeric status, and an allowlisted service code. Raw SDK/provider messages,
+request URLs, credential values, bucket names, prefixes, and unknown service
+codes are not included in errors or provider-contract banners.
+
+S3 owns one control AWS SDK transport and presigned-GET HTTP pool plus
+`store.s3.bulk_clients` independent bulk SDK transports and HTTP pools. The
+closed shared GCS/S3 data classifier admits only known V1 and V2 control
+encodings to the control data lane; malformed, unknown, future, or
+wrong-prefix data keys and every ranged read use bulk. Multipart and compose
+byte-moving requests always use bulk. Metadata requests and enumeration remain
+on the control SDK transport. `store.s3.bulk_clients` is bounded to `1..=16`,
+and `store.s3.bulk_concurrency` bounds in-flight bulk provider requests in
+`1..=256`; streamed GET bodies retain their permit until EOF, error,
+cancellation, or drop. A closed or saturated bulk lane never falls back to
+control. Every SDK transport is constructed with the same resolved credential
+provider and closed endpoint settings but with a distinct connection pool.
+
 Contract tests: `crates/walgit-store/tests/contract.rs` with a `run_contract(store: DynStore)` suite executed for
 memory always, for S3 when `WALGIT_TEST_S3_ENDPOINT` is set (endpoint, region, bucket, prefix, addressing mode,
-and default-chain/explicit credentials are parameterized with `WALGIT_TEST_S3_*`; every run adds a unique suffix),
+and closed default-chain/explicit-env credentials are parameterized with `WALGIT_TEST_S3_*`; the exact configured
+deployment prefix is validated and every run writes only below a unique repository key),
 for gcs when `WALGIT_TEST_GCS_BUCKET` set.
 
 S3 large writes and compose use multipart completion as the destination's
@@ -199,7 +460,7 @@ impl RepoHandle {
   pub fn local(&self) -> &LocalRepo;
   pub fn store(&self) -> &Prefixed;                       // repo-scoped
   pub fn manifest(&self) -> Arc<walgit_proto::v1::Manifest>;   // last known
-  pub fn manifest_version(&self) -> Option<Version>;
+  pub fn manifest_version(&self) -> Option<CasToken>;
   /// Freshness check (conditional GET on manifest.pb; honors wal.freshness_ttl) + catch-up (download new
   /// packs, apply log entries after our seq, apply COMPACT: install new pack, remove superseded). Returns a
   /// read guard; while any guard is alive no pack is removed locally. Every request calls this first.

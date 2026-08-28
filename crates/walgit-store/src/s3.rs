@@ -2,15 +2,16 @@
 //!
 //! Uses `aws-sdk-s3` for all operations. GET responses are streamed via
 //! presigned URLs + `reqwest` because the SDK's `GetObjectOutput::body()`
-//! returns `&ByteStream` with no owned-body extractor. All other operations
-//! (PUT, HEAD, DELETE, LIST) use the SDK directly.
+//! returns `&ByteStream` with no owned-body extractor. The control lane and
+//! every bounded bulk lane own separate SDK and reqwest connection pools. All
+//! other operations (PUT, HEAD, DELETE, LIST) use the selected SDK directly.
 //!
-//! ## Version tokens
+//! ## Object identity tokens
 //!
-//! S3 ETags are used as opaque `Version` strings. Quotes are stripped
-//! consistently on read and never stored. For non-multipart uploads the
-//! ETag is the MD5 of the content; for multipart uploads it is a compound
-//! hash. Callers never parse the token — equality comparison suffices.
+//! S3 ETags are used only as opaque `CasToken` strings. SDK `VersionId`
+//! values are returned separately as `ObjectVersionId`. Quotes are stripped
+//! from ETags consistently on read and never stored. Callers never parse or
+//! interchange either token.
 //!
 //! ## Conditional PUT
 //!
@@ -40,6 +41,7 @@
 
 use std::io::Cursor;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_s3::Client as S3Client;
@@ -52,69 +54,125 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    BoxStream, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody, PutMode, PutOptions,
-    Result, StoreError, Version,
+    BoxStream, ByteStream, CasToken, ComposeSource, GetOptions, GetResult,
+    MAX_S3_EVIDENCE_FIELD_BYTES, MAX_S3_EVIDENCE_PAGE_SIZE, MAX_VERSION_PAGE_SIZE, ObjectMeta,
+    ObjectStore, ObjectVersion, ObjectVersionId, ObjectVersionKind, PutBody, PutMode, PutOptions,
+    Result, S3MultipartEvidenceCursor, S3MultipartEvidenceItem, S3MultipartEvidencePage,
+    S3VersionEvidenceCursor, S3VersionEvidencePage, StoreError, VersionCursor, VersionPage,
 };
 
 /// S3-compatible object store.
 pub struct S3Store {
-    client: S3Client,
+    /// Dedicated connection pool for control metadata and coordination.
+    control: S3Client,
+    /// Independent connection pools for pack, bundle, LFS, and ranged data.
+    bulk: Vec<S3Client>,
+    bulk_next: std::sync::atomic::AtomicUsize,
     bucket: String,
-    /// reqwest client for streaming GETs via presigned URLs.
-    http: reqwest::Client,
+    physical_prefix: String,
+    /// Dedicated presigned-GET pool for control objects.
+    control_http: reqwest::Client,
+    /// Independent presigned-GET pools paired with `bulk`.
+    bulk_http: Vec<reqwest::Client>,
+    bulk_permits: Arc<tokio::sync::Semaphore>,
+    bulk_permits_total: usize,
+    permit_wait_warn: Duration,
     multipart_threshold: u64,
     multipart_part_size: u64,
+}
+
+struct S3DataLane {
+    client: S3Client,
+    http: reqwest::Client,
+    bulk_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl S3Store {
     /// Build a store from `walgit-config::StoreConfig`.
     ///
-    /// The AWS SDK default chain supplies refreshable credentials. The env
-    /// vars named in `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// override it only when both resolve to non-empty values. A configured
-    /// `session_token_env` is included for temporary explicit credentials.
+    /// `default_chain` delegates to the refreshable AWS SDK chain and accepts
+    /// no custom variable names. `explicit_env` requires the configured
+    /// access/secret variables and optional session-token variable to resolve
+    /// non-empty before AWS SDK setup; it never falls back to ambient AWS
+    /// identity. The required validated endpoint always replaces ambient AWS
+    /// endpoint, FIPS, and dual-stack settings.
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
-        let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(region.clone())
-            .load()
-            .await;
-        let mut s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
-            .region(region)
-            .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
-
-        if let Some((access_key, secret_key, session_token)) = explicit_credentials(
+        cfg.validate_s3()?;
+        let explicit_credentials = explicit_credentials(
+            cfg.s3.credential_mode,
             &cfg.s3.access_key_env,
             &cfg.s3.secret_key_env,
             &cfg.s3.session_token_env,
-            |name| std::env::var(name).ok(),
-        )? {
-            s3_config = s3_config.credentials_provider(Credentials::new(
+            |name| std::env::var(name),
+        )?
+        .map(|(access_key, secret_key, session_token)| {
+            Credentials::new(
                 access_key,
                 secret_key,
                 session_token,
                 None,
                 "walgit-explicit-env",
-            ));
-        }
+            )
+        });
 
-        if !cfg.s3.endpoint.is_empty() {
-            s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
+        let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .region(region.clone())
+            .endpoint_url(&cfg.s3.endpoint)
+            .use_fips(false)
+            .use_dual_stack(false);
+        if let Some(credentials) = explicit_credentials.clone() {
+            config_loader = config_loader.credentials_provider(credentials);
         }
+        let shared_config = config_loader.load().await;
+        let build_client = || {
+            let mut builder =
+                closed_s3_config_builder(&shared_config, cfg, independent_aws_http_client());
+            if let Some(credentials) = explicit_credentials.clone() {
+                builder = builder.credentials_provider(credentials);
+            }
+            S3Client::from_conf(builder.build())
+        };
 
-        let client = S3Client::from_conf(s3_config.build());
-        let http = reqwest::Client::builder().build()?;
+        let control = build_client();
+        let control_http = independent_data_http_client()?;
+        let mut bulk = Vec::with_capacity(cfg.s3.bulk_clients);
+        let mut bulk_http = Vec::with_capacity(cfg.s3.bulk_clients);
+        for _ in 0..cfg.s3.bulk_clients {
+            bulk.push(build_client());
+            bulk_http.push(independent_data_http_client()?);
+        }
 
         let multipart_part_size = multipart_part_size(1, cfg.multipart_part_size.as_u64())?;
 
-        Ok(S3Store {
-            client,
+        let store = S3Store {
+            control,
+            bulk,
+            bulk_next: std::sync::atomic::AtomicUsize::new(0),
             bucket: cfg.bucket.clone(),
-            http,
+            physical_prefix: crate::traffic::normalized_store_prefix(&cfg.prefix),
+            control_http,
+            bulk_http,
+            bulk_permits: Arc::new(tokio::sync::Semaphore::new(cfg.s3.bulk_concurrency)),
+            bulk_permits_total: cfg.s3.bulk_concurrency,
+            permit_wait_warn: Duration::from_secs(1),
             multipart_threshold: cfg.multipart_threshold.as_u64(),
             multipart_part_size,
-        })
+        };
+        store.verify_versioning().await?;
+        Ok(store)
+    }
+
+    /// Set the warning threshold for observable bulk-lane queue waits.
+    pub fn with_permit_wait_warn(mut self, duration: Duration) -> Self {
+        self.permit_wait_warn = duration;
+        self
+    }
+
+    fn next_bulk_index(&self) -> usize {
+        self.bulk_next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.bulk.len()
     }
 
     /// `bytes=start-(end-1)` for a half-open range (S3 Range is inclusive).
@@ -124,17 +182,77 @@ impl S3Store {
 
     // ---- GET via presigned URL + reqwest (true streaming) ---------------
 
-    async fn presigned_get(&self, key: &str, opts: &GetOptions) -> Result<reqwest::Response> {
+    async fn data_lane(&self, key: &str, ranged: bool, force_bulk: bool) -> Result<S3DataLane> {
+        if force_bulk
+            || ranged
+            || matches!(
+                crate::traffic::classify_data_key(key, &self.physical_prefix),
+                crate::traffic::DataTraffic::Bulk
+            )
+        {
+            let index = self.next_bulk_index();
+            let started = std::time::Instant::now();
+            let permit = self
+                .bulk_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    StoreError::other(anyhow::anyhow!("s3 bulk admission is unavailable"))
+                })?;
+            let queued = started.elapsed();
+            if queued.as_millis() > 0 {
+                tracing::Span::current().record("queued_ms", queued.as_millis() as u64);
+            }
+            metrics::histogram!("walgit_store_bulk_queue_seconds").record(queued.as_secs_f64());
+            if queued > Duration::ZERO {
+                metrics::histogram!("walgit_lock_wait_seconds", "lock" => "s3_bulk_permit")
+                    .record(queued.as_secs_f64());
+            }
+            if queued >= self.permit_wait_warn {
+                tracing::warn!(
+                    lock = "s3_bulk_permit",
+                    wait_ms = queued.as_millis() as u64,
+                    "lock wait"
+                );
+            }
+            metrics::gauge!("walgit_store_bulk_inflight")
+                .set((self.bulk_permits_total - self.bulk_permits.available_permits()) as f64);
+            Ok(S3DataLane {
+                client: self.bulk[index].clone(),
+                http: self.bulk_http[index].clone(),
+                bulk_permit: Some(permit),
+            })
+        } else {
+            Ok(S3DataLane {
+                client: self.control.clone(),
+                http: self.control_http.clone(),
+                bulk_permit: None,
+            })
+        }
+    }
+
+    async fn presigned_get(
+        &self,
+        client: &S3Client,
+        http: &reqwest::Client,
+        key: &str,
+        opts: &GetOptions,
+    ) -> Result<reqwest::Response> {
         let presigning = PresigningConfig::expires_in(Duration::from_secs(60))
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning config: {e}")))?;
 
-        let mut builder = self.client.get_object().bucket(&self.bucket).key(key);
+        let mut builder = client.get_object().bucket(&self.bucket).key(key);
 
         if let Some(v) = &opts.if_none_match {
             builder = builder.if_none_match(v.as_str());
         }
         if let Some(v) = &opts.if_match {
             builder = builder.if_match(v.as_str());
+        }
+        if let Some(version_id) = &opts.object_version_id {
+            validate_requested_s3_version_id(version_id)?;
+            builder = builder.version_id(version_id.as_str());
         }
         if let Some(r) = &opts.range {
             builder = builder.range(Self::range_header(r));
@@ -145,7 +263,7 @@ impl S3Store {
             .await
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning get: {e}")))?;
 
-        let mut req = self.http.get(presigned.uri());
+        let mut req = http.get(presigned.uri());
         for (name, value) in presigned.headers() {
             req = req.header(name, value);
         }
@@ -155,7 +273,12 @@ impl S3Store {
             .map_err(|e| sanitized_reqwest_error("get request", e))
     }
 
-    fn get_result_from_response(key: &str, resp: reqwest::Response) -> Result<GetResult> {
+    fn get_result_from_response(
+        key: &str,
+        resp: reqwest::Response,
+        requested_version_id: Option<&ObjectVersionId>,
+        bulk_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<GetResult> {
         let status = resp.status();
         let etag = resp
             .headers()
@@ -167,6 +290,10 @@ impl S3Store {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        let response_version_id = resp
+            .headers()
+            .get("x-amz-version-id")
+            .and_then(|v| v.to_str().ok());
 
         // `ObjectMeta::size` is the size of the whole object (as on GCS/memory),
         // also for range reads: `Content-Range: bytes a-b/total` carries it.
@@ -179,25 +306,38 @@ impl S3Store {
 
         match status.as_u16() {
             200 | 206 => {
-                let version = Version::new(etag.as_deref().unwrap_or(""));
+                let object_version_id = require_current_s3_version_id(
+                    "VersionId on successful current GET",
+                    response_version_id,
+                )?;
+                if requested_version_id.is_some_and(|requested| &object_version_id != requested) {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "honored exact-version GET with VersionId response",
+                    });
+                }
+                let version = CasToken::new(etag.as_deref().unwrap_or(""));
                 let meta = ObjectMeta {
                     key: key.into(),
                     size: total.or(content_length).unwrap_or(0),
                     version,
+                    object_version_id: Some(object_version_id),
                 };
-                let body = resp
-                    .bytes_stream()
-                    .map(|r| r.map_err(|e| sanitized_reqwest_error("get body", e)))
-                    .boxed();
+                let body = retain_bulk_permit(
+                    resp.bytes_stream()
+                        .map(|item| item.map_err(|e| sanitized_reqwest_error("get body", e)))
+                        .boxed(),
+                    bulk_permit,
+                );
                 Ok(GetResult::Object { meta, body })
             }
             304 => Ok(GetResult::NotModified {
-                version: Version::new(etag.as_deref().unwrap_or("")),
+                version: CasToken::new(etag.as_deref().unwrap_or("")),
             }),
             404 => Err(StoreError::NotFound { key: key.into() }),
             412 => Err(StoreError::PreconditionFailed {
                 key: key.into(),
-                current: etag.map(Version::new),
+                current: etag.map(CasToken::new),
             }),
             s if retryable_status(s) => {
                 Err(StoreError::Retryable(anyhow::anyhow!("s3 get status {s}")))
@@ -205,6 +345,53 @@ impl S3Store {
             s => Err(StoreError::Other(anyhow::anyhow!("s3 get status {s}"))),
         }
     }
+}
+
+fn retain_bulk_permit(
+    body: ByteStream,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> ByteStream {
+    futures::stream::unfold((body, permit), |(mut body, permit)| async move {
+        match body.next().await {
+            Some(Ok(bytes)) => Some((Ok(bytes), (body, permit))),
+            Some(Err(error)) => {
+                drop(permit);
+                Some((Err(error), (body, None)))
+            }
+            None => None,
+        }
+    })
+    .boxed()
+}
+
+fn closed_s3_config_builder(
+    shared_config: &aws_config::SdkConfig,
+    cfg: &walgit_config::StoreConfig,
+    http_client: aws_sdk_s3::config::SharedHttpClient,
+) -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::from(shared_config)
+        .http_client(http_client)
+        .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
+        .endpoint_url(&cfg.s3.endpoint)
+        .use_fips(false)
+        .use_dual_stack(false)
+        .force_path_style(cfg.s3.force_path_style)
+        .behavior_version_latest()
+}
+
+fn independent_aws_http_client() -> aws_sdk_s3::config::SharedHttpClient {
+    aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .build_https()
+}
+
+fn independent_data_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(64)
+        .connect_timeout(Duration::from_secs(10))
+        .build()
 }
 
 const S3_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
@@ -355,54 +542,30 @@ fn sanitized_reqwest_error(op: &str, error: reqwest::Error) -> StoreError {
 }
 
 fn explicit_credentials(
+    mode: walgit_config::S3CredentialMode,
     access_name: &str,
     secret_name: &str,
     session_token_name: &str,
-    read: impl Fn(&str) -> Option<String>,
+    read: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
 ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
-    if access_name.is_empty() != secret_name.is_empty() {
-        anyhow::bail!(
-            "s3: explicit credential override is partial; access_key_env and secret_key_env must both be configured or both be empty"
-        );
-    }
-    if access_name.is_empty() {
-        if !session_token_name.is_empty() {
-            anyhow::bail!(
-                "s3: session_token_env requires configured access_key_env and secret_key_env"
-            );
-        }
+    if mode == walgit_config::S3CredentialMode::DefaultChain {
         return Ok(None);
     }
 
-    let access = (!access_name.is_empty())
-        .then(|| read(access_name))
-        .flatten()
-        .filter(|value| !value.is_empty());
-    let secret = (!secret_name.is_empty())
-        .then(|| read(secret_name))
-        .flatten()
-        .filter(|value| !value.is_empty());
-    let session_token = (!session_token_name.is_empty())
-        .then(|| read(session_token_name))
-        .flatten()
-        .filter(|value| !value.is_empty());
-    match (access, secret, session_token) {
-        (None, None, None) => Ok(None),
-        (Some(access), Some(secret), session_token)
-            if session_token_name.is_empty() || session_token.is_some() =>
-        {
-            Ok(Some((access, secret, session_token)))
-        }
-        (Some(_), Some(_), None) => anyhow::bail!(
-            "s3: configured session token variable {} must resolve to a non-empty value",
-            session_token_name
-        ),
-        _ => anyhow::bail!(
-            "s3: explicit credential override is partial; {} and {} must both resolve to non-empty values",
-            access_name,
-            secret_name
-        ),
-    }
+    let required = |name: &str, kind: &str| {
+        read(name)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("s3: explicit {kind} credential is missing or invalid"))
+    };
+    let access = required(access_name, "access-key")?;
+    let secret = required(secret_name, "secret-key")?;
+    let session_token = if session_token_name.is_empty() {
+        None
+    } else {
+        Some(required(session_token_name, "session-token")?)
+    };
+    Ok(Some((access, secret, session_token)))
 }
 
 fn multipart_part_size(len: u64, configured: u64) -> Result<u64> {
@@ -561,6 +724,40 @@ fn retryable_status(status: u16) -> bool {
     status == 429 || status >= 500
 }
 
+fn diagnostic_service_code(code: &str) -> Option<&str> {
+    matches!(
+        code,
+        "AccessDenied"
+            | "AuthorizationHeaderMalformed"
+            | "ConditionalRequestConflict"
+            | "InternalError"
+            | "InvalidArgument"
+            | "InvalidRequest"
+            | "NoSuchBucket"
+            | "RequestTimeout"
+            | "RequestTimeoutException"
+            | "ServiceUnavailable"
+            | "SlowDown"
+            | "Throttling"
+            | "ThrottlingException"
+            | "TooManyRequestsException"
+    )
+    .then_some(code)
+}
+
+fn sdk_error_diagnostic(
+    op: &str,
+    category: &str,
+    status: Option<u16>,
+    code: &str,
+) -> anyhow::Error {
+    let status = status
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".into());
+    let code = diagnostic_service_code(code).unwrap_or("unrecognized");
+    anyhow::anyhow!("s3 {op} {category}: status={status} code={code}")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum S3ErrorClass {
     PreconditionFailed,
@@ -593,16 +790,14 @@ fn should_reconcile_conditional_conflict(code: Option<&str>, mode: &PutMode) -> 
         && matches!(mode, PutMode::Create | PutMode::Update(_))
 }
 
-fn conditional_conflict_retryable(key: &str, reason: &str) -> StoreError {
-    StoreError::retryable(anyhow::anyhow!(
-        "s3 conditional write conflict for {key}: {reason}"
-    ))
+fn conditional_conflict_retryable(_key: &str, reason: &str) -> StoreError {
+    StoreError::retryable(anyhow::anyhow!("s3 conditional write conflict: {reason}"))
 }
 
 fn reconcile_conditional_conflict(
     key: &str,
     mode: &PutMode,
-    current: Option<Version>,
+    current: Option<CasToken>,
 ) -> StoreError {
     match mode {
         PutMode::Create if current.is_some() => StoreError::PreconditionFailed {
@@ -643,16 +838,23 @@ where
         err,
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_)
     );
+    let category = match &err {
+        SdkError::ConstructionFailure(_) => "construction",
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "response",
+        SdkError::ServiceError(_) => "service",
+        _ => "other",
+    };
+    let diagnostic = sdk_error_diagnostic(op, category, status, code.unwrap_or(""));
     match classify_error_metadata(code, status, retryable_transport) {
         S3ErrorClass::PreconditionFailed => StoreError::PreconditionFailed {
             key: key.into(),
             current: None,
         },
         S3ErrorClass::NotFound => StoreError::NotFound { key: key.into() },
-        S3ErrorClass::Retryable => {
-            StoreError::retryable(anyhow::anyhow!("s3 {op} error for {key}: {err}"))
-        }
-        S3ErrorClass::Other => StoreError::other(anyhow::anyhow!("s3 {op} error for {key}: {err}")),
+        S3ErrorClass::Retryable => StoreError::retryable(diagnostic),
+        S3ErrorClass::Other => StoreError::other(diagnostic),
     }
 }
 
@@ -662,6 +864,424 @@ fn classify_list_error(
     classify_sdk_error("list", "<prefix>", err)
 }
 
+fn require_enabled_versioning(
+    status: Option<&aws_sdk_s3::types::BucketVersioningStatus>,
+) -> Result<()> {
+    if matches!(
+        status,
+        Some(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedCapability {
+            backend: "s3",
+            capability: "enabled bucket versioning",
+        })
+    }
+}
+
+fn successful_write_meta(
+    operation: &'static str,
+    key: &str,
+    size: u64,
+    etag: Option<&str>,
+    version_id: Option<&str>,
+) -> Result<ObjectMeta> {
+    let version_id =
+        usable_s3_version_id(version_id).ok_or_else(|| StoreError::AmbiguousWrite {
+            backend: "s3",
+            operation,
+            key: key.to_owned(),
+        })?;
+    Ok(ObjectMeta {
+        key: key.to_owned(),
+        size,
+        version: CasToken::new(etag.unwrap_or("").trim_matches('"').to_owned()),
+        object_version_id: Some(version_id),
+    })
+}
+
+fn usable_s3_version_id(version_id: Option<&str>) -> Option<ObjectVersionId> {
+    version_id
+        .filter(|id| !id.is_empty() && id.len() <= MAX_S3_EVIDENCE_FIELD_BYTES && *id != "null")
+        .map(ObjectVersionId::new)
+}
+
+fn validate_requested_s3_version_id(version_id: &ObjectVersionId) -> Result<()> {
+    if usable_s3_version_id(Some(version_id.as_str())).is_none() {
+        return Err(StoreError::InvalidArgument(
+            "S3 ObjectVersionId is empty, null, or exceeds 1024 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_s3_evidence(reason: &'static str) -> StoreError {
+    StoreError::InvalidArgument(format!("invalid S3 evidence page: {reason}"))
+}
+
+fn validate_s3_evidence_value(
+    value: &str,
+    allow_empty: bool,
+    reject_null: bool,
+    reason: &'static str,
+) -> Result<()> {
+    if value.len() > MAX_S3_EVIDENCE_FIELD_BYTES
+        || (!allow_empty && value.is_empty())
+        || (reject_null && value == "null")
+    {
+        return Err(invalid_s3_evidence(reason));
+    }
+    Ok(())
+}
+
+fn validate_optional_marker(value: Option<&str>) -> Result<()> {
+    if let Some(value) = value {
+        validate_s3_evidence_value(value, true, false, "marker is too long")?;
+    }
+    Ok(())
+}
+
+fn marker_echo_matches(request: Option<&str>, response: Option<&str>) -> bool {
+    request == response || matches!((request, response), (None, Some("")) | (Some(""), None))
+}
+
+fn validate_s3_evidence_request(prefix: &str, limit: usize) -> Result<()> {
+    validate_s3_evidence_value(prefix, true, false, "prefix is too long")?;
+    if !(1..=MAX_S3_EVIDENCE_PAGE_SIZE).contains(&limit) {
+        return Err(invalid_s3_evidence("page size is outside 1..=1000"));
+    }
+    Ok(())
+}
+
+fn validate_s3_version_cursor(cursor: &S3VersionEvidenceCursor) -> Result<()> {
+    validate_optional_marker(cursor.key_marker())?;
+    validate_optional_marker(cursor.version_id_marker())
+}
+
+fn validate_s3_multipart_cursor(cursor: &S3MultipartEvidenceCursor) -> Result<()> {
+    validate_optional_marker(cursor.key_marker())?;
+    validate_optional_marker(cursor.upload_id_marker())
+}
+
+fn decode_s3_version_evidence_page(
+    bucket: &str,
+    prefix: &str,
+    request_cursor: &S3VersionEvidenceCursor,
+    limit: usize,
+    response: &aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput,
+) -> Result<S3VersionEvidencePage> {
+    validate_s3_evidence_request(prefix, limit)?;
+    validate_s3_version_cursor(request_cursor)?;
+    if response.name() != Some(bucket) {
+        return Err(invalid_s3_evidence("bucket echo is missing or mismatched"));
+    }
+    if response.prefix() != Some(prefix) {
+        return Err(invalid_s3_evidence("prefix echo is missing or mismatched"));
+    }
+    if response.max_keys() != Some(limit as i32) {
+        return Err(invalid_s3_evidence(
+            "page-size echo is missing or mismatched",
+        ));
+    }
+    if response.delimiter().is_some() || !response.common_prefixes().is_empty() {
+        return Err(invalid_s3_evidence(
+            "response used grouped-prefix semantics",
+        ));
+    }
+    if response.encoding_type().is_some() {
+        return Err(invalid_s3_evidence("response used key encoding"));
+    }
+    validate_optional_marker(response.key_marker())?;
+    validate_optional_marker(response.version_id_marker())?;
+    if !marker_echo_matches(request_cursor.key_marker(), response.key_marker())
+        || !marker_echo_matches(
+            request_cursor.version_id_marker(),
+            response.version_id_marker(),
+        )
+    {
+        return Err(invalid_s3_evidence("request cursor echo is mismatched"));
+    }
+
+    let count = response
+        .versions()
+        .len()
+        .checked_add(response.delete_markers().len())
+        .ok_or_else(|| invalid_s3_evidence("entry count overflowed"))?;
+    if count > limit {
+        return Err(invalid_s3_evidence(
+            "entry count exceeds requested page size",
+        ));
+    }
+    let mut versions = Vec::with_capacity(count);
+    for version in response.versions() {
+        let key = version
+            .key()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted key"))?;
+        validate_s3_evidence_value(key, false, false, "version object key is invalid")?;
+        if !key.starts_with(prefix) {
+            return Err(invalid_s3_evidence(
+                "version object escaped the requested prefix",
+            ));
+        }
+        let version_id = version
+            .version_id()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted VersionId"))?;
+        validate_s3_evidence_value(
+            version_id,
+            false,
+            true,
+            "version object VersionId is invalid",
+        )?;
+        let size = version
+            .size()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted size"))?;
+        if size < 0 {
+            return Err(invalid_s3_evidence("version object size is negative"));
+        }
+        let is_latest = version
+            .is_latest()
+            .ok_or_else(|| invalid_s3_evidence("version object omitted IsLatest"))?;
+        versions.push(ObjectVersion {
+            key: key.to_owned(),
+            object_version_id: ObjectVersionId::new(version_id),
+            cas_token: version
+                .e_tag()
+                .map(|etag| CasToken::new(etag.trim_matches('"').to_owned())),
+            size: size as u64,
+            kind: ObjectVersionKind::Object,
+            is_latest,
+        });
+    }
+    for marker in response.delete_markers() {
+        let key = marker
+            .key()
+            .ok_or_else(|| invalid_s3_evidence("delete marker omitted key"))?;
+        validate_s3_evidence_value(key, false, false, "delete marker key is invalid")?;
+        if !key.starts_with(prefix) {
+            return Err(invalid_s3_evidence(
+                "delete marker escaped the requested prefix",
+            ));
+        }
+        let version_id = marker
+            .version_id()
+            .ok_or_else(|| invalid_s3_evidence("delete marker omitted VersionId"))?;
+        validate_s3_evidence_value(
+            version_id,
+            false,
+            true,
+            "delete marker VersionId is invalid",
+        )?;
+        let is_latest = marker
+            .is_latest()
+            .ok_or_else(|| invalid_s3_evidence("delete marker omitted IsLatest"))?;
+        versions.push(ObjectVersion {
+            key: key.to_owned(),
+            object_version_id: ObjectVersionId::new(version_id),
+            cas_token: None,
+            size: 0,
+            kind: ObjectVersionKind::DeleteMarker,
+            is_latest,
+        });
+    }
+
+    let is_truncated = response
+        .is_truncated()
+        .ok_or_else(|| invalid_s3_evidence("response omitted IsTruncated"))?;
+    validate_optional_marker(response.next_key_marker())?;
+    validate_optional_marker(response.next_version_id_marker())?;
+    let response_next_cursor = S3VersionEvidenceCursor {
+        key_marker: response.next_key_marker().map(str::to_owned),
+        version_id_marker: response.next_version_id_marker().map(str::to_owned),
+    };
+    if is_truncated {
+        if response_next_cursor.key_marker.is_none()
+            || response_next_cursor.version_id_marker.is_none()
+        {
+            return Err(invalid_s3_evidence(
+                "truncated response omitted a next marker",
+            ));
+        }
+        if response_next_cursor == *request_cursor {
+            return Err(invalid_s3_evidence(
+                "truncated response repeated its request cursor",
+            ));
+        }
+    } else if response_next_cursor.key_marker.is_some()
+        || response_next_cursor.version_id_marker.is_some()
+    {
+        return Err(invalid_s3_evidence(
+            "terminal response included a next marker",
+        ));
+    }
+
+    Ok(S3VersionEvidencePage {
+        versions,
+        request_cursor: request_cursor.clone(),
+        response_next_cursor,
+        is_truncated,
+    })
+}
+
+fn decode_s3_multipart_evidence_page(
+    bucket: &str,
+    prefix: &str,
+    request_cursor: &S3MultipartEvidenceCursor,
+    limit: usize,
+    response: &aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput,
+) -> Result<S3MultipartEvidencePage> {
+    validate_s3_evidence_request(prefix, limit)?;
+    validate_s3_multipart_cursor(request_cursor)?;
+    if response.bucket() != Some(bucket) {
+        return Err(invalid_s3_evidence("bucket echo is missing or mismatched"));
+    }
+    if response.prefix() != Some(prefix) {
+        return Err(invalid_s3_evidence("prefix echo is missing or mismatched"));
+    }
+    if response.max_uploads() != Some(limit as i32) {
+        return Err(invalid_s3_evidence(
+            "page-size echo is missing or mismatched",
+        ));
+    }
+    if response.delimiter().is_some() || !response.common_prefixes().is_empty() {
+        return Err(invalid_s3_evidence(
+            "response used grouped-prefix semantics",
+        ));
+    }
+    if response.encoding_type().is_some() {
+        return Err(invalid_s3_evidence("response used key encoding"));
+    }
+    validate_optional_marker(response.key_marker())?;
+    validate_optional_marker(response.upload_id_marker())?;
+    if !marker_echo_matches(request_cursor.key_marker(), response.key_marker())
+        || !marker_echo_matches(
+            request_cursor.upload_id_marker(),
+            response.upload_id_marker(),
+        )
+    {
+        return Err(invalid_s3_evidence("request cursor echo is mismatched"));
+    }
+    if response.uploads().len() > limit {
+        return Err(invalid_s3_evidence(
+            "entry count exceeds requested page size",
+        ));
+    }
+    let mut uploads = Vec::with_capacity(response.uploads().len());
+    for upload in response.uploads() {
+        let key = upload
+            .key()
+            .ok_or_else(|| invalid_s3_evidence("multipart upload omitted key"))?;
+        validate_s3_evidence_value(key, false, false, "multipart upload key is invalid")?;
+        if !key.starts_with(prefix) {
+            return Err(invalid_s3_evidence(
+                "multipart upload escaped the requested prefix",
+            ));
+        }
+        let upload_id = upload
+            .upload_id()
+            .ok_or_else(|| invalid_s3_evidence("multipart upload omitted upload ID"))?;
+        validate_s3_evidence_value(upload_id, false, false, "multipart upload ID is invalid")?;
+        uploads.push(S3MultipartEvidenceItem {
+            key: key.to_owned(),
+            upload_id: upload_id.to_owned(),
+        });
+    }
+
+    let is_truncated = response
+        .is_truncated()
+        .ok_or_else(|| invalid_s3_evidence("response omitted IsTruncated"))?;
+    validate_optional_marker(response.next_key_marker())?;
+    validate_optional_marker(response.next_upload_id_marker())?;
+    let response_next_cursor = S3MultipartEvidenceCursor {
+        key_marker: response.next_key_marker().map(str::to_owned),
+        upload_id_marker: response.next_upload_id_marker().map(str::to_owned),
+    };
+    if is_truncated {
+        if response_next_cursor.key_marker.is_none()
+            || response_next_cursor.upload_id_marker.is_none()
+        {
+            return Err(invalid_s3_evidence(
+                "truncated response omitted a next marker",
+            ));
+        }
+        if response_next_cursor == *request_cursor {
+            return Err(invalid_s3_evidence(
+                "truncated response repeated its request cursor",
+            ));
+        }
+    } else if response_next_cursor.key_marker.is_some()
+        || response_next_cursor.upload_id_marker.is_some()
+    {
+        return Err(invalid_s3_evidence(
+            "terminal response included a next marker",
+        ));
+    }
+
+    Ok(S3MultipartEvidencePage {
+        uploads,
+        request_cursor: request_cursor.clone(),
+        response_next_cursor,
+        is_truncated,
+    })
+}
+
+fn require_current_s3_version_id(
+    capability: &'static str,
+    version_id: Option<&str>,
+) -> Result<ObjectVersionId> {
+    usable_s3_version_id(version_id).ok_or(StoreError::UnsupportedCapability {
+        backend: "s3",
+        capability,
+    })
+}
+
+fn compose_copy_source(bucket: &str, source: &ComposeSource) -> String {
+    let encoded_version_id =
+        crate::util::encode_path(source.object_version_id.as_str()).replace('/', "%2F");
+    format!(
+        "{}/{}?versionId={}",
+        bucket,
+        crate::util::encode_path(&source.key),
+        encoded_version_id
+    )
+}
+
+const DELETE_MARKER_PROOF_MAX_PAGES: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactDeleteMarkerHeadEvidence {
+    Confirmed,
+    RequiresListing,
+    Unrelated,
+}
+
+fn exact_delete_marker_head_evidence(
+    status: u16,
+    delete_marker: Option<&str>,
+    response_version_id: Option<&str>,
+    requested_version_id: &ObjectVersionId,
+) -> ExactDeleteMarkerHeadEvidence {
+    if status != 405 {
+        return ExactDeleteMarkerHeadEvidence::Unrelated;
+    }
+    if delete_marker == Some("true") && response_version_id == Some(requested_version_id.as_str()) {
+        ExactDeleteMarkerHeadEvidence::Confirmed
+    } else {
+        ExactDeleteMarkerHeadEvidence::RequiresListing
+    }
+}
+
+fn exact_listed_version_kind(
+    versions: &[ObjectVersion],
+    key: &str,
+    version_id: &ObjectVersionId,
+) -> Option<ObjectVersionKind> {
+    versions
+        .iter()
+        .find(|version| version.key == key && version.object_version_id == *version_id)
+        .map(|version| version.kind)
+}
+
 #[async_trait::async_trait]
 impl ObjectStore for S3Store {
     fn backend(&self) -> &'static str {
@@ -669,13 +1289,18 @@ impl ObjectStore for S3Store {
     }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
-        let resp = self.presigned_get(key, &opts).await?;
-        Self::get_result_from_response(key, resp)
+        let S3DataLane {
+            client,
+            http,
+            bulk_permit,
+        } = self.data_lane(key, opts.range.is_some(), false).await?;
+        let resp = self.presigned_get(&client, &http, key, &opts).await?;
+        Self::get_result_from_response(key, resp, opts.object_version_id.as_ref(), bulk_permit)
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let resp = self
-            .client
+            .control
             .head_object()
             .bucket(&self.bucket)
             .key(key)
@@ -686,10 +1311,15 @@ impl ObjectStore for S3Store {
             Ok(out) => {
                 let etag = out.e_tag().map(|s| s.trim_matches('"').to_owned());
                 let size = out.content_length().unwrap_or(0) as u64;
+                let object_version_id = require_current_s3_version_id(
+                    "VersionId on successful current HEAD",
+                    out.version_id(),
+                )?;
                 Ok(Some(ObjectMeta {
                     key: key.into(),
                     size,
-                    version: Version::new(etag.as_deref().unwrap_or("")),
+                    version: CasToken::new(etag.as_deref().unwrap_or("")),
+                    object_version_id: Some(object_version_id),
                 }))
             }
             Err(err) => {
@@ -718,7 +1348,9 @@ impl ObjectStore for S3Store {
         // before the provider can make a shortened object visible.
         let bytes = read_declared_body(&mut reader, len).await?;
 
-        let mut builder = self
+        let lane = self.data_lane(key, false, false).await?;
+
+        let mut builder = lane
             .client
             .put_object()
             .bucket(&self.bucket)
@@ -746,12 +1378,7 @@ impl ObjectStore for S3Store {
         let result = builder.send().await;
         match result {
             Ok(resp) => {
-                let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
-                Ok(ObjectMeta {
-                    key: key.into(),
-                    size: len,
-                    version: Version::new(etag.as_deref().unwrap_or("")),
-                })
+                successful_write_meta("PutObject", key, len, resp.e_tag(), resp.version_id())
             }
             Err(e) => Err(self
                 .resolve_conditional_write_failure("put", key, &opts.mode, e)
@@ -759,8 +1386,8 @@ impl ObjectStore for S3Store {
         }
     }
 
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
-        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
+        let mut request = self.control.delete_object().bucket(&self.bucket).key(key);
         if let Some(want) = &if_version {
             request = request.if_match(want.as_str());
         }
@@ -789,12 +1416,197 @@ impl ObjectStore for S3Store {
         }
     }
 
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        validate_requested_s3_version_id(version_id)?;
+        let result = self
+            .control
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .version_id(version_id.as_str())
+            .send()
+            .await;
+        match result {
+            Ok(out) => {
+                if out.version_id() != Some(version_id.as_str()) {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "honored exact-version HEAD with VersionId response",
+                    });
+                }
+                let etag = out.e_tag().map(|value| value.trim_matches('"').to_owned());
+                Ok(Some(ObjectMeta {
+                    key: key.to_owned(),
+                    size: out.content_length().unwrap_or(0).max(0) as u64,
+                    version: CasToken::new(etag.as_deref().unwrap_or("")),
+                    object_version_id: Some(version_id.clone()),
+                }))
+            }
+            Err(error) => {
+                let evidence = error
+                    .raw_response()
+                    .map(|response| {
+                        exact_delete_marker_head_evidence(
+                            response.status().as_u16(),
+                            response.headers().get("x-amz-delete-marker"),
+                            response.headers().get("x-amz-version-id"),
+                            version_id,
+                        )
+                    })
+                    .unwrap_or(ExactDeleteMarkerHeadEvidence::Unrelated);
+                match evidence {
+                    ExactDeleteMarkerHeadEvidence::Confirmed => return Ok(None),
+                    ExactDeleteMarkerHeadEvidence::RequiresListing => {
+                        let mapped = classify_sdk_error("head exact version", key, error);
+                        return if self
+                            .prove_exact_delete_marker_by_listing(key, version_id)
+                            .await?
+                        {
+                            Ok(None)
+                        } else {
+                            Err(mapped)
+                        };
+                    }
+                    ExactDeleteMarkerHeadEvidence::Unrelated => {}
+                }
+                match classify_sdk_error("head exact version", key, error) {
+                    StoreError::NotFound { .. } => Ok(None),
+                    other => Err(other),
+                }
+            }
+        }
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        validate_requested_s3_version_id(version_id)?;
+        let response = self
+            .control
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .version_id(version_id.as_str())
+            .send()
+            .await
+            .map_err(|error| classify_sdk_error("delete exact version", key, error))?;
+        if response.version_id() != Some(version_id.as_str()) {
+            return Err(StoreError::UnsupportedCapability {
+                backend: "s3",
+                capability: "honored exact-version delete with VersionId response",
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        if !(1..=MAX_VERSION_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidArgument(format!(
+                "version page size must be in 1..={MAX_VERSION_PAGE_SIZE}"
+            )));
+        }
+        if cursor.is_some_and(|cursor| cursor.page_token.is_some()) {
+            return Err(StoreError::InvalidArgument(
+                "version cursor belongs to another backend".into(),
+            ));
+        }
+        let evidence_cursor = cursor.map_or_else(S3VersionEvidenceCursor::initial, |cursor| {
+            S3VersionEvidenceCursor {
+                key_marker: cursor.key_marker.clone(),
+                version_id_marker: cursor
+                    .version_id_marker
+                    .as_ref()
+                    .map(|version| version.as_str().to_owned()),
+            }
+        });
+        let page = self
+            .list_s3_version_evidence_page(prefix, &evidence_cursor, limit)
+            .await?;
+        let next = page.is_truncated.then(|| VersionCursor {
+            key_marker: page.response_next_cursor.key_marker.clone(),
+            version_id_marker: page
+                .response_next_cursor
+                .version_id_marker
+                .as_deref()
+                .map(ObjectVersionId::new),
+            page_token: None,
+        });
+        Ok(VersionPage {
+            versions: page.versions,
+            next,
+        })
+    }
+
+    async fn list_s3_version_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3VersionEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3VersionEvidencePage> {
+        validate_s3_evidence_request(prefix, limit)?;
+        validate_s3_version_cursor(cursor)?;
+        let mut request = self
+            .control
+            .list_object_versions()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(limit as i32);
+        request = request.set_key_marker(cursor.key_marker.clone());
+        request = request.set_version_id_marker(cursor.version_id_marker.clone());
+        let response = request.send().await.map_err(|error| {
+            classify_sdk_error("list S3 version evidence", "<evidence-prefix>", error)
+        })?;
+        decode_s3_version_evidence_page(&self.bucket, prefix, cursor, limit, &response)
+    }
+
+    async fn list_s3_multipart_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3MultipartEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3MultipartEvidencePage> {
+        validate_s3_evidence_request(prefix, limit)?;
+        validate_s3_multipart_cursor(cursor)?;
+        let response = self
+            .control
+            .list_multipart_uploads()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_uploads(limit as i32)
+            .set_key_marker(cursor.key_marker.clone())
+            .set_upload_id_marker(cursor.upload_id_marker.clone())
+            .send()
+            .await
+            .map_err(|error| {
+                classify_sdk_error("list S3 multipart evidence", "<evidence-prefix>", error)
+            })?;
+        decode_s3_multipart_evidence_page(&self.bucket, prefix, cursor, limit, &response)
+    }
+
+    async fn verify_versioning(&self) -> Result<()> {
+        let response = self
+            .control
+            .get_bucket_versioning()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|error| classify_sdk_error("get bucket versioning", &self.bucket, error))?;
+        require_enabled_versioning(response.status())
+    }
+
     fn list(
         &self,
         prefix: &str,
         start_after: Option<&str>,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
-        let client = self.client.clone();
+        let client = self.control.clone();
         let bucket = self.bucket.clone();
         let prefix = prefix.to_owned();
         let start_after = start_after.map(|s| s.to_owned());
@@ -844,7 +1656,8 @@ impl ObjectStore for S3Store {
                                 Ok(ObjectMeta {
                                     key: obj.key().unwrap_or("").to_owned(),
                                     size: obj.size().unwrap_or(0) as u64,
-                                    version: Version::new(etag.as_deref().unwrap_or("")),
+                                    version: CasToken::new(etag.as_deref().unwrap_or("")),
+                                    object_version_id: None,
                                 })
                             })
                             .collect();
@@ -870,7 +1683,7 @@ impl ObjectStore for S3Store {
         let mut continuation_token: Option<String> = None;
         loop {
             let mut builder = self
-                .client
+                .control
                 .list_objects_v2()
                 .bucket(&self.bucket)
                 .prefix(prefix)
@@ -926,7 +1739,7 @@ impl ObjectStore for S3Store {
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
         if sources.is_empty() {
@@ -934,17 +1747,27 @@ impl ObjectStore for S3Store {
                 "compose needs at least one source".into(),
             ));
         }
-        // Sizes first: the layout of parts depends on them.
-        let mut sizes = Vec::with_capacity(sources.len());
-        let mut versions = Vec::with_capacity(sources.len());
-        for src in sources {
-            let m = self
-                .head(src)
+        for source in sources {
+            let meta = self
+                .head_version(&source.key, &source.object_version_id)
                 .await?
-                .ok_or_else(|| StoreError::NotFound { key: src.clone() })?;
-            sizes.push(m.size);
-            versions.push(m.version);
+                .ok_or_else(|| StoreError::NotFound {
+                    key: source.key.clone(),
+                })?;
+            if meta.version != source.cas_token {
+                return Err(StoreError::PreconditionFailed {
+                    key: source.key.clone(),
+                    current: Some(meta.version),
+                });
+            }
+            if meta.size != source.size {
+                return Err(StoreError::InvalidArgument(format!(
+                    "compose source {} size is {}, expected {}",
+                    source.key, meta.size, source.size
+                )));
+            }
         }
+        let sizes: Vec<u64> = sources.iter().map(|source| source.size).collect();
         let total = sizes.iter().try_fold(0u64, |total, size| {
             total.checked_add(*size).ok_or_else(|| {
                 StoreError::InvalidArgument("composed object size overflows u64".into())
@@ -963,8 +1786,9 @@ impl ObjectStore for S3Store {
         // sees a partially uploaded layout that later exceeds 10,000 parts.
         let part_target = multipart_part_size(total, self.multipart_part_size)?;
         let plans = compose_part_plan(&sizes, part_target)?;
+        let lane = self.data_lane(dest, false, true).await?;
 
-        let mut create = self
+        let mut create = lane
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
@@ -975,10 +1799,9 @@ impl ObjectStore for S3Store {
         if opts.immutable {
             create = create.cache_control("public, max-age=31536000, immutable");
         }
-        let upload = create
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error("create multipart", dest, e))?;
+        let upload_result = create.send().await;
+        drop(lane);
+        let upload = upload_result.map_err(|e| classify_sdk_error("create multipart", dest, e))?;
         let upload_id = upload
             .upload_id()
             .ok_or_else(|| {
@@ -995,23 +1818,22 @@ impl ObjectStore for S3Store {
                     ComposePartPlan::Copy(range) => {
                         let source = &sources[range.source];
                         let range_end = range.start + range.len - 1;
-                        let part = self
+                        let lane = self.data_lane(dest, false, true).await?;
+                        let part_result = lane
                             .client
                             .upload_part_copy()
                             .bucket(&self.bucket)
                             .key(dest)
                             .upload_id(&upload_id)
                             .part_number(part_number)
-                            .copy_source(format!(
-                                "{}/{}",
-                                self.bucket,
-                                crate::util::encode_path(source)
-                            ))
+                            .copy_source(compose_copy_source(&self.bucket, source))
                             .copy_source_range(format!("bytes={}-{}", range.start, range_end))
-                            .copy_source_if_match(versions[range.source].as_str())
+                            .copy_source_if_match(source.cas_token.as_str())
                             .send()
-                            .await
-                            .map_err(|e| classify_sdk_error("upload part copy", source, e))?;
+                            .await;
+                        drop(lane);
+                        let part = part_result
+                            .map_err(|e| classify_sdk_error("upload part copy", &source.key, e))?;
                         let etag = part
                             .copy_part_result()
                             .and_then(|r| r.e_tag())
@@ -1036,16 +1858,17 @@ impl ObjectStore for S3Store {
                             let source = &sources[range.source];
                             let range_result = self
                                 .get(
-                                    source,
+                                    &source.key,
                                     GetOptions {
-                                        if_match: Some(versions[range.source].clone()),
+                                        if_match: Some(source.cas_token.clone()),
                                         range: Some(range.start..range.start + range.len),
+                                        object_version_id: Some(source.object_version_id.clone()),
                                         ..GetOptions::default()
                                     },
                                 )
                                 .await?;
                             let bytes =
-                                collect_compose_range(range_result, source, range.len).await?;
+                                collect_compose_range(range_result, &source.key, range.len).await?;
                             buf.extend_from_slice(&bytes);
                         }
                         if buf.len() as u64 != len {
@@ -1053,7 +1876,8 @@ impl ObjectStore for S3Store {
                                 "s3 compose upload part length changed after planning".into(),
                             ));
                         }
-                        let part = self
+                        let lane = self.data_lane(dest, false, true).await?;
+                        let part_result = lane
                             .client
                             .upload_part()
                             .bucket(&self.bucket)
@@ -1063,8 +1887,10 @@ impl ObjectStore for S3Store {
                             .body(S3ByteStream::from(Bytes::from(buf)))
                             .content_length(len as i64)
                             .send()
-                            .await
-                            .map_err(|e| classify_sdk_error("upload part", dest, e))?;
+                            .await;
+                        drop(lane);
+                        let part =
+                            part_result.map_err(|e| classify_sdk_error("upload part", dest, e))?;
                         parts.push(
                             aws_sdk_s3::types::CompletedPart::builder()
                                 .e_tag(part.e_tag().unwrap_or("").to_owned())
@@ -1084,7 +1910,8 @@ impl ObjectStore for S3Store {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
             .set_parts(Some(parts))
             .build();
-        let complete = self
+        let lane = self.data_lane(dest, false, true).await?;
+        let complete = lane
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
@@ -1092,7 +1919,9 @@ impl ObjectStore for S3Store {
             .upload_id(&upload_id)
             .multipart_upload(completed);
         let complete = apply_complete_condition(complete, &opts.mode);
-        let resp = match complete.send().await {
+        let complete_result = complete.send().await;
+        drop(lane);
+        let resp = match complete_result {
             Ok(r) => r,
             Err(e) => {
                 self.abort_multipart_after_failure(dest, &upload_id).await;
@@ -1101,19 +1930,20 @@ impl ObjectStore for S3Store {
                     .await);
             }
         };
-        let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
-        Ok(ObjectMeta {
-            key: dest.into(),
-            size: total,
-            version: Version::new(etag.as_deref().unwrap_or("")),
-        })
+        successful_write_meta(
+            "ComposeObject completion",
+            dest,
+            total,
+            resp.e_tag(),
+            resp.version_id(),
+        )
     }
 
     async fn signed_get_url(&self, key: &str, ttl: Duration) -> Result<Option<String>> {
         let presigning = PresigningConfig::expires_in(ttl)
             .map_err(|e| StoreError::other(anyhow::anyhow!("presigning config: {e}")))?;
         let presigned = self
-            .client
+            .control
             .get_object()
             .bucket(&self.bucket)
             .key(key)
@@ -1143,6 +1973,36 @@ struct ListState {
 // ---- multipart upload --------------------------------------------------
 
 impl S3Store {
+    async fn prove_exact_delete_marker_by_listing(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<bool> {
+        let mut cursor = None;
+        for _ in 0..DELETE_MARKER_PROOF_MAX_PAGES {
+            let page = self
+                .list_versions(key, cursor.as_ref(), MAX_VERSION_PAGE_SIZE)
+                .await?;
+            if let Some(kind) = exact_listed_version_kind(&page.versions, key, version_id) {
+                return Ok(kind == ObjectVersionKind::DeleteMarker);
+            }
+            match page.next {
+                None => return Ok(false),
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(StoreError::UnsupportedCapability {
+                        backend: "s3",
+                        capability: "progressing exact delete-marker version enumeration",
+                    });
+                }
+                Some(next) => cursor = Some(next),
+            }
+        }
+        Err(StoreError::UnsupportedCapability {
+            backend: "s3",
+            capability: "bounded exact delete-marker version enumeration",
+        })
+    }
+
     async fn resolve_conditional_write_failure<E>(
         &self,
         op: &str,
@@ -1186,7 +2046,8 @@ impl S3Store {
         opts: &PutOptions,
     ) -> Result<ObjectMeta> {
         let part_size = multipart_part_size(len, self.multipart_part_size)?;
-        let mut create = self
+        let lane = self.data_lane(key, false, true).await?;
+        let mut create = lane
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
@@ -1199,10 +2060,9 @@ impl S3Store {
             create = create.cache_control("public, max-age=31536000, immutable");
         }
 
-        let upload = create
-            .send()
-            .await
-            .map_err(|e| classify_sdk_error("create multipart", key, e))?;
+        let upload_result = create.send().await;
+        drop(lane);
+        let upload = upload_result.map_err(|e| classify_sdk_error("create multipart", key, e))?;
 
         let upload_id = upload
             .upload_id()
@@ -1227,7 +2087,8 @@ impl S3Store {
             };
             let actual = buf.len() as u64;
 
-            let part = match self
+            let lane = self.data_lane(key, false, true).await?;
+            let part_result = lane
                 .client
                 .upload_part()
                 .bucket(&self.bucket)
@@ -1237,8 +2098,9 @@ impl S3Store {
                 .body(S3ByteStream::from(buf))
                 .content_length(actual as i64)
                 .send()
-                .await
-            {
+                .await;
+            drop(lane);
+            let part = match part_result {
                 Ok(p) => p,
                 Err(e) => {
                     self.abort_multipart_after_failure(key, &upload_id).await;
@@ -1268,7 +2130,8 @@ impl S3Store {
             .set_parts(Some(uploaded_parts))
             .build();
 
-        let complete = self
+        let lane = self.data_lane(key, false, true).await?;
+        let complete = lane
             .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
@@ -1276,7 +2139,9 @@ impl S3Store {
             .upload_id(&upload_id)
             .multipart_upload(completed);
         let complete = apply_complete_condition(complete, &opts.mode);
-        let resp = match complete.send().await {
+        let complete_result = complete.send().await;
+        drop(lane);
+        let resp = match complete_result {
             Ok(r) => r,
             Err(e) => {
                 self.abort_multipart_after_failure(key, &upload_id).await;
@@ -1286,16 +2151,18 @@ impl S3Store {
             }
         };
 
-        let etag = resp.e_tag().map(|s| s.trim_matches('"').to_owned());
-        Ok(ObjectMeta {
-            key: key.into(),
-            size: len,
-            version: Version::new(etag.as_deref().unwrap_or("")),
-        })
+        successful_write_meta(
+            "CompleteMultipartUpload",
+            key,
+            len,
+            resp.e_tag(),
+            resp.version_id(),
+        )
     }
 
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
-        self.client
+        let lane = self.data_lane(key, false, true).await?;
+        lane.client
             .abort_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
@@ -1313,6 +2180,8 @@ impl S3Store {
                 StoreError::PreconditionFailed { .. } => "precondition",
                 StoreError::Retryable(_) => "retryable",
                 StoreError::InvalidArgument(_) => "invalid-argument",
+                StoreError::UnsupportedCapability { .. } => "unsupported-capability",
+                StoreError::AmbiguousWrite { .. } => "ambiguous-write",
                 StoreError::Other(_) => "other",
             };
             tracing::warn!(
@@ -1337,17 +2206,142 @@ impl S3Store {
 //    are supported. The exact selected provider must separately prove the
 //    conditional CompleteMultipartUpload headers required by this backend.
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
-//    stripped consistently in our Version.
+//    stripped consistently in our CasToken.
 // 9. force_path_style: required for rustfs local dev.
+// 10. Exact HEAD of a delete marker returns a bare 405 without the AWS
+//     delete-marker/version headers. The failure path proves the exact marker
+//     through bounded ListObjectVersions pagination instead.
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
     use aws_smithy_types::{body::SdkBody, retry::RetryConfig};
 
     use super::*;
+
+    fn lane_test_store(bulk_clients: usize, bulk_concurrency: usize) -> S3Store {
+        let cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "lane-test-bucket".into(),
+            ..Default::default()
+        };
+        let shared_config = aws_config::SdkConfig::builder()
+            .region(aws_sdk_s3::config::Region::new(cfg.s3.region.clone()))
+            .build();
+        let build_client = || {
+            S3Client::from_conf(
+                closed_s3_config_builder(&shared_config, &cfg, independent_aws_http_client())
+                    .credentials_provider(Credentials::new(
+                        "test-access",
+                        "test-secret",
+                        None,
+                        None,
+                        "lane-test",
+                    ))
+                    .build(),
+            )
+        };
+        S3Store {
+            control: build_client(),
+            bulk: (0..bulk_clients).map(|_| build_client()).collect(),
+            bulk_next: std::sync::atomic::AtomicUsize::new(0),
+            bucket: cfg.bucket,
+            physical_prefix: String::new(),
+            control_http: independent_data_http_client().unwrap(),
+            bulk_http: (0..bulk_clients)
+                .map(|_| independent_data_http_client().unwrap())
+                .collect(),
+            bulk_permits: Arc::new(tokio::sync::Semaphore::new(bulk_concurrency)),
+            bulk_permits_total: bulk_concurrency,
+            permit_wait_warn: Duration::from_secs(1),
+            multipart_threshold: cfg.multipart_threshold.as_u64(),
+            multipart_part_size: cfg.multipart_part_size.as_u64(),
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_bulk_admission_never_blocks_control_selection() {
+        let store = Arc::new(lane_test_store(2, 1));
+        let held = store
+            .data_lane("repos/o/r/wal/a.pack", false, false)
+            .await
+            .expect("first bulk lane");
+        assert!(held.bulk_permit.is_some());
+        assert_eq!(store.bulk_permits.available_permits(), 0);
+
+        let waiting_store = store.clone();
+        let mut waiting = tokio::spawn(async move {
+            waiting_store
+                .data_lane("repos/o/r/wal/b.pack", false, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "a second bulk operation must remain queued"
+        );
+
+        for control_key in ["repos/o/r/manifest.pb", "repos/o/r/events/cursor.json"] {
+            let control = tokio::time::timeout(
+                Duration::from_millis(50),
+                store.data_lane(control_key, false, false),
+            )
+            .await
+            .expect("control selection must not wait")
+            .expect("control lane");
+            assert!(control.bulk_permit.is_none(), "{control_key}");
+        }
+
+        drop(held);
+        let resumed = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("queued bulk operation resumes")
+            .expect("bulk selection task")
+            .expect("second bulk lane");
+        assert!(resumed.bulk_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn closed_bulk_admission_fails_without_control_fallback() {
+        let store = lane_test_store(1, 1);
+        store.bulk_permits.close();
+        let result = store.data_lane("repos/o/r/wal/a.pack", false, false).await;
+        assert!(matches!(result, Err(StoreError::Other(_))));
+
+        let control = store
+            .data_lane("repos/o/r/manifest.pb", false, false)
+            .await
+            .expect("closed bulk admission does not close control");
+        assert!(control.bulk_permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_bulk_waiter_does_not_consume_admission() {
+        let store = Arc::new(lane_test_store(1, 1));
+        let held = store
+            .data_lane("repos/o/r/wal/a.pack", false, false)
+            .await
+            .unwrap();
+        let waiting_store = store.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_store
+                .data_lane("repos/o/r/wal/b.pack", false, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        waiting.abort();
+        match waiting.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("queued bulk operation completed before cancellation"),
+        }
+        drop(held);
+        assert_eq!(store.bulk_permits.available_permits(), 1);
+    }
 
     const TEST_BUCKET: &str = "test-bucket";
     const CONDITIONAL_CONFLICT_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1383,11 +2377,19 @@ mod tests {
             .force_path_style(true)
             .http_client(replay.clone())
             .build();
+        let client = S3Client::from_conf(config);
         (
             S3Store {
-                client: S3Client::from_conf(config),
+                control: client.clone(),
+                bulk: vec![client],
+                bulk_next: std::sync::atomic::AtomicUsize::new(0),
                 bucket: TEST_BUCKET.into(),
-                http: reqwest::Client::new(),
+                physical_prefix: String::new(),
+                control_http: reqwest::Client::new(),
+                bulk_http: vec![reqwest::Client::new()],
+                bulk_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+                bulk_permits_total: 1,
+                permit_wait_warn: Duration::from_secs(1),
                 multipart_threshold: 1024 * 1024,
                 multipart_part_size: S3_MIN_PART_SIZE,
             },
@@ -1429,21 +2431,76 @@ mod tests {
     }
 
     #[test]
-    fn explicit_credentials_fall_back_only_when_both_are_absent() {
+    fn bulk_clients_are_selected_round_robin_within_bounds() {
+        let store = lane_test_store(3, 1);
+        let selected: Vec<usize> = (0..8).map(|_| store.next_bulk_index()).collect();
+        assert_eq!(selected, [0, 1, 2, 0, 1, 2, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn bulk_get_body_holds_permit_until_eof_or_drop() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let mut body = retain_bulk_permit(
+            Box::pin(futures::stream::iter([Ok(Bytes::from_static(b"chunk"))])),
+            Some(permit),
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"chunk")
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert!(body.next().await.is_none());
+        assert_eq!(permits.available_permits(), 1);
+
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let mut body = retain_bulk_permit(
+            Box::pin(futures::stream::iter([Err(StoreError::InvalidArgument(
+                "stream failed".into(),
+            ))])),
+            Some(permit),
+        );
+        assert_eq!(permits.available_permits(), 0);
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(permits.available_permits(), 1);
+
+        let permit = permits.clone().acquire_owned().await.unwrap();
+        let body = retain_bulk_permit(Box::pin(futures::stream::pending()), Some(permit));
+        assert_eq!(permits.available_permits(), 0);
+        drop(body);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn explicit_credentials_never_fall_back_when_selected() {
         let empty = HashMap::<&str, &str>::new();
         assert!(
-            explicit_credentials("ACCESS", "SECRET", "", |name| empty
-                .get(name)
-                .map(ToString::to_string))
-            .expect("absent credentials use default chain")
-            .is_none()
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "ACCESS",
+                "SECRET",
+                "",
+                |name| empty
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
+            .is_err()
         );
 
         let both = HashMap::from([("ACCESS", "access-value"), ("SECRET", "secret-value")]);
         assert_eq!(
-            explicit_credentials("ACCESS", "SECRET", "", |name| both
-                .get(name)
-                .map(ToString::to_string))
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "ACCESS",
+                "SECRET",
+                "",
+                |name| both
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .expect("complete explicit credentials"),
             Some(("access-value".into(), "secret-value".into(), None))
         );
@@ -1457,9 +2514,16 @@ mod tests {
             ("AWS_SESSION_TOKEN", "token-value"),
         ]);
         assert!(
-            explicit_credentials("", "", "", |name| standard
-                .get(name)
-                .map(ToString::to_string))
+            explicit_credentials(
+                walgit_config::S3CredentialMode::DefaultChain,
+                "",
+                "",
+                "",
+                |name| standard
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .expect("empty override names select the SDK default chain")
             .is_none()
         );
@@ -1471,6 +2535,250 @@ mod tests {
     }
 
     #[test]
+    fn production_versioning_check_fails_closed() {
+        assert!(require_enabled_versioning(None).is_err());
+        assert!(
+            require_enabled_versioning(Some(&aws_sdk_s3::types::BucketVersioningStatus::Suspended))
+                .is_err()
+        );
+        require_enabled_versioning(Some(&aws_sdk_s3::types::BucketVersioningStatus::Enabled))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_construction_cannot_bypass_static_s3_validation() {
+        let mut cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            ..Default::default()
+        };
+        cfg.s3.credential_mode = walgit_config::S3CredentialMode::DefaultChain;
+        cfg.s3.access_key_env = "SHOULD_NOT_BE_READ".into();
+        cfg.s3.secret_key_env = "ALSO_SHOULD_NOT_BE_READ".into();
+
+        let error = S3Store::new(&cfg)
+            .await
+            .err()
+            .expect("invalid static config must fail before opening S3")
+            .to_string();
+        assert!(error.contains("default_chain"), "{error}");
+        assert!(!error.contains("SHOULD_NOT_BE_READ"), "{error}");
+        assert!(!error.contains("ALSO_SHOULD_NOT_BE_READ"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn configured_endpoint_replaces_imported_aws_endpoint_modifiers() {
+        let shared_config = aws_config::SdkConfig::builder()
+            .region(aws_sdk_s3::config::Region::new("hostile-region"))
+            .endpoint_url("http://hostile.example.test")
+            .use_fips(true)
+            .use_dual_stack(true)
+            .build();
+        let mut cfg = walgit_config::StoreConfig {
+            backend: walgit_config::StoreBackend::S3,
+            bucket: "trusted-bucket".into(),
+            ..Default::default()
+        };
+        cfg.s3.endpoint = "https://trusted.example.test".into();
+        cfg.s3.region = "trusted-region-1".into();
+        cfg.s3.force_path_style = true;
+
+        let service_config =
+            closed_s3_config_builder(&shared_config, &cfg, independent_aws_http_client())
+                .credentials_provider(Credentials::new(
+                    "test-access",
+                    "test-secret",
+                    None,
+                    None,
+                    "endpoint-authority-test",
+                ))
+                .build();
+        let request = S3Client::from_conf(service_config)
+            .get_object()
+            .bucket(&cfg.bucket)
+            .key("object")
+            .presigned(PresigningConfig::expires_in(Duration::from_secs(60)).unwrap())
+            .await
+            .expect("presign with the closed endpoint configuration");
+        let uri = request.uri();
+
+        assert!(
+            uri.starts_with("https://trusted.example.test/trusted-bucket/object?"),
+            "unexpected provider target"
+        );
+        assert!(!uri.contains("hostile.example.test"));
+        assert!(!uri.contains("fips"));
+        assert!(!uri.contains("dualstack"));
+    }
+
+    #[test]
+    fn every_successful_write_path_requires_a_usable_version_id() {
+        for operation in [
+            "PutObject",
+            "ComposeObject completion",
+            "CompleteMultipartUpload",
+        ] {
+            for missing in [None, Some(""), Some("null")] {
+                assert!(matches!(
+                    successful_write_meta(operation, "key", 4, Some("\"etag\""), missing),
+                    Err(StoreError::AmbiguousWrite { .. })
+                ));
+            }
+            assert!(matches!(
+                successful_write_meta(
+                    operation,
+                    "key",
+                    4,
+                    Some("\"etag\""),
+                    Some(&"x".repeat(1_025)),
+                ),
+                Err(StoreError::AmbiguousWrite { .. })
+            ));
+            let meta =
+                successful_write_meta(operation, "key", 4, Some("\"etag\""), Some("version-id"))
+                    .expect("version-addressed successful write");
+            assert_eq!(meta.version.as_str(), "etag");
+            assert_eq!(
+                meta.object_version_id.expect("version ID").as_str(),
+                "version-id"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_current_get_and_head_require_a_usable_version_id() {
+        for capability in [
+            "VersionId on successful current GET",
+            "VersionId on successful current HEAD",
+        ] {
+            for missing in [None, Some(""), Some("null")] {
+                assert!(matches!(
+                    require_current_s3_version_id(capability, missing),
+                    Err(StoreError::UnsupportedCapability { .. })
+                ));
+            }
+            assert_eq!(
+                require_current_s3_version_id(capability, Some(" version-id "))
+                    .expect("usable version ID")
+                    .as_str(),
+                " version-id "
+            );
+            assert_eq!(
+                require_current_s3_version_id(capability, Some(" null "))
+                    .expect("only exact null is invalid")
+                    .as_str(),
+                " null "
+            );
+        }
+    }
+
+    #[test]
+    fn compose_copy_source_pins_the_exact_version_and_cas() {
+        let source = ComposeSource {
+            key: "packs/a pack.pack".into(),
+            size: 42,
+            cas_token: CasToken::new("etag"),
+            object_version_id: ObjectVersionId::new("version/with+reserved"),
+        };
+        assert_eq!(
+            compose_copy_source("bucket", &source),
+            "bucket/packs/a%20pack.pack?versionId=version%2Fwith%2Breserved"
+        );
+    }
+
+    #[test]
+    fn exact_head_uses_only_405_for_delete_marker_evidence() {
+        let requested = ObjectVersionId::new("marker-version");
+        assert_eq!(
+            exact_delete_marker_head_evidence(
+                405,
+                Some("true"),
+                Some("marker-version"),
+                &requested
+            ),
+            ExactDeleteMarkerHeadEvidence::Confirmed
+        );
+        for (marker, version) in [
+            (None, Some("marker-version")),
+            (Some("false"), Some("marker-version")),
+            (Some("true"), Some("other-version")),
+            (Some("true"), None),
+        ] {
+            assert_eq!(
+                exact_delete_marker_head_evidence(405, marker, version, &requested),
+                ExactDeleteMarkerHeadEvidence::RequiresListing
+            );
+        }
+        assert_eq!(
+            exact_delete_marker_head_evidence(
+                404,
+                Some("true"),
+                Some("marker-version"),
+                &requested
+            ),
+            ExactDeleteMarkerHeadEvidence::Unrelated
+        );
+        assert_eq!(
+            exact_delete_marker_head_evidence(500, None, None, &requested),
+            ExactDeleteMarkerHeadEvidence::Unrelated
+        );
+    }
+
+    #[test]
+    fn exact_listing_proof_matches_both_key_and_version_kind() {
+        let requested = ObjectVersionId::new("requested");
+        let versions = vec![
+            ObjectVersion {
+                key: "same-prefix-sibling".into(),
+                object_version_id: requested.clone(),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: false,
+            },
+            ObjectVersion {
+                key: "key".into(),
+                object_version_id: ObjectVersionId::new("other"),
+                cas_token: None,
+                size: 0,
+                kind: ObjectVersionKind::DeleteMarker,
+                is_latest: false,
+            },
+        ];
+        assert_eq!(
+            exact_listed_version_kind(&versions, "key", &requested),
+            None
+        );
+
+        let mut exact_object = versions.clone();
+        exact_object.push(ObjectVersion {
+            key: "key".into(),
+            object_version_id: requested.clone(),
+            cas_token: Some(CasToken::new("etag")),
+            size: 1,
+            kind: ObjectVersionKind::Object,
+            is_latest: false,
+        });
+        assert_eq!(
+            exact_listed_version_kind(&exact_object, "key", &requested),
+            Some(ObjectVersionKind::Object)
+        );
+
+        let mut exact_marker = versions;
+        exact_marker.push(ObjectVersion {
+            key: "key".into(),
+            object_version_id: requested.clone(),
+            cas_token: None,
+            size: 0,
+            kind: ObjectVersionKind::DeleteMarker,
+            is_latest: true,
+        });
+        assert_eq!(
+            exact_listed_version_kind(&exact_marker, "key", &requested),
+            Some(ObjectVersionKind::DeleteMarker)
+        );
+    }
+
+    #[test]
     fn explicit_temporary_credentials_include_session_token() {
         let values = HashMap::from([
             ("CUSTOM_ACCESS", "access-value"),
@@ -1478,9 +2786,16 @@ mod tests {
             ("CUSTOM_TOKEN", "token-value"),
         ]);
         assert_eq!(
-            explicit_credentials("CUSTOM_ACCESS", "CUSTOM_SECRET", "CUSTOM_TOKEN", |name| {
-                values.get(name).map(ToString::to_string)
-            },)
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "CUSTOM_ACCESS",
+                "CUSTOM_SECRET",
+                "CUSTOM_TOKEN",
+                |name| values
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .expect("complete temporary credentials"),
             Some((
                 "access-value".into(),
@@ -1493,20 +2808,35 @@ mod tests {
     #[test]
     fn partial_explicit_credentials_fail_without_exposing_values() {
         let values = HashMap::from([("ACCESS", "must-not-appear")]);
-        let error = explicit_credentials("ACCESS", "SECRET", "", |name| {
-            values.get(name).map(ToString::to_string)
-        })
+        let error = explicit_credentials(
+            walgit_config::S3CredentialMode::ExplicitEnv,
+            "ACCESS",
+            "SECRET",
+            "",
+            |name| {
+                values
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent)
+            },
+        )
         .expect_err("partial override must fail")
         .to_string();
-        assert!(error.contains("ACCESS"));
-        assert!(error.contains("SECRET"));
+        assert!(error.contains("secret-key"));
         assert!(!error.contains("must-not-appear"));
 
         let empty_secret = HashMap::from([("ACCESS", "must-not-appear"), ("SECRET", "")]);
         assert!(
-            explicit_credentials("ACCESS", "SECRET", "", |name| empty_secret
-                .get(name)
-                .map(ToString::to_string))
+            explicit_credentials(
+                walgit_config::S3CredentialMode::ExplicitEnv,
+                "ACCESS",
+                "SECRET",
+                "",
+                |name| empty_secret
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent),
+            )
             .is_err()
         );
 
@@ -1514,15 +2844,50 @@ mod tests {
             ("ACCESS", "must-not-appear"),
             ("SECRET", "also-must-not-appear"),
         ]);
-        let error = explicit_credentials("ACCESS", "SECRET", "TOKEN", |name| {
-            missing_token.get(name).map(ToString::to_string)
-        })
+        let error = explicit_credentials(
+            walgit_config::S3CredentialMode::ExplicitEnv,
+            "ACCESS",
+            "SECRET",
+            "TOKEN",
+            |name| {
+                missing_token
+                    .get(name)
+                    .map(ToString::to_string)
+                    .ok_or(std::env::VarError::NotPresent)
+            },
+        )
         .expect_err("a configured session-token variable must resolve")
         .to_string();
         assert!(!error.contains("must-not-appear"));
         assert!(!error.contains("also-must-not-appear"));
-        assert!(explicit_credentials("ACCESS", "", "", |_| None).is_err());
-        assert!(explicit_credentials("", "", "TOKEN", |_| None).is_err());
+        assert!(error.contains("session-token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_explicit_credentials_fail_without_exposing_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = explicit_credentials(
+            walgit_config::S3CredentialMode::ExplicitEnv,
+            "ACCESS",
+            "SECRET",
+            "",
+            |name| {
+                if name == "ACCESS" {
+                    Err(std::env::VarError::NotUnicode(
+                        std::ffi::OsString::from_vec(b"secret-sentinel-\xff".to_vec()),
+                    ))
+                } else {
+                    Ok("other-secret-sentinel".into())
+                }
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("access-key"), "{error}");
+        assert!(!error.contains("secret-sentinel"), "{error}");
+        assert!(!error.contains("other-secret-sentinel"), "{error}");
     }
 
     #[tokio::test]
@@ -1540,10 +2905,18 @@ mod tests {
             .endpoint_url("http://127.0.0.1:9000")
             .force_path_style(true)
             .build();
+        let client = S3Client::from_conf(config);
         let store = S3Store {
-            client: S3Client::from_conf(config),
+            control: client.clone(),
+            bulk: vec![client],
+            bulk_next: std::sync::atomic::AtomicUsize::new(0),
             bucket: "test-bucket".into(),
-            http: reqwest::Client::new(),
+            physical_prefix: String::new(),
+            control_http: reqwest::Client::new(),
+            bulk_http: vec![reqwest::Client::new()],
+            bulk_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            bulk_permits_total: 1,
+            permit_wait_warn: Duration::from_secs(1),
             multipart_threshold: 8 * 1024 * 1024,
             multipart_part_size: S3_MIN_PART_SIZE,
         };
@@ -1682,7 +3055,8 @@ mod tests {
             meta: ObjectMeta {
                 key: "large-pack".into(),
                 size: 30 * 1024 * 1024 * 1024,
-                version: Version::new("version"),
+                version: CasToken::new("version"),
+                object_version_id: None,
             },
             body: Box::pin(futures::stream::iter([
                 Ok(Bytes::from(vec![b'a'; 2 * 1024 * 1024])),
@@ -1700,7 +3074,8 @@ mod tests {
             meta: ObjectMeta {
                 key: "large-pack".into(),
                 size: 30 * 1024 * 1024 * 1024,
-                version: Version::new("version"),
+                version: CasToken::new("version"),
+                object_version_id: None,
             },
             body: crate::util::once(Bytes::from_static(b"short")),
         };
@@ -1724,7 +3099,7 @@ mod tests {
         assert_eq!(create.get_if_none_match().as_deref(), Some("*"));
         assert!(create.get_if_match().is_none());
 
-        let update_version = Version::new("etag");
+        let update_version = CasToken::new("etag");
         let update = apply_complete_condition(
             client.complete_multipart_upload(),
             &PutMode::Update(update_version),
@@ -1747,7 +3122,15 @@ mod tests {
                 CONDITIONAL_CONFLICT_XML,
                 &[("content-type", "application/xml")],
             ),
-            replay_event(200, "", &[("etag", "\"moved\""), ("content-length", "0")]),
+            replay_event(
+                200,
+                "",
+                &[
+                    ("etag", "\"moved\""),
+                    ("content-length", "0"),
+                    ("x-amz-version-id", "moved-version"),
+                ],
+            ),
         ]);
 
         let create = store
@@ -1764,14 +3147,14 @@ mod tests {
             .put(
                 "update",
                 PutBody::Bytes(Bytes::from_static(b"update")),
-                PutOptions::from(PutMode::Update(Version::new("expected"))),
+                PutOptions::from(PutMode::Update(CasToken::new("expected"))),
             )
             .await
             .expect_err("moved Update reconciliation is a precondition failure");
         match update {
             StoreError::PreconditionFailed { key, current } => {
                 assert_eq!(key, "update");
-                assert_eq!(current, Some(Version::new("moved")));
+                assert_eq!(current, Some(CasToken::new("moved")));
             }
             other => panic!("expected PreconditionFailed, got {other:?}"),
         }
@@ -1829,7 +3212,15 @@ mod tests {
                 &[("content-type", "application/xml")],
             ),
             replay_event(204, "", &[]),
-            replay_event(200, "", &[("etag", "\"moved\""), ("content-length", "0")]),
+            replay_event(
+                200,
+                "",
+                &[
+                    ("etag", "\"moved\""),
+                    ("content-length", "0"),
+                    ("x-amz-version-id", "moved-version"),
+                ],
+            ),
         ]);
 
         let error = store
@@ -1843,7 +3234,7 @@ mod tests {
         match error {
             StoreError::PreconditionFailed { key, current } => {
                 assert_eq!(key, "multi");
-                assert_eq!(current, Some(Version::new("moved")));
+                assert_eq!(current, Some(CasToken::new("moved")));
             }
             other => panic!("expected PreconditionFailed, got {other:?}"),
         }
@@ -1903,7 +3294,11 @@ mod tests {
             replay_event(
                 200,
                 "",
-                &[("etag", "\"source\""), ("content-length", "6291456")],
+                &[
+                    ("etag", "\"source\""),
+                    ("content-length", "6291456"),
+                    ("x-amz-version-id", "source-version"),
+                ],
             ),
             replay_event(200, initiated, &[("content-type", "application/xml")]),
             replay_event(200, copied, &[("content-type", "application/xml")]),
@@ -1916,22 +3311,32 @@ mod tests {
             replay_event(
                 200,
                 "",
-                &[("etag", "\"dest-moved\""), ("content-length", "0")],
+                &[
+                    ("etag", "\"dest-moved\""),
+                    ("content-length", "0"),
+                    ("x-amz-version-id", "dest-moved-version"),
+                ],
             ),
         ]);
 
+        let source = ComposeSource {
+            key: "source".into(),
+            size: 6 * 1024 * 1024,
+            cas_token: CasToken::new("source"),
+            object_version_id: ObjectVersionId::new("source-version"),
+        };
         let error = store
             .compose(
                 "compose-dest",
-                &["source".into()],
-                PutOptions::from(PutMode::Update(Version::new("expected"))),
+                &[source],
+                PutOptions::from(PutMode::Update(CasToken::new("expected"))),
             )
             .await
             .expect_err("compose conflict must fail");
         match error {
             StoreError::PreconditionFailed { key, current } => {
                 assert_eq!(key, "compose-dest");
-                assert_eq!(current, Some(Version::new("dest-moved")));
+                assert_eq!(current, Some(CasToken::new("dest-moved")));
             }
             other => panic!("expected PreconditionFailed, got {other:?}"),
         }
@@ -2073,8 +3478,226 @@ mod tests {
     }
 
     #[test]
+    fn sdk_diagnostics_allowlist_provider_fields() {
+        const SENTINEL: &str = "provider-error-secret-sentinel";
+        let unknown = sdk_error_diagnostic("get", "service", Some(400), SENTINEL).to_string();
+        assert!(unknown.contains("status=400"), "{unknown}");
+        assert!(unknown.contains("code=unrecognized"), "{unknown}");
+        assert!(!unknown.contains(SENTINEL), "{unknown}");
+
+        let allowed = sdk_error_diagnostic("get", "service", Some(403), "AccessDenied").to_string();
+        assert!(allowed.contains("code=AccessDenied"), "{allowed}");
+    }
+
+    const EVIDENCE_BUCKET: &str = "evidence-bucket";
+    const EVIDENCE_PREFIX: &str = "deployment/";
+
+    fn version_output(
+        cursor: &S3VersionEvidenceCursor,
+        truncated: bool,
+        next: S3VersionEvidenceCursor,
+    ) -> aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput {
+        aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput::builder()
+            .name(EVIDENCE_BUCKET)
+            .prefix(EVIDENCE_PREFIX)
+            .max_keys(10)
+            .set_key_marker(cursor.key_marker.clone())
+            .set_version_id_marker(cursor.version_id_marker.clone())
+            .set_next_key_marker(next.key_marker)
+            .set_next_version_id_marker(next.version_id_marker)
+            .is_truncated(truncated)
+            .versions(
+                aws_sdk_s3::types::ObjectVersion::builder()
+                    .key(format!("{EVIDENCE_PREFIX}object"))
+                    .version_id(" version-id ")
+                    .size(7)
+                    .is_latest(true)
+                    .build(),
+            )
+            .delete_markers(
+                aws_sdk_s3::types::DeleteMarkerEntry::builder()
+                    .key(format!("{EVIDENCE_PREFIX}deleted"))
+                    .version_id("delete-id")
+                    .is_latest(false)
+                    .build(),
+            )
+            .build()
+    }
+
+    fn multipart_output(
+        cursor: &S3MultipartEvidenceCursor,
+        truncated: bool,
+        next: S3MultipartEvidenceCursor,
+    ) -> aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput {
+        aws_sdk_s3::operation::list_multipart_uploads::ListMultipartUploadsOutput::builder()
+            .bucket(EVIDENCE_BUCKET)
+            .prefix(EVIDENCE_PREFIX)
+            .max_uploads(10)
+            .set_key_marker(cursor.key_marker.clone())
+            .set_upload_id_marker(cursor.upload_id_marker.clone())
+            .set_next_key_marker(next.key_marker)
+            .set_next_upload_id_marker(next.upload_id_marker)
+            .is_truncated(truncated)
+            .uploads(
+                aws_sdk_s3::types::MultipartUpload::builder()
+                    .key(format!("{EVIDENCE_PREFIX}upload"))
+                    .upload_id("upload-id")
+                    .build(),
+            )
+            .build()
+    }
+
+    #[test]
+    fn version_evidence_decodes_initial_terminal_page_without_normalizing_ids() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let response = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        let page = decode_s3_version_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &cursor,
+            10,
+            &response,
+        )
+        .expect("strict version page");
+
+        assert_eq!(page.versions().len(), 2);
+        assert_eq!(
+            page.versions()[0].object_version_id.as_str(),
+            " version-id "
+        );
+        assert_eq!(page.request_cursor().key_marker(), None);
+        assert_eq!(page.response_next_cursor().key_marker(), None);
+        assert!(!page.is_truncated());
+    }
+
+    #[test]
+    fn evidence_pages_preserve_present_empty_and_support_two_pages() {
+        let initial = S3VersionEvidenceCursor::initial();
+        let next = S3VersionEvidenceCursor {
+            key_marker: Some(String::new()),
+            version_id_marker: Some(String::new()),
+        };
+        let first = version_output(&initial, true, next.clone());
+        let first =
+            decode_s3_version_evidence_page(EVIDENCE_BUCKET, EVIDENCE_PREFIX, &initial, 10, &first)
+                .expect("first page");
+        assert_eq!(first.response_next_cursor().key_marker(), Some(""));
+        assert_eq!(first.response_next_cursor().version_id_marker(), Some(""));
+
+        let mut second = version_output(&next, false, S3VersionEvidenceCursor::initial());
+        second.key_marker = None;
+        second.version_id_marker = None;
+        let second =
+            decode_s3_version_evidence_page(EVIDENCE_BUCKET, EVIDENCE_PREFIX, &next, 10, &second)
+                .expect("absent echoes are equivalent only to issued empty markers");
+        assert_eq!(second.request_cursor().key_marker(), Some(""));
+        assert_eq!(second.response_next_cursor().key_marker(), None);
+    }
+
+    #[test]
+    fn multipart_evidence_decodes_two_pages_and_preserves_ids() {
+        let initial = S3MultipartEvidenceCursor::initial();
+        let next = S3MultipartEvidenceCursor {
+            key_marker: Some("next-key".into()),
+            upload_id_marker: Some("next-upload".into()),
+        };
+        let first = multipart_output(&initial, true, next.clone());
+        let first = decode_s3_multipart_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &initial,
+            10,
+            &first,
+        )
+        .expect("first multipart page");
+        assert_eq!(first.uploads()[0].upload_id(), "upload-id");
+        assert_eq!(first.response_next_cursor(), &next);
+
+        let second = multipart_output(&next, false, S3MultipartEvidenceCursor::initial());
+        let second =
+            decode_s3_multipart_evidence_page(EVIDENCE_BUCKET, EVIDENCE_PREFIX, &next, 10, &second)
+                .expect("second multipart page");
+        assert!(!second.is_truncated());
+    }
+
+    #[test]
+    fn evidence_decoders_fail_closed_on_pagination_shape() {
+        let cursor = S3VersionEvidenceCursor {
+            key_marker: Some("request-key".into()),
+            version_id_marker: Some("request-version".into()),
+        };
+        let next = S3VersionEvidenceCursor {
+            key_marker: Some("next-key".into()),
+            version_id_marker: Some("next-version".into()),
+        };
+
+        let mut missing_truncation = version_output(&cursor, true, next.clone());
+        missing_truncation.is_truncated = None;
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &missing_truncation,
+            )
+            .is_err()
+        );
+
+        let mut missing_next = version_output(&cursor, true, next.clone());
+        missing_next.next_version_id_marker = None;
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &missing_next,
+            )
+            .is_err()
+        );
+
+        let extra_next = version_output(&cursor, false, next.clone());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &extra_next,
+            )
+            .is_err()
+        );
+
+        let repeated = version_output(&cursor, true, cursor.clone());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &repeated,
+            )
+            .is_err()
+        );
+
+        let mut wrong_echo = version_output(&cursor, true, next);
+        wrong_echo.key_marker = Some("different".into());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &wrong_echo,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn conditional_request_conflict_recognition_is_exact_and_conditional() {
-        for mode in [PutMode::Create, PutMode::Update(Version::new("expected"))] {
+        for mode in [PutMode::Create, PutMode::Update(CasToken::new("expected"))] {
             assert!(should_reconcile_conditional_conflict(
                 Some("ConditionalRequestConflict"),
                 &mode
@@ -2132,9 +3755,226 @@ mod tests {
     }
 
     #[test]
+    fn evidence_decoders_enforce_envelope_entries_and_bounds_without_leaks() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let mut response = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        response.name = Some("secret-wrong-bucket".into());
+        let error = decode_s3_version_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &cursor,
+            10,
+            &response,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("secret-wrong-bucket"), "{error}");
+        assert!(!error.contains(EVIDENCE_PREFIX), "{error}");
+
+        let mut escaped = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        escaped.versions.as_mut().unwrap()[0].key = Some("secret-escape".into());
+        let error = decode_s3_version_evidence_page(
+            EVIDENCE_BUCKET,
+            EVIDENCE_PREFIX,
+            &cursor,
+            10,
+            &escaped,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("secret-escape"), "{error}");
+
+        let mut combined_overflow =
+            version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        combined_overflow.max_keys = Some(1);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                1,
+                &combined_overflow,
+            )
+            .is_err()
+        );
+
+        let mut missing = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        let version = &mut missing.versions.as_mut().unwrap()[0];
+        version.size = None;
+        version.is_latest = None;
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &missing,
+            )
+            .is_err()
+        );
+
+        for bad_id in [String::new(), "null".into(), "x".repeat(1_025)] {
+            let mut invalid = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+            invalid.versions.as_mut().unwrap()[0].version_id = Some(bad_id);
+            assert!(
+                decode_s3_version_evidence_page(
+                    EVIDENCE_BUCKET,
+                    EVIDENCE_PREFIX,
+                    &cursor,
+                    10,
+                    &invalid,
+                )
+                .is_err()
+            );
+        }
+        let mut negative = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        negative.versions.as_mut().unwrap()[0].size = Some(-1);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &negative,
+            )
+            .is_err()
+        );
+
+        assert!(validate_s3_evidence_request(&"p".repeat(1_024), 1).is_ok());
+        assert!(validate_s3_evidence_request(&"p".repeat(1_025), 1).is_err());
+        assert!(validate_s3_evidence_request("", 0).is_err());
+        assert!(validate_s3_evidence_request("", 1_001).is_err());
+    }
+
+    #[test]
+    fn evidence_entry_fields_accept_1024_bytes_and_reject_1025() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let prefix = "p".repeat(1_023);
+        let key = format!("{prefix}k");
+        let id = "v".repeat(1_024);
+        let mut response = version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+        response.prefix = Some(prefix.clone());
+        response.versions.as_mut().unwrap()[0].key = Some(key.clone());
+        response.versions.as_mut().unwrap()[0].version_id = Some(id.clone());
+        response.delete_markers.as_mut().unwrap()[0].key = Some(key.clone());
+        response.delete_markers.as_mut().unwrap()[0].version_id = Some(id);
+        decode_s3_version_evidence_page(EVIDENCE_BUCKET, &prefix, &cursor, 10, &response)
+            .expect("1024-byte keys and IDs are valid");
+
+        response.versions.as_mut().unwrap()[0].key = Some("k".repeat(1_025));
+        assert!(
+            decode_s3_version_evidence_page(EVIDENCE_BUCKET, &prefix, &cursor, 10, &response,)
+                .is_err()
+        );
+
+        let multipart_cursor = S3MultipartEvidenceCursor::initial();
+        for bad_id in [String::new(), "u".repeat(1_025)] {
+            let mut response = multipart_output(
+                &multipart_cursor,
+                false,
+                S3MultipartEvidenceCursor::initial(),
+            );
+            response.uploads.as_mut().unwrap()[0].upload_id = Some(bad_id);
+            assert!(
+                decode_s3_multipart_evidence_page(
+                    EVIDENCE_BUCKET,
+                    EVIDENCE_PREFIX,
+                    &multipart_cursor,
+                    10,
+                    &response,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_envelope_rejects_grouping_encoding_and_mismatched_limits() {
+        let cursor = S3VersionEvidenceCursor::initial();
+        let base = || version_output(&cursor, false, S3VersionEvidenceCursor::initial());
+
+        let mut wrong_limit = base();
+        wrong_limit.max_keys = Some(9);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &wrong_limit,
+            )
+            .is_err()
+        );
+
+        let mut delimited = base();
+        delimited.delimiter = Some("/".into());
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &delimited,
+            )
+            .is_err()
+        );
+
+        let mut grouped = base();
+        grouped.common_prefixes = Some(vec![
+            aws_sdk_s3::types::CommonPrefix::builder()
+                .prefix("secret-group")
+                .build(),
+        ]);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &grouped,
+            )
+            .is_err()
+        );
+
+        let mut encoded = base();
+        encoded.encoding_type = Some(aws_sdk_s3::types::EncodingType::Url);
+        assert!(
+            decode_s3_version_evidence_page(
+                EVIDENCE_BUCKET,
+                EVIDENCE_PREFIX,
+                &cursor,
+                10,
+                &encoded,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_debug_is_redacted() {
+        let cursor = S3MultipartEvidenceCursor {
+            key_marker: Some("secret-key-marker".into()),
+            upload_id_marker: Some("secret-upload-marker".into()),
+        };
+        let item = S3MultipartEvidenceItem {
+            key: "secret-key".into(),
+            upload_id: "secret-upload".into(),
+        };
+        let debug = format!("{cursor:?} {item:?}");
+        for secret in [
+            "secret-key-marker",
+            "secret-upload-marker",
+            "secret-key",
+            "secret-upload",
+        ] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    #[test]
     fn conditional_conflict_reconciliation_uses_one_head_snapshot() {
-        let current = Version::new("current");
-        let expected = Version::new("expected");
+        let current = CasToken::new("current");
+        let expected = CasToken::new("expected");
 
         assert_precondition(
             reconcile_conditional_conflict("key", &PutMode::Create, Some(current.clone())),
@@ -2168,7 +4008,7 @@ mod tests {
         );
     }
 
-    fn assert_precondition(error: StoreError, expected: Option<&Version>) {
+    fn assert_precondition(error: StoreError, expected: Option<&CasToken>) {
         match error {
             StoreError::PreconditionFailed { key, current } => {
                 assert_eq!(key, "key");

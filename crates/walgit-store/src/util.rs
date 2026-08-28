@@ -77,6 +77,33 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::fault::{FaultPlan, FaultStore};
+    use crate::memory::MemoryStore;
+    use crate::{DynStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
+
+    fn parallel_test_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("temporary upload file");
+        std::fs::write(file.path(), (0u8..66).collect::<Vec<_>>())
+            .expect("write temporary upload file");
+        file
+    }
+
+    fn parallel_test_limits() -> ParallelUploadLimits {
+        ParallelUploadLimits {
+            min_part: 1,
+            max_part: 1,
+            max_parts: 128,
+        }
+    }
+
+    async fn assert_no_temporary_history(store: &MemoryStore, prefix: &str) {
+        let page = store
+            .list_versions(prefix, None, crate::MAX_VERSION_PAGE_SIZE)
+            .await
+            .expect("list temporary history");
+        assert!(page.versions.is_empty(), "temporary history: {page:?}");
+        assert!(page.next.is_none());
+    }
 
     #[tokio::test]
     async fn collect_exact_stops_after_expected_plus_one_across_chunks() {
@@ -113,6 +140,79 @@ mod tests {
             .await
             .expect_err("early EOF must fail");
         assert!(error.to_string().contains("supplied 3 bytes"));
+    }
+
+    #[tokio::test]
+    async fn parallel_upload_exact_deletes_parts_and_intermediates_after_success() {
+        let file = parallel_test_file();
+        let store = MemoryStore::new();
+
+        let meta = put_file_parallel_with_limits(
+            &store,
+            "success",
+            file.path(),
+            PutOptions::from(PutMode::Create),
+            8,
+            parallel_test_limits(),
+        )
+        .await
+        .expect("parallel upload");
+        assert_eq!(meta.size, 66);
+        assert_eq!(
+            store.get_bytes("success").await.unwrap().unwrap().1.len(),
+            66
+        );
+        assert_no_temporary_history(&store, "success.part/").await;
+    }
+
+    #[tokio::test]
+    async fn parallel_upload_exact_deletes_completed_parts_after_upload_failure() {
+        let file = parallel_test_file();
+        let inner = Arc::new(MemoryStore::new());
+        let inner_store: DynStore = inner.clone();
+        let fault = FaultStore::new(inner_store, "upload-failure", 1);
+        fault.set(FaultPlan {
+            p_err_before: 1.0,
+            only_keys: Some(vec!["upload-fail.part/0001".into()]),
+            ..Default::default()
+        });
+
+        put_file_parallel_with_limits(
+            fault.as_ref(),
+            "upload-fail",
+            file.path(),
+            PutOptions::from(PutMode::Create),
+            8,
+            parallel_test_limits(),
+        )
+        .await
+        .expect_err("injected part upload failure");
+        assert_no_temporary_history(&inner, "upload-fail.part/").await;
+    }
+
+    #[tokio::test]
+    async fn parallel_upload_exact_deletes_all_temporaries_after_final_compose_failure() {
+        let file = parallel_test_file();
+        let inner = Arc::new(MemoryStore::new());
+        let inner_store: DynStore = inner.clone();
+        let fault = FaultStore::new(inner_store, "compose-failure", 1);
+        fault.set(FaultPlan {
+            p_cas_fail: 1.0,
+            ..Default::default()
+        });
+
+        put_file_parallel_with_limits(
+            fault.as_ref(),
+            "compose-fail",
+            file.path(),
+            PutOptions::from(PutMode::Create),
+            8,
+            parallel_test_limits(),
+        )
+        .await
+        .expect_err("injected final compose failure");
+        assert_no_temporary_history(&inner, "compose-fail.part/").await;
+        assert!(inner.get_bytes("compose-fail").await.unwrap().is_none());
     }
 }
 
@@ -257,22 +357,88 @@ pub async fn put_file_parallel(
     opts: crate::PutOptions,
     parallelism: usize,
 ) -> crate::Result<crate::ObjectMeta> {
-    use crate::{PutBody, PutMode, PutOptions, StoreError};
-    use futures::{StreamExt, TryStreamExt};
+    put_file_parallel_with_limits(
+        store,
+        key,
+        path,
+        opts,
+        parallelism,
+        ParallelUploadLimits {
+            min_part: 64 * 1024 * 1024,
+            max_part: 1024 * 1024 * 1024,
+            max_parts: 32 * 32,
+        },
+    )
+    .await
+}
 
-    const MIN_PART: u64 = 64 * 1024 * 1024;
-    const MAX_PART: u64 = 1024 * 1024 * 1024;
-    const MAX_PARTS: u64 = 32 * 32; // two compose levels
+#[derive(Clone, Copy)]
+struct ParallelUploadLimits {
+    min_part: u64,
+    max_part: u64,
+    max_parts: u64,
+}
+
+/// Best-effort exact deletion for completed temporary objects. Every known
+/// version is attempted. Cleanup errors are logged, but never replace the
+/// primary upload or compose result.
+pub async fn cleanup_temporary_versions(
+    store: &dyn crate::ObjectStore,
+    temporary: &[crate::ComposeSource],
+) {
+    const MAX_FAILURE_LOGS: usize = 8;
+    let mut failures = 0usize;
+    for source in temporary {
+        if let Err(error) = store
+            .delete_version(&source.key, &source.object_version_id)
+            .await
+        {
+            if failures < MAX_FAILURE_LOGS {
+                tracing::warn!(
+                    key = %source.key,
+                    object_version_id = %source.object_version_id,
+                    error = %error,
+                    "failed to exact-delete completed temporary object"
+                );
+            }
+            failures += 1;
+        }
+    }
+    if failures > MAX_FAILURE_LOGS {
+        tracing::warn!(
+            failures,
+            omitted = failures - MAX_FAILURE_LOGS,
+            "additional temporary exact-delete failures suppressed"
+        );
+    }
+}
+
+async fn put_file_parallel_with_limits(
+    store: &dyn crate::ObjectStore,
+    key: &str,
+    path: &std::path::Path,
+    opts: crate::PutOptions,
+    parallelism: usize,
+    limits: ParallelUploadLimits,
+) -> crate::Result<crate::ObjectMeta> {
+    use crate::{ComposeSource, PutBody, PutMode, PutOptions, StoreError};
+    use futures::StreamExt;
+
+    if limits.min_part == 0 || limits.max_part < limits.min_part || limits.max_parts == 0 {
+        return Err(StoreError::InvalidArgument(
+            "parallel upload limits must be non-zero and ordered".into(),
+        ));
+    }
     let size = tokio::fs::metadata(path)
         .await
         .map_err(StoreError::other)?
         .len();
-    if !store.compose_is_native() || size <= 2 * MIN_PART {
+    if !store.compose_is_native() || size <= limits.min_part.saturating_mul(2) {
         return store
             .put(key, PutBody::File(path.to_path_buf()), opts)
             .await;
     }
-    let part_size = (size.div_ceil(MAX_PARTS)).clamp(MIN_PART, MAX_PART);
+    let part_size = (size.div_ceil(limits.max_parts)).clamp(limits.min_part, limits.max_part);
     let parts: Vec<(u64, u64)> = (0..size)
         .step_by(part_size as usize)
         .map(|start| (start, (start + part_size).min(size)))
@@ -280,7 +446,7 @@ pub async fn put_file_parallel(
     let part_key = |i: usize| format!("{key}.part/{i:04}");
     let started = std::time::Instant::now();
     let uploaded = std::sync::atomic::AtomicU64::new(0);
-    futures::stream::iter(parts.clone().into_iter().enumerate())
+    let mut part_results = futures::stream::iter(parts.clone().into_iter().enumerate())
         .map(|(i, (start, end))| {
             let pk = part_key(i);
             let range = start..end;
@@ -292,50 +458,69 @@ pub async fn put_file_parallel(
                     stream: file_stream(path.to_path_buf(), Some(range), 1024 * 1024),
                 };
                 // Parts are content of an immutable object: overwrite is safe.
-                store
+                let result = store
                     .put(&pk, body, PutOptions::from(PutMode::Overwrite))
-                    .await?;
-                let done = uploaded.fetch_add(len, std::sync::atomic::Ordering::Relaxed) + len;
-                tracing::debug!(
-                    key,
-                    part = i,
-                    done_bytes = done,
-                    total_bytes = size,
-                    mb_per_s = done as f64 / 1e6 / started.elapsed().as_secs_f64().max(0.001),
-                    "part uploaded"
-                );
-                Ok::<(), StoreError>(())
+                    .await;
+                if result.is_ok() {
+                    let done = uploaded.fetch_add(len, std::sync::atomic::Ordering::Relaxed) + len;
+                    tracing::debug!(
+                        key,
+                        part = i,
+                        done_bytes = done,
+                        total_bytes = size,
+                        mb_per_s = done as f64 / 1e6 / started.elapsed().as_secs_f64().max(0.001),
+                        "part uploaded"
+                    );
+                }
+                (i, result)
             }
         })
         .buffer_unordered(parallelism.max(1))
-        .try_collect::<Vec<()>>()
-        .await?;
+        .collect::<Vec<_>>()
+        .await;
+    part_results.sort_by_key(|(index, _)| *index);
+
+    let mut part_sources = Vec::with_capacity(part_results.len());
+    let mut upload_error = None;
+    for (_, result) in part_results {
+        match result.and_then(ComposeSource::try_from) {
+            Ok(source) => part_sources.push(source),
+            Err(error) if upload_error.is_none() => upload_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = upload_error {
+        cleanup_temporary_versions(store, &part_sources).await;
+        return Err(error);
+    }
 
     // Level 1: groups of <= 32 parts -> intermediates (or directly the final).
-    let part_keys: Vec<String> = (0..parts.len()).map(part_key).collect();
-    let mut cleanup: Vec<String> = part_keys.clone();
-    let result = if part_keys.len() <= 32 {
-        store.compose(key, &part_keys, opts).await
-    } else {
-        let mut mids = Vec::new();
-        for (g, chunk) in part_keys.chunks(32).enumerate() {
-            let mk = format!("{key}.part/mid{g:04}");
-            store
-                .compose(&mk, chunk, PutOptions::from(PutMode::Overwrite))
-                .await?;
-            mids.push(mk);
+    let part_count = part_sources.len();
+    let mut temporary = part_sources.clone();
+    let result = async {
+        if part_sources.len() <= 32 {
+            return store.compose(key, &part_sources, opts).await;
         }
-        cleanup.extend(mids.iter().cloned());
+
+        let mut mids = Vec::new();
+        for (group, chunk) in part_sources.chunks(32).enumerate() {
+            let mid_key = format!("{key}.part/mid{group:04}");
+            let meta = store
+                .compose(&mid_key, chunk, PutOptions::from(PutMode::Overwrite))
+                .await?;
+            let source = ComposeSource::try_from(meta)?;
+            temporary.push(source.clone());
+            mids.push(source);
+        }
         store.compose(key, &mids, opts).await
-    };
-    for k in cleanup {
-        let _ = store.delete(&k, None).await;
     }
+    .await;
+    cleanup_temporary_versions(store, &temporary).await;
     if result.is_ok() {
         tracing::info!(
             key,
             bytes = size,
-            parts = part_keys.len(),
+            parts = part_count,
             secs = started.elapsed().as_secs_f64(),
             mb_per_s = size as f64 / 1e6 / started.elapsed().as_secs_f64().max(0.001),
             "striped upload done"

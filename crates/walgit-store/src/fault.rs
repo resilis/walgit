@@ -39,8 +39,10 @@ use futures::StreamExt;
 use parking_lot::Mutex;
 
 use crate::{
-    BoxStream, ByteStream, DynStore, GetOptions, GetResult, ObjectMeta, ObjectStore, PutBody,
-    PutMode, PutOptions, Result, StoreError, Version,
+    BoxStream, ByteStream, CasToken, ComposeSource, DynStore, GetOptions, GetResult, ObjectMeta,
+    ObjectStore, ObjectVersionId, PutBody, PutMode, PutOptions, Result, S3MultipartEvidenceCursor,
+    S3MultipartEvidencePage, S3VersionEvidenceCursor, S3VersionEvidencePage, StoreError,
+    VersionCursor, VersionPage,
 };
 
 /// Probabilities (0..=1) and switches. `Default` = no faults at all.
@@ -265,6 +267,19 @@ impl FaultStore {
         conditional: bool,
         read_body: bool,
     ) -> Decision {
+        self.decide_with_label(op, key, key, mutation, conditional, read_body)
+            .await
+    }
+
+    async fn decide_with_label(
+        &self,
+        op: &str,
+        scope_key: &str,
+        diagnostic_key: &str,
+        mutation: bool,
+        conditional: bool,
+        read_body: bool,
+    ) -> Decision {
         self.stats.ops.fetch_add(1, Ordering::Relaxed);
         let plan = self.plan.lock().clone();
         if let Some(p) = plan
@@ -272,9 +287,9 @@ impl FaultStore {
             .iter()
             .find(|p| match p.split_once(':') {
                 Some((o, k)) if ["get", "head", "put", "delete", "compose"].contains(&o) => {
-                    o == op && key.contains(k)
+                    o == op && scope_key.contains(k)
                 }
-                _ => key.contains(p.as_str()),
+                _ => scope_key.contains(p.as_str()),
             })
         {
             let mut fired = self.fired_panics.lock();
@@ -282,21 +297,26 @@ impl FaultStore {
                 fired.push(p.clone());
                 drop(fired);
                 self.stats.panics.fetch_add(1, Ordering::Relaxed);
-                self.log(format!("{} {op} {key}: PANIC", self.name));
+                self.log(format!("{} {op} {diagnostic_key}: PANIC", self.name));
                 panic!(
-                    "fault-store[{}]: injected crash during {op} {key}",
+                    "fault-store[{}]: injected crash during {op} {diagnostic_key}",
                     self.name
                 );
             }
         }
         if plan.black_hole {
             self.stats.hang.fetch_add(1, Ordering::Relaxed);
-            self.log(format!("{} {op} {key}: black-hole", self.name));
+            self.log(format!("{} {op} {diagnostic_key}: black-hole", self.name));
             return Decision::Hang;
         }
-        if !mutation && plan.deny_keys.iter().any(|p| key.contains(p.as_str())) {
+        if !mutation
+            && plan
+                .deny_keys
+                .iter()
+                .any(|p| scope_key.contains(p.as_str()))
+        {
             self.stats.denied.fetch_add(1, Ordering::Relaxed);
-            self.log(format!("{} {op} {key}: denied", self.name));
+            self.log(format!("{} {op} {diagnostic_key}: denied", self.name));
             return Decision::Denied;
         }
         if let Some((lo, hi)) = plan.delay {
@@ -304,7 +324,7 @@ impl FaultStore {
             let extra = self.rng.lock().below(span + 1);
             tokio::time::sleep(lo + Duration::from_micros(extra)).await;
         }
-        if !Self::in_scope(&plan, key) {
+        if !Self::in_scope(&plan, scope_key) {
             return Decision::Proceed;
         }
         let (roll, cut) = {
@@ -345,7 +365,7 @@ impl FaultStore {
                 Decision::Truncate(_) => "truncate",
                 _ => "?",
             };
-            self.log(format!("{} {op} {key}: {what}", self.name));
+            self.log(format!("{} {op} {diagnostic_key}: {what}", self.name));
         }
         d
     }
@@ -401,6 +421,9 @@ impl ObjectStore for FaultStore {
         // Hide from the Prefixed span logic: we are transparent.
         self.inner.is_prefixed()
     }
+    fn applied_prefix(&self) -> &str {
+        self.inner.applied_prefix()
+    }
 
     async fn get(&self, key: &str, opts: GetOptions) -> Result<GetResult> {
         let conditional = opts.if_none_match.is_some();
@@ -445,7 +468,7 @@ impl ObjectStore for FaultStore {
         }
     }
 
-    async fn delete(&self, key: &str, if_version: Option<Version>) -> Result<()> {
+    async fn delete(&self, key: &str, if_version: Option<CasToken>) -> Result<()> {
         let conditional = if_version.is_some();
         match self.decide("delete", key, true, conditional, false).await {
             Decision::Hang => hang_forever().await,
@@ -460,6 +483,113 @@ impl ObjectStore for FaultStore {
             }
             _ => self.inner.delete(key, if_version).await,
         }
+    }
+
+    async fn head_version(
+        &self,
+        key: &str,
+        version_id: &ObjectVersionId,
+    ) -> Result<Option<ObjectMeta>> {
+        match self.decide("head_version", key, false, false, false).await {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("head_version", key, "before")),
+            Decision::Denied => Ok(None),
+            _ => self.inner.head_version(key, version_id).await,
+        }
+    }
+
+    async fn delete_version(&self, key: &str, version_id: &ObjectVersionId) -> Result<()> {
+        match self.decide("delete_version", key, true, false, false).await {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("delete_version", key, "before")),
+            Decision::ErrAfter => {
+                self.inner.delete_version(key, version_id).await?;
+                Err(self.retryable("delete_version", key, "after (applied)"))
+            }
+            _ => self.inner.delete_version(key, version_id).await,
+        }
+    }
+
+    async fn list_versions(
+        &self,
+        prefix: &str,
+        cursor: Option<&VersionCursor>,
+        limit: usize,
+    ) -> Result<VersionPage> {
+        match self
+            .decide("list_versions", prefix, false, false, false)
+            .await
+        {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable("list_versions", prefix, "before")),
+            _ => self.inner.list_versions(prefix, cursor, limit).await,
+        }
+    }
+
+    async fn list_s3_version_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3VersionEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3VersionEvidencePage> {
+        match self
+            .decide_with_label(
+                "list_s3_version_evidence_page",
+                prefix,
+                "<evidence-prefix>",
+                false,
+                false,
+                false,
+            )
+            .await
+        {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable(
+                "list_s3_version_evidence_page",
+                "<evidence-prefix>",
+                "before",
+            )),
+            _ => {
+                self.inner
+                    .list_s3_version_evidence_page(prefix, cursor, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn list_s3_multipart_evidence_page(
+        &self,
+        prefix: &str,
+        cursor: &S3MultipartEvidenceCursor,
+        limit: usize,
+    ) -> Result<S3MultipartEvidencePage> {
+        match self
+            .decide_with_label(
+                "list_s3_multipart_evidence_page",
+                prefix,
+                "<evidence-prefix>",
+                false,
+                false,
+                false,
+            )
+            .await
+        {
+            Decision::Hang => hang_forever().await,
+            Decision::ErrBefore => Err(self.retryable(
+                "list_s3_multipart_evidence_page",
+                "<evidence-prefix>",
+                "before",
+            )),
+            _ => {
+                self.inner
+                    .list_s3_multipart_evidence_page(prefix, cursor, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn verify_versioning(&self) -> Result<()> {
+        self.inner.verify_versioning().await
     }
 
     fn list(
@@ -502,10 +632,13 @@ impl ObjectStore for FaultStore {
     fn supports_compose(&self) -> bool {
         self.inner.supports_compose()
     }
+    fn compose_is_native(&self) -> bool {
+        self.inner.compose_is_native()
+    }
     async fn compose(
         &self,
         dest: &str,
-        sources: &[String],
+        sources: &[ComposeSource],
         opts: PutOptions,
     ) -> Result<ObjectMeta> {
         let conditional = !matches!(opts.mode, PutMode::Overwrite);
@@ -609,6 +742,85 @@ mod tests {
         link.set(FaultPlan::black_hole());
         let r = tokio::time::timeout(Duration::from_millis(50), link.head("k")).await;
         assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn evidence_reads_use_distinct_fault_ops_without_mutation_faults() {
+        let truth: DynStore = MemoryStore::shared();
+        let link = FaultStore::new(truth, "evidence", 11);
+        link.set_trace(true);
+        link.set(FaultPlan {
+            p_err_before: 1.0,
+            p_err_after: 1.0,
+            p_cas_fail: 1.0,
+            ..Default::default()
+        });
+
+        let version = link
+            .list_s3_version_evidence_page("secret-prefix", &S3VersionEvidenceCursor::initial(), 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(version.contains("list_s3_version_evidence_page"));
+        assert!(!version.contains("secret-prefix"));
+
+        let multipart = link
+            .list_s3_multipart_evidence_page(
+                "secret-prefix",
+                &S3MultipartEvidenceCursor::initial(),
+                1,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(multipart.contains("list_s3_multipart_evidence_page"));
+        assert!(!multipart.contains("secret-prefix"));
+
+        assert_eq!(link.stats().ops.load(Ordering::Relaxed), 2);
+        assert_eq!(link.stats().err_before.load(Ordering::Relaxed), 2);
+        assert_eq!(link.stats().err_after.load(Ordering::Relaxed), 0);
+        assert_eq!(link.stats().cas_fail.load(Ordering::Relaxed), 0);
+        let trace = link.take_trace().join("\n");
+        assert!(trace.contains("list_s3_version_evidence_page"));
+        assert!(trace.contains("list_s3_multipart_evidence_page"));
+        assert!(!trace.contains("secret-prefix"), "{trace}");
+    }
+
+    #[tokio::test]
+    async fn evidence_reads_preserve_delay_black_hole_and_unsupported_inner() {
+        let truth: DynStore = MemoryStore::shared();
+        let link = FaultStore::new(truth, "evidence", 13);
+        link.set_trace(true);
+        link.set(FaultPlan {
+            delay: Some((Duration::from_millis(5), Duration::from_millis(5))),
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let unsupported = link
+            .list_s3_version_evidence_page("prefix", &S3VersionEvidenceCursor::initial(), 1)
+            .await;
+        assert!(matches!(
+            unsupported,
+            Err(StoreError::UnsupportedCapability { .. })
+        ));
+        assert!(started.elapsed() >= Duration::from_millis(5));
+
+        link.set(FaultPlan::black_hole());
+        let hanging = tokio::time::timeout(
+            Duration::from_millis(20),
+            link.list_s3_multipart_evidence_page(
+                "secret-black-hole-prefix",
+                &S3MultipartEvidenceCursor::initial(),
+                1,
+            ),
+        )
+        .await;
+        assert!(hanging.is_err());
+        assert_eq!(link.stats().ops.load(Ordering::Relaxed), 2);
+        assert_eq!(link.stats().hang.load(Ordering::Relaxed), 1);
+        let trace = link.take_trace().join("\n");
+        assert!(trace.contains("list_s3_multipart_evidence_page"));
+        assert!(!trace.contains("secret-black-hole-prefix"), "{trace}");
     }
 }
 

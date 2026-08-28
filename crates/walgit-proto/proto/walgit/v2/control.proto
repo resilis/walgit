@@ -1,0 +1,692 @@
+syntax = "proto3";
+
+package walgit.v2;
+
+import "walgit/v2/options.proto";
+
+enum ObjectFormat {
+  OBJECT_FORMAT_UNSPECIFIED = 0;
+  OBJECT_FORMAT_SHA1 = 1;
+  OBJECT_FORMAT_SHA256 = 2;
+}
+
+enum Lifecycle {
+  LIFECYCLE_UNSPECIFIED = 0;
+  LIFECYCLE_ACTIVE = 1;
+  LIFECYCLE_DELETING = 2;
+  LIFECYCLE_TOMBSTONED = 3;
+}
+
+enum Visibility {
+  VISIBILITY_UNSPECIFIED = 0;
+  VISIBILITY_PRIVATE = 1;
+  VISIBILITY_INTERNAL = 2;
+  VISIBILITY_PUBLIC = 3;
+}
+
+enum GrantRole {
+  GRANT_ROLE_UNSPECIFIED = 0;
+  GRANT_ROLE_READER = 1;
+  GRANT_ROLE_WRITER = 2;
+  GRANT_ROLE_ADMINISTRATOR = 3;
+}
+
+enum CatalogKind {
+  CATALOG_KIND_UNSPECIFIED = 0;
+  CATALOG_KIND_PACK = 1;
+  CATALOG_KIND_REF_DELTA = 2;
+  CATALOG_KIND_GRANT = 3;
+  CATALOG_KIND_RECEIPT = 4;
+  CATALOG_KIND_EVENT = 5;
+  CATALOG_KIND_PIN = 6;
+  CATALOG_KIND_GIT_OWNERSHIP = 7;
+  CATALOG_KIND_LFS_OWNERSHIP = 8;
+  CATALOG_KIND_BUNDLE = 9;
+  CATALOG_KIND_RECOVERY = 10;
+  CATALOG_KIND_AUDIT = 11;
+  CATALOG_KIND_RECLAMATION = 12;
+}
+
+enum WalEntryKind {
+  WAL_ENTRY_KIND_UNSPECIFIED = 0;
+  WAL_ENTRY_KIND_PUSH = 1;
+  WAL_ENTRY_KIND_REF_UPDATE = 2;
+  WAL_ENTRY_KIND_COMPACTION = 3;
+  WAL_ENTRY_KIND_CHECKPOINT = 4;
+  WAL_ENTRY_KIND_SETTINGS = 5;
+  WAL_ENTRY_KIND_POLICY = 6;
+  WAL_ENTRY_KIND_GRANTS = 7;
+  WAL_ENTRY_KIND_LIFECYCLE = 8;
+  WAL_ENTRY_KIND_BUNDLE = 9;
+  WAL_ENTRY_KIND_PIN = 10;
+  WAL_ENTRY_KIND_EVENT = 11;
+  WAL_ENTRY_KIND_RECLAMATION = 12;
+}
+
+enum ReclamationPhase {
+  RECLAMATION_PHASE_UNSPECIFIED = 0;
+  RECLAMATION_PHASE_IDLE = 1;
+  RECLAMATION_PHASE_SCANNING = 2;
+  RECLAMATION_PHASE_DELETING = 3;
+  RECLAMATION_PHASE_VERIFYING = 4;
+}
+
+// Persisted numeric values are frozen. INTERNAL_SETTLEMENT is the only
+// receiptless repository-control CAS and is never valid in a receipt row.
+enum MutationKind {
+  MUTATION_KIND_UNSPECIFIED = 0;
+  MUTATION_KIND_CREATE = 1;
+  MUTATION_KIND_PUSH = 2;
+  MUTATION_KIND_REF_UPDATE = 3;
+  MUTATION_KIND_LFS_FINALIZE = 4;
+  MUTATION_KIND_POLICY = 5;
+  MUTATION_KIND_SETTINGS = 6;
+  MUTATION_KIND_GRANTS = 7;
+  MUTATION_KIND_LIFECYCLE = 8;
+  MUTATION_KIND_CHECKPOINT = 9;
+  MUTATION_KIND_COMPACTION = 10;
+  MUTATION_KIND_BUNDLE = 11;
+  MUTATION_KIND_FOLLOW = 12;
+  MUTATION_KIND_IMPORT = 13;
+  MUTATION_KIND_REPAIR = 14;
+  MUTATION_KIND_PIN = 15;
+  MUTATION_KIND_EVENT = 16;
+  MUTATION_KIND_RECLAMATION = 17;
+  MUTATION_KIND_WRITER_TAKEOVER = 18;
+  MUTATION_KIND_INTERNAL_SETTLEMENT = 19;
+}
+
+enum ReceiptState {
+  RECEIPT_STATE_UNSPECIFIED = 0;
+  RECEIPT_STATE_UNRESOLVED = 1;
+  RECEIPT_STATE_SETTLED = 2;
+}
+
+// Persisted numeric values are frozen. PREPARING always carries one closed
+// redistribution phase; STABLE never does.
+enum CapacityControlState {
+  CAPACITY_CONTROL_STATE_UNSPECIFIED = 0;
+  CAPACITY_CONTROL_STATE_STABLE = 1;
+  CAPACITY_CONTROL_STATE_PREPARING = 2;
+}
+
+enum RedistributionPhase {
+  REDISTRIBUTION_PHASE_UNSPECIFIED = 0;
+  REDISTRIBUTION_PHASE_DRAINING = 1;
+  REDISTRIBUTION_PHASE_APPLYING = 2;
+}
+
+enum CapacityReservationState {
+  CAPACITY_RESERVATION_STATE_UNSPECIFIED = 0;
+  CAPACITY_RESERVATION_STATE_RESERVED = 1;
+  CAPACITY_RESERVATION_STATE_COMMITTING = 2;
+  CAPACITY_RESERVATION_STATE_CHARGED = 3;
+  CAPACITY_RESERVATION_STATE_ABORTED = 4;
+}
+
+// Closed evidence classification for a commit whose expected repository CAS
+// cannot land. The exact-loaded RepoControl must corroborate the selected cell.
+enum CapacityConflictClass {
+  CAPACITY_CONFLICT_CLASS_UNSPECIFIED = 0;
+  CAPACITY_CONFLICT_CLASS_CREATE_CONTROL_EXISTS = 1;
+  CAPACITY_CONFLICT_CLASS_SAME_WRITER_VERSION_ADVANCED = 2;
+  CAPACITY_CONFLICT_CLASS_WRITER_EPOCH_ADVANCED = 3;
+}
+
+message RepositoryIdentity {
+  option (max_encoded_bytes) = 2048;
+
+  bytes tenant_id = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes project_id = 2 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes repository_uuid = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 generation = 4;
+  bytes canonical_path = 5 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes canonical_path_digest = 6 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes routing_digest = 7 [(min_bytes) = 32, (max_bytes) = 32];
+}
+
+// An authoritative parent reference. The referenced immutable body does not
+// contain its own key, version, digest, or size.
+message TargetObjectRef {
+  option (max_encoded_bytes) = 4096;
+
+  RepositoryIdentity identity = 1;
+  bytes key = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 3 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 4 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 5;
+}
+
+message CatalogRoot {
+  option (max_encoded_bytes) = 4096;
+
+  CatalogKind kind = 1;
+  TargetObjectRef object = 2;
+  uint32 depth = 3;
+  uint64 node_count = 4;
+  uint64 item_count = 5;
+  uint64 total_encoded_bytes = 6;
+}
+
+message WriterFence {
+  option (max_encoded_bytes) = 4096;
+
+  bytes holder = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 epoch = 2;
+}
+
+message QuotaState {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 logical_quota_bytes = 1;
+  uint64 charged_git_bytes = 2;
+  uint64 charged_lfs_bytes = 3;
+}
+
+// The repository's last exact capacity witness. Admission must independently
+// load the current repository-hashed shard and compare epoch, key, budget, and
+// tenant slice. Settlement advances this binding to the exact CHARGED version.
+message CapacityBinding {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 allocation_epoch = 1;
+  uint32 shard = 2;
+  bytes shard_key = 3 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes shard_object_version_id = 4 [(min_bytes) = 1, (max_bytes) = 1024];
+  uint64 shard_budget_bytes = 5;
+  uint64 tenant_slice_bytes = 6;
+  bytes shard_digest = 7 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 shard_size = 8;
+}
+
+message BucketSafetyBinding {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 epoch = 1;
+  bytes safety_digest = 2 [(min_bytes) = 32, (max_bytes) = 32];
+}
+
+message PackRoot {
+  option (max_encoded_bytes) = 4096;
+
+  TargetObjectRef object = 1;
+  bytes git_object_id = 2 [(min_bytes) = 20, (max_bytes) = 32];
+  uint64 introduced_wal_sequence = 3;
+  uint64 object_count = 4;
+}
+
+message InlinePackRoots {
+  option (max_encoded_bytes) = 1048576;
+
+  repeated PackRoot roots = 1 [(min_items) = 0, (max_items) = 4096];
+}
+
+message RepositoryGrant {
+  option (max_encoded_bytes) = 4096;
+
+  bytes issuer = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes subject = 2 [(min_bytes) = 1, (max_bytes) = 256];
+  GrantRole role = 3;
+}
+
+message InlineGrants {
+  option (max_encoded_bytes) = 1048576;
+
+  repeated RepositoryGrant grants = 1 [(min_items) = 0, (max_items) = 256];
+}
+
+message RefChange {
+  option (max_encoded_bytes) = 4096;
+
+  bytes name = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes old_object_id = 2 [(min_bytes) = 0, (max_bytes) = 32];
+  bytes new_object_id = 3 [(min_bytes) = 0, (max_bytes) = 32];
+  bytes new_symbolic_target = 4 [(min_bytes) = 0, (max_bytes) = 1024];
+  bytes new_peeled_object_id = 5 [(min_bytes) = 0, (max_bytes) = 32];
+}
+
+message InlineRefChanges {
+  option (max_encoded_bytes) = 65536;
+
+  repeated RefChange changes = 1 [(min_items) = 0, (max_items) = 256];
+}
+
+message WalTailEntry {
+  option (max_encoded_bytes) = 65536;
+
+  uint64 sequence = 1;
+  WalEntryKind kind = 2;
+  bytes mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  repeated TargetObjectRef superseded_objects = 4 [(min_items) = 0, (max_items) = 256];
+  oneof ref_representation {
+    InlineRefChanges inline_ref_changes = 5;
+    CatalogRoot ref_delta_catalog = 6;
+  }
+}
+
+message WalState {
+  option (max_encoded_bytes) = 1048576;
+
+  uint64 head_sequence = 1;
+  uint64 minimum_sequence = 2;
+  TargetObjectRef checkpoint = 3;
+  repeated WalTailEntry tail = 4 [(min_items) = 0, (max_items) = 256];
+}
+
+message ReclamationState {
+  option (max_encoded_bytes) = 65536;
+
+  ReclamationPhase phase = 1;
+  bytes cursor = 2 [(min_bytes) = 0, (max_bytes) = 4096];
+  uint64 pass_objects = 3;
+  uint64 pass_bytes = 4;
+}
+
+message NoPriorControl {
+  option (max_encoded_bytes) = 1;
+}
+
+message PriorControlBinding {
+  option (max_encoded_bytes) = 4096;
+
+  bytes cas_token = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+}
+
+message NoCapacityObligation {
+  option (max_encoded_bytes) = 1;
+}
+
+// The exact COMMITTING shard version that must become terminal before receipt
+// settlement. The ObjectVersionID is the provider version of that shard body.
+message CapacityObligation {
+  option (max_encoded_bytes) = 8192;
+
+  uint64 allocation_epoch = 1;
+  bytes shard_key = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes shard_object_version_id = 3 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes reservation_id = 4 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 tenant_slice_bytes = 5;
+  bytes mutation_id = 6 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 byte_count = 7;
+}
+
+message NoEventObligation {
+  option (max_encoded_bytes) = 1;
+}
+
+message EventSubscriberBody {
+  option (max_encoded_bytes) = 4096;
+
+  bytes digest = 1 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 2;
+}
+
+message EventObligation {
+  option (max_encoded_bytes) = 65536;
+
+  bytes event_id = 1 [(min_bytes) = 16, (max_bytes) = 16];
+  uint64 wal_sequence = 2;
+  bytes subscriber_set_digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes result_key = 4 [(min_bytes) = 1, (max_bytes) = 1024];
+  repeated EventSubscriberBody subscriber_bodies = 5 [(min_items) = 0, (max_items) = 64];
+}
+
+// Every non-settlement mutation persists one core before its publishing CAS.
+// The three oneofs make NONE values explicit rather than empty identifiers.
+message MutationReceipt {
+  option (max_encoded_bytes) = 65536;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  bytes mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  MutationKind kind = 4;
+  uint64 writer_epoch = 5;
+  uint64 wal_sequence = 6;
+  bytes request_digest = 7 [(min_bytes) = 32, (max_bytes) = 32];
+  repeated bytes immutable_dependency_digests = 8 [
+    (min_bytes) = 32,
+    (max_bytes) = 32,
+    (min_items) = 0,
+    (max_items) = 64
+  ];
+
+  oneof predecessor {
+    NoPriorControl no_prior_control = 9;
+    PriorControlBinding prior_control = 10;
+  }
+  oneof capacity_obligation {
+    NoCapacityObligation no_capacity = 11;
+    CapacityObligation capacity = 12;
+  }
+  oneof event_obligation {
+    NoEventObligation no_event = 13;
+    EventObligation event = 14;
+  }
+}
+
+// Exact provider binding for the by-path repo_control authority. It is not a
+// TargetObjectRef because that message is reserved for identity-scoped leaves
+// under the by-id repository root.
+message LandedControlRef {
+  option (max_encoded_bytes) = 4096;
+
+  bytes repo_control_key = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 4;
+}
+
+// Proof of the successful landed repo_control version. This message never
+// contains a reference to its own key or provider metadata.
+message MutationResult {
+  option (max_encoded_bytes) = 65536;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  bytes mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  MutationKind kind = 4;
+  LandedControlRef landed_control = 5;
+  uint64 landed_control_revision = 6;
+  uint64 writer_epoch = 7;
+  uint64 wal_sequence = 8;
+}
+
+// Settlement preserves the receipt core and records both the exact settlement
+// mutation ID and exact result reference. Rows are strictly sorted by
+// mutation_id.
+message ReceiptCatalogRow {
+  option (max_encoded_bytes) = 65536;
+
+  bytes mutation_id = 1 [(min_bytes) = 16, (max_bytes) = 16];
+  ReceiptState state = 2;
+  MutationReceipt receipt = 3;
+  TargetObjectRef result = 4;
+  bytes settlement_mutation_id = 5 [(min_bytes) = 0, (max_bytes) = 16];
+}
+
+message ReceiptCatalog {
+  option (max_encoded_bytes) = 524288;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  repeated ReceiptCatalogRow rows = 3 [(min_items) = 0, (max_items) = 4096];
+}
+
+// Exact provider metadata for a global capacity object. Repository-scoped
+// TargetObjectRef is deliberately not reused for global capacity authority.
+message CapacityObjectRef {
+  option (max_encoded_bytes) = 4096;
+
+  bytes key = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 4;
+}
+
+// One STABLE shard budget and its exact epoch-start shard proof.
+message CapacityShardBudget {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 budget_bytes = 2;
+  CapacityObjectRef shard_object = 3;
+}
+
+// A target budget has no provider proof until its deterministic successor is
+// written and the final STABLE control roots that exact version.
+message CapacityShardBudgetProposal {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 budget_bytes = 2;
+}
+
+message TenantShardSlice {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 byte_count = 2;
+}
+
+message TenantCapacityAllocation {
+  option (max_encoded_bytes) = 16384;
+
+  bytes tenant_id = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 total_bytes = 2;
+  repeated TenantShardSlice slices = 3 [(min_items) = 256, (max_items) = 256];
+}
+
+// This dormant slice is one immutable flat page. A later explicit schema and
+// controller phase must introduce the deferred multilevel topology.
+message TenantCapacityCatalogPage {
+  option (max_encoded_bytes) = 524288;
+
+  uint32 schema_version = 1;
+  repeated TenantCapacityAllocation allocations = 2 [(min_items) = 0, (max_items) = 4096];
+}
+
+message ReservedCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 created_at_unix_seconds = 1;
+  uint64 expires_at_unix_seconds = 2;
+}
+
+message CapacityCommitBinding {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 writer_epoch = 1;
+  bytes mutation_id = 2 [(min_bytes) = 16, (max_bytes) = 16];
+  MutationKind kind = 3;
+  oneof predecessor {
+    NoPriorControl no_prior_control = 4;
+    PriorControlBinding prior_control = 5;
+  }
+}
+
+message CommittingCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  CapacityCommitBinding commit = 1;
+}
+
+message ChargedCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  CapacityCommitBinding commit = 1;
+  LandedControlRef landed_control = 2;
+}
+
+message ExpiredCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  uint64 created_at_unix_seconds = 1;
+  uint64 expires_at_unix_seconds = 2;
+  uint64 observed_now_unix_seconds = 3;
+}
+
+message ConflictingCapacityCommit {
+  option (max_encoded_bytes) = 4096;
+
+  CapacityCommitBinding commit = 1;
+  LandedControlRef conflicting_control = 2;
+  bytes conflicting_mutation_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  CapacityConflictClass conflict_class = 4;
+}
+
+message AbortedCapacityReservation {
+  option (max_encoded_bytes) = 4096;
+
+  oneof proof {
+    ExpiredCapacityReservation expired = 1;
+    ConflictingCapacityCommit conflicting_commit = 2;
+  }
+}
+
+// The state enum and oneof must select the same closed state cell.
+message CapacityReservation {
+  option (max_encoded_bytes) = 16384;
+
+  bytes reservation_id = 1 [(min_bytes) = 16, (max_bytes) = 16];
+  RepositoryIdentity identity = 2;
+  bytes tenant_id = 3 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 allocation_epoch = 4;
+  uint64 byte_count = 5;
+  uint64 tenant_slice_bytes = 6;
+  CapacityReservationState state = 7;
+  oneof state_payload {
+    ReservedCapacityReservation reserved = 8;
+    CommittingCapacityReservation committing = 9;
+    ChargedCapacityReservation charged = 10;
+    AbortedCapacityReservation aborted = 11;
+  }
+}
+
+// Current-epoch accounting is separate from immutable historical reservation
+// proofs so redistribution never rewrites a receipt-bound epoch or slice.
+message CapacityTenantAccount {
+  option (max_encoded_bytes) = 4096;
+
+  bytes tenant_id = 1 [(min_bytes) = 1, (max_bytes) = 256];
+  uint64 current_slice_bytes = 2;
+}
+
+message CapacityShard {
+  option (max_encoded_bytes) = 1048576;
+
+  uint32 schema_version = 1;
+  uint64 control_revision = 2;
+  uint32 shard = 3;
+  uint64 allocation_epoch = 4;
+  uint64 budget_bytes = 5;
+  repeated CapacityTenantAccount tenant_accounts = 6 [(min_items) = 0, (max_items) = 4096];
+  repeated CapacityReservation reservations = 7 [(min_items) = 0, (max_items) = 4096];
+}
+
+// APPLYING captures the exact current drained shard version. Terminal
+// transitions can make its provider metadata newer than the historical
+// STABLE epoch-start proof, while epoch and immutable budget stay unchanged.
+message CapacityShardBaseline {
+  option (max_encoded_bytes) = 4096;
+
+  uint32 shard = 1;
+  uint64 allocation_epoch = 2;
+  uint64 budget_bytes = 3;
+  CapacityObjectRef shard_object = 4;
+}
+
+message StableCapacityState {
+  option (max_encoded_bytes) = 1;
+}
+
+message CapacityRedistribution {
+  option (max_encoded_bytes) = 1048576;
+
+  RedistributionPhase phase = 1;
+  uint64 target_epoch = 2;
+  uint64 target_global_allocatable_bytes = 3;
+  CapacityObjectRef target_tenant_catalog = 4;
+  repeated CapacityShardBudgetProposal target_shard_budgets = 5 [(min_items) = 256, (max_items) = 256];
+  bytes admission_fence_id = 6 [(min_bytes) = 16, (max_bytes) = 16];
+  repeated CapacityShardBaseline baselines = 7 [(min_items) = 0, (max_items) = 256];
+}
+
+// Dormant global allocation authority. During PREPARING, fields 5 through 8
+// retain the exact prior STABLE plan while redistribution binds the target.
+message CapacityControl {
+  option (max_encoded_bytes) = 1048576;
+
+  uint32 schema_version = 1;
+  uint64 control_revision = 2;
+  CapacityControlState state = 3;
+  WriterFence writer = 4;
+  uint64 allocation_epoch = 5;
+  uint64 global_allocatable_bytes = 6;
+  CapacityObjectRef tenant_catalog = 7;
+  repeated CapacityShardBudget shard_budgets = 8 [(min_items) = 256, (max_items) = 256];
+  oneof state_payload {
+    StableCapacityState stable = 9;
+    CapacityRedistribution redistribution = 10;
+  }
+}
+
+// The one future repository semantic authority. No V1 runtime path reads or
+// writes this message until the production hard cut.
+message RepoControl {
+  option (max_encoded_bytes) = 1048576;
+
+  uint32 schema_version = 1;
+  RepositoryIdentity identity = 2;
+  bytes create_intent_id = 3 [(min_bytes) = 16, (max_bytes) = 16];
+  bytes create_intent_digest = 4 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes create_intent_cose = 5 [(min_bytes) = 1, (max_bytes) = 8192];
+  bytes repo_control_key = 6 [(min_bytes) = 1, (max_bytes) = 1024];
+  ObjectFormat object_format = 7;
+  Lifecycle lifecycle = 8;
+  Visibility visibility = 9;
+  uint64 control_revision = 10;
+  uint64 cutover_generation = 11;
+  WriterFence writer = 12;
+  uint64 authorization_epoch = 13;
+  QuotaState quota = 14;
+  CapacityBinding capacity = 15;
+  BucketSafetyBinding bucket_safety = 16;
+  bytes inline_settings = 17 [(min_bytes) = 0, (max_bytes) = 16384];
+  bytes inline_policy = 18 [(min_bytes) = 0, (max_bytes) = 65536];
+  WalState wal = 19;
+  ReclamationState reclamation = 20;
+  bytes last_internal_mutation_id = 21 [(min_bytes) = 16, (max_bytes) = 16];
+
+  CatalogRoot receipt_catalog = 22;
+  CatalogRoot event_catalog = 23;
+  CatalogRoot pin_catalog = 24;
+  CatalogRoot git_ownership_catalog = 25;
+  CatalogRoot lfs_ownership_catalog = 26;
+  CatalogRoot bundle_catalog = 27;
+  CatalogRoot recovery_catalog = 28;
+  CatalogRoot audit_catalog = 29;
+  CatalogRoot reclamation_catalog = 30;
+
+  oneof pack_representation {
+    InlinePackRoots inline_packs = 31;
+    CatalogRoot pack_catalog = 32;
+  }
+  oneof grant_representation {
+    InlineGrants inline_grants = 33;
+    CatalogRoot grant_catalog = 34;
+  }
+}
+
+// Exact immutable-object binding for one verification-ring slot.
+message VerificationRingRoot {
+  option (max_encoded_bytes) = 4096;
+
+  bytes key = 1 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes object_version_id = 2 [(min_bytes) = 1, (max_bytes) = 1024];
+  bytes digest = 3 [(min_bytes) = 32, (max_bytes) = 32];
+  uint64 size = 4;
+  uint64 ring_epoch = 5;
+}
+
+// The dormant V2 authority for verification-ring slots and revoked data keys.
+// No runtime path reads or writes this message before the production hard cut.
+message CredentialControl {
+  option (max_encoded_bytes) = 65536;
+
+  uint32 schema_version = 1;
+  uint64 control_revision = 2;
+  uint64 issuer_epoch = 3;
+  VerificationRingRoot current = 4;
+  VerificationRingRoot next = 5;
+  VerificationRingRoot previous = 6;
+  optional int64 previous_last_issue_unix_seconds = 7;
+  repeated bytes revoked_kids = 8 [
+    (min_bytes) = 16,
+    (max_bytes) = 16,
+    (min_items) = 0,
+    (max_items) = 64
+  ];
+  bytes verifier_set_digest = 9 [(min_bytes) = 32, (max_bytes) = 32];
+  bytes acknowledgement_proof_digest = 10 [(min_bytes) = 32, (max_bytes) = 32];
+}

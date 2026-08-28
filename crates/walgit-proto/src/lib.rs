@@ -1,11 +1,22 @@
 //! Generated protobuf types for walgit's on-store formats.
 //!
-//! Schema lives in `proto/walgit/v1/wal.proto`; it is the contract between
-//! every walgit instance and must only evolve backward-compatibly.
+//! V1 schema lives in `proto/walgit/v1/wal.proto`; it is the live contract
+//! between every walgit instance and must only evolve backward-compatibly.
+//! V2 repository control is additive and dormant until the production hard
+//! cut described by `docs/PRODUCTION_ARCHITECTURE.md`.
+
+mod descriptor_lint;
 
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/walgit.v1.rs"));
 }
+
+/// Dormant V2 repository-control types and their strict persisted codec.
+pub mod v2;
+
+/// Complete descriptors for V1 and V2 persisted protobuf types.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/walgit-descriptor.bin"));
 
 pub use prost;
 pub use prost::Message;

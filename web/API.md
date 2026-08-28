@@ -265,14 +265,15 @@ removes it — the same handlers as `PUT|DELETE /{owner}/{repo}`.
 `GET|PUT|DELETE …/policy` is the push policy document (`docs/POLICY.md`).
 
 `GET|PUT|DELETE /{o}/{r}/api/settings` (D24, 2026-08-21) is the repository's **settings in the WAL**: a TOML document
-restricted to `[bundles]`, `[maintenance]`, `[compaction]`, and `[upstream]`, merged over the
-host's config (`effective config`).
+restricted to `[bundles]`, `[maintenance]`, `[compaction]`, and `[upstream]`, merged over the host's config
+(`effective settings`). Public effective/describe/validate responses use an explicit closed projection of only
+those four sections; they never serialize the runtime `Config`.
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
 on failure; 200 `{revision}`. A tenant Admin can change ordinary sections. `[upstream]` additionally requires
 platform-operator status. Non-operators do not receive `[upstream]` in the raw current/history documents, and
 their PUT or DELETE preserves an existing operator-owned block. `GET …/settings/effective` → only the safe
-repository settings sections as TOML (`application/toml`), with `upstream.token_env` omitted;
+four-section repository settings projection as TOML (`application/toml`), with `upstream.token_env` omitted;
 `GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,at,toml}]}` from the live log (older
 changes are folded into checkpoints). All `no-store`. Every instance sees a new revision on its next refs-level
 sync (no extra round trip: the document rides
@@ -284,7 +285,7 @@ strategies:[{name,kind,base,schedule,schedule_human,next,keep,backfill_max,min_c
 upstream:{git,lfs,token_env:bool,follow:[refs],follow_interval_secs,last_round:{at,outcome: in-sync|published|refused|failed,
 detail,upstream:{ref:oid},ours:{ref:oid}}|null} (D33; last_round = this instance's last follow round),
 fields:[{key,value,host_value,source: host|setting}], head_seq}`; `POST …/settings/validate` (body TOML) → the same
-shape for the *would-be* effective config with `ok: true`, or `{ok: false, errors[]}` (nothing published);
+shape for the *would-be* effective settings projection with `ok: true`, or `{ok: false, errors[]}` (nothing published);
 `POST …/policy/validate` (body policy JSON) → `{ok, errors[], rules, groups, protect}`; `POST …/policy/dry-run?last=N`
 (body policy JSON, empty = the saved policy) → the policy evaluated against the last N PUSH entries of the live log
 (`{pushes, allowed, denied, results:[{seq,at,principal,atomic,refs:[{name,ok,reason,force}]}]}`; force = non-ancestor

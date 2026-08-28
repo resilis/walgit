@@ -31,7 +31,6 @@ use std::collections::{HashMap, HashSet};
 
 use futures::future::BoxFuture;
 use gix_object::{Find, FindHeader, Kind as ObjKind};
-use gix_pack::data::Version as PackVersion;
 use gix_pack::data::output::bytes::FromEntriesIter;
 use gix_pack::data::output::count;
 use gix_pack::data::output::entry;
@@ -102,8 +101,23 @@ impl LocalRepo {
     pub async fn upload_pack_gix_with<W: AsyncWrite + Unpin + Send>(
         &self,
         req: UploadPackRequest,
+        out: W,
+        faulter: Option<&dyn ObjectFaulter>,
+    ) -> Result<UploadPackStats, GitError> {
+        self.upload_pack_gix_with_pack_progress(req, out, faulter, None)
+            .await
+    }
+
+    /// Run the gix upload-pack engine and emit an optional user-visible status
+    /// immediately after the `packfile` section starts. Git versions that
+    /// accept `sideband-all` can still suppress band-2 messages sent before
+    /// that section.
+    pub async fn upload_pack_gix_with_pack_progress<W: AsyncWrite + Unpin + Send>(
+        &self,
+        req: UploadPackRequest,
         mut out: W,
         faulter: Option<&dyn ObjectFaulter>,
+        pack_progress: Option<&str>,
     ) -> Result<UploadPackStats, GitError> {
         let sb_all = req.sideband_all;
         let progress = !req.no_progress;
@@ -184,7 +198,7 @@ impl LocalRepo {
             progress,
         };
         let stats = self
-            .produce_pack(&req, &common_haves, faulter, &mut sink)
+            .produce_pack(&req, &common_haves, faulter, &mut sink, pack_progress)
             .await?;
         sink.finish().await?;
         Ok(stats)
@@ -237,7 +251,9 @@ impl LocalRepo {
         // Prerequisites are known by definition (the bundle's consumer has them).
         let common: Vec<gix_hash::ObjectId> = prerequisites.to_vec();
         let mut sink = PackOut::Raw(out);
-        let stats = self.produce_pack(&req, &common, faulter, &mut sink).await?;
+        let stats = self
+            .produce_pack(&req, &common, faulter, &mut sink, None)
+            .await?;
         sink.finish().await?;
         Ok(stats)
     }
@@ -249,6 +265,7 @@ impl LocalRepo {
         common_haves: &[gix_hash::ObjectId],
         faulter: Option<&dyn ObjectFaulter>,
         sink: &mut PackOut<W>,
+        pack_progress: Option<&str>,
     ) -> Result<UploadPackStats, GitError> {
         let t_start = std::time::Instant::now();
         // Wants that are not local (a blob of a lazy checkout, a tag in the
@@ -374,6 +391,13 @@ impl LocalRepo {
 
         // ---- packfile section, streamed ----
         sink.begin_pack().await?;
+        if let Some(text) = pack_progress {
+            if text.ends_with('\n') {
+                sink.progress(text).await;
+            } else {
+                sink.progress(&format!("{text}\n")).await;
+            }
+        }
 
         let object_hash = self.object_format().kind();
         let find = {
@@ -585,7 +609,7 @@ fn generate_pack_streaming(
     )
     .map_err(ge)?;
     if counts.is_empty() {
-        let header = gix_pack::data::header::encode(PackVersion::V2, 0);
+        let header = gix_pack::data::header::encode(gix_pack::data::Version::V2, 0);
         let mut buf = header.to_vec();
         let trailer = crate::compute_pack_trailer(&buf, object_hash);
         buf.extend_from_slice(trailer.as_slice());
@@ -600,7 +624,7 @@ fn generate_pack_streaming(
         find,
         progress,
         entry::iter_from_counts::Options {
-            version: PackVersion::V2,
+            version: gix_pack::data::Version::V2,
             mode: entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
             allow_thin_pack,
             thread_limit,
@@ -613,7 +637,7 @@ fn generate_pack_streaming(
         entries_in_order,
         out,
         num_entries,
-        PackVersion::V2,
+        gix_pack::data::Version::V2,
         object_hash,
     );
     while let Some(result) = pack_iter.next() {

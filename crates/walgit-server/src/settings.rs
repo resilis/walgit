@@ -5,10 +5,11 @@
 //! * `GET` → `{revision, author, updated_at, message, toml}` (or `revision: 0`).
 //! * `PUT` body = the TOML document (`text/plain` or `application/toml`),
 //!   optional `?message=`; validated against this host's config (the
-//!   effective config must load and pass `Config::validate`); 400 with the
-//!   reason on failure, nothing published. 200 `{revision}`.
+//!   merged host-plus-repository config must load and pass `Config::validate`);
+//!   400 with the reason on failure, nothing published. 200 `{revision}`.
 //! * `DELETE` = publish an empty document.
-//! * `…/effective` → the repository-safe effective settings sections as TOML.
+//! * `…/effective` → the effective values of the four repo-configurable
+//!   sections as TOML. It never serializes the runtime `Config`.
 //! * `…/history` → SETTINGS entries in the live log.
 use std::sync::Arc;
 
@@ -95,7 +96,10 @@ pub async fn http_effective(
     h.sync_refs()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let text = toml::to_string_pretty(&settings_projection(&h.effective_config())?)
+    let text = h
+        .effective_config()
+        .effective_settings_view()
+        .to_toml_string()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((
         StatusCode::OK,
@@ -301,21 +305,6 @@ fn toml_json(v: &toml::Value) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
 }
 
-fn settings_projection(cfg: &walgit_config::Config) -> Result<toml::Table, ApiError> {
-    let full = toml::Table::try_from(cfg).map_err(|e| ApiError::Internal(e.to_string()))?;
-    let mut projected = toml::Table::new();
-    for section in walgit_config::SETTINGS_SECTIONS {
-        if let Some(value) = full.get(*section) {
-            projected.insert((*section).to_string(), value.clone());
-        }
-    }
-    // The environment-variable name is platform configuration. It is not repository data.
-    if let Some(toml::Value::Table(upstream)) = projected.get_mut("upstream") {
-        upstream.remove("token_env");
-    }
-    Ok(projected)
-}
-
 fn authorize_settings_document(text: &str, operator: bool) -> Result<(), ApiError> {
     if operator || text.trim().is_empty() {
         return Ok(());
@@ -371,8 +360,8 @@ fn settings_document_for_publish(
 
 /// Everything the Settings tab needs in one answer: the strategies (with the
 /// next fire time and a human preview), placement (host-level, read-only),
-/// the effective config as a flat `key → {value, source}` map restricted to
-/// the settings sections, the current settings document and the history.
+/// the effective settings projection as a flat `key → {value, source}` map,
+/// the current settings document and the history.
 pub async fn http_describe(
     st: &AppState,
     route: &RepoRoute,
@@ -434,8 +423,15 @@ fn describe_json(
         .collect();
     // Sources: every key of the settings sections; a key is "setting" when the
     // repo document sets it (rev/author), else "host" (walgit.toml ⊕ env).
-    let host_doc = settings_projection(&st.cfg)?;
-    let eff_doc = settings_projection(effective)?;
+    let host_doc = st
+        .cfg
+        .effective_settings_view()
+        .to_toml_table()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let eff_doc = effective
+        .effective_settings_view()
+        .to_toml_table()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let set_doc: toml::Table = settings
         .map(|s| s.toml.parse::<toml::Table>().unwrap_or_default())
         .unwrap_or_default();
@@ -553,7 +549,7 @@ fn human_schedule(expr: &str) -> String {
 }
 
 /// `POST …/settings/validate` body = TOML: `{ok, errors[], strategies[], fields[]}` —
-/// the describe of the *would-be* effective config, without publishing.
+/// the describe of the *would-be* effective settings projection, without publishing.
 pub async fn http_validate(
     st: &AppState,
     route: &RepoRoute,

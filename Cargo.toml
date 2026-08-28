@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/walgit-control",
+    "crates/walgit-identity",
     "crates/walgit-proto",
     "crates/walgit-store",
     "crates/walgit-config",
@@ -18,7 +20,9 @@ license = "MIT"
 rust-version = "1.90"
 
 [workspace.dependencies]
+walgit-control = { path = "crates/walgit-control" }
 walgit-proto = { path = "crates/walgit-proto" }
+walgit-identity = { path = "crates/walgit-identity" }
 walgit-store = { path = "crates/walgit-store" }
 walgit-config = { path = "crates/walgit-config" }
 walgit-git = { path = "crates/walgit-git" }
@@ -43,6 +47,7 @@ rust-embed = "8"
 prost = "0.14"
 prost-types = "0.14"
 prost-build = "0.14"
+prost-reflect = "0.16.5"
 tonic = "0.14"
 axum = { version = "0.8", features = ["http2", "macros"] }
 hyper = { version = "1", features = ["full"] }
@@ -78,11 +83,14 @@ google-cloud-gax = "1"
 google-cloud-auth = "1"
 aws-config = { version = "1.11.0", default-features = false, features = ["behavior-version-latest", "credentials-process", "default-https-client", "rt-tokio", "sso"] }
 aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio", "sigv4a"] }
+aws-smithy-http-client = { version = "1.4.0", default-features = false, features = ["default-client", "rustls-aws-lc"] }
 aws-smithy-types = "1"
 clap = { version = "4", features = ["derive", "env"] }
 rand = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
+subtle = "2"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "std"] }
 hmac = "0.12"
 hex = "0.4"
 humantime = "2"
@@ -100,6 +108,7 @@ flate2 = "1"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 pin-project-lite = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+url = "2"
 base64 = "0.22"
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["aws_lc_rs"] }
 aws-lc-rs = { version = "1.18.0", default-features = false, features = ["aws-lc-sys", "ring-io"] }

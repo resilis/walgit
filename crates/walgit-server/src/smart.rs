@@ -517,7 +517,7 @@ async fn run_fetch<W: tokio::io::AsyncWrite + Unpin + Send>(
     engine: walgit_config::UploadPackEngine,
     req: walgit_git::UploadPackRequest,
     writer: W,
-    _progress: Option<()>,
+    pack_progress: Option<&str>,
 ) -> Result<(), walgit_git::GitError> {
     let local = handle.local().clone();
     if !handle.remote_served().is_empty() {
@@ -528,7 +528,7 @@ async fn run_fetch<W: tokio::io::AsyncWrite + Unpin + Send>(
         let faulter = walgit_wal::remote::Faulter::new(reader, local.clone());
         let t0 = std::time::Instant::now();
         let stats = local
-            .upload_pack_gix_with(req, writer, Some(&faulter))
+            .upload_pack_gix_with_pack_progress(req, writer, Some(&faulter), pack_progress)
             .await?;
         let (faulted, rounds) = faulter.stats();
         tracing::info!(
@@ -754,16 +754,29 @@ async fn narrated_fetch(
         let local = guard.local().clone();
         let packs = local.packs().map(|p| p.len()).unwrap_or(0);
         let remote = handle.remote_served();
-        let _ = say(
-            &mut writer,
-            &format!(
-                "local copy ready ({packs} pack(s){}, {:.1}s); computing what you are missing and packing it…",
-                if remote.is_empty() { String::new() } else { format!(" + {} base pack(s) read from the bucket by range", remote.len()) },
-                t0.elapsed().as_secs_f64()
-            ),
-        )
-        .await;
-        if let Err(e) = run_fetch(&handle, engine, req, writer, None).await {
+        let ready = format!(
+            "local copy ready ({packs} pack(s){}, {:.1}s); computing what you are missing and packing it…",
+            if remote.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " + {} base pack(s) read from the bucket by range",
+                    remote.len()
+                )
+            },
+            t0.elapsed().as_secs_f64()
+        );
+        let pack_progress = if remote.is_empty() {
+            let _ = say(&mut writer, &ready).await;
+            None
+        } else {
+            // Git 2.43 accepts sideband-all before the packfile section but
+            // does not display band-2 text from that part of the response.
+            // Emit remote-serving status after the packfile header so the
+            // client sees the fact that its base comes from object storage.
+            Some(ready)
+        };
+        if let Err(e) = run_fetch(&handle, engine, req, writer, pack_progress.as_deref()).await {
             tracing::warn!(error = ?e, "narrated upload_pack v2 fetch failed");
         }
         drop(guard);

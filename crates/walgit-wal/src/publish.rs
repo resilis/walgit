@@ -192,11 +192,11 @@ pub(crate) async fn put_immutable_create(
 /// A log segment written and owned by this writer, awaiting the manifest CAS.
 pub(crate) struct LogSlot {
     pub(crate) key: String,
-    pub(crate) version: walgit_store::Version,
+    pub(crate) version: walgit_store::CasToken,
     pub(crate) first_seq: u64,
     /// Orphan segments (key, version as observed) whose seqs were burned to
     /// get here; CAS-deleted after our commit.
-    pub(crate) burned: Vec<(String, walgit_store::Version)>,
+    pub(crate) burned: Vec<(String, walgit_store::CasToken)>,
 }
 
 pub(crate) enum ClaimOutcome {
@@ -236,7 +236,7 @@ pub(crate) async fn claim_log_slot(
     mut encode: impl FnMut(u64) -> bytes::Bytes,
 ) -> Result<ClaimOutcome, WalError> {
     let mut seq = head_seq + 1;
-    let mut burned: Vec<(String, walgit_store::Version)> = Vec::new();
+    let mut burned: Vec<(String, walgit_store::CasToken)> = Vec::new();
     loop {
         let key = keys::log_segment_key(seq);
         let bytes = encode(seq);
@@ -680,7 +680,7 @@ async fn process_batch(handle: &RepoHandle, batch: Vec<PublishRequest>) -> Resul
             .await;
         // A non-412 error is ambiguous: the bucket may have applied the CAS and
         // lost the response. Look before deciding.
-        let committed: Option<(Manifest, Option<walgit_store::Version>)> = match cas {
+        let committed: Option<(Manifest, Option<walgit_store::CasToken>)> = match cas {
             Ok(meta) => Some((updated, Some(meta.version))),
             Err(StoreError::PreconditionFailed { .. }) => None,
             Err(e) => match cas_landed(&handle.store, &slot)
