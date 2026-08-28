@@ -791,6 +791,28 @@ mod tests {
         assert!(toks.windows(2).all(|w| w[0] <= w[1]));
     }
 
+    #[test]
+    fn newest_incremental_is_pending_during_close_grace() {
+        let c = cfg();
+        let mut list = BundleList::default();
+        let weekly_slot = epoch(t("2026-08-16T23:00:00Z"));
+        list.bundles.push(entry("weekly", weekly_slot, ""));
+
+        let rows = plan(&c, &list, t("2026-08-21T12:01:00Z"), false).unwrap();
+        let hourly: Vec<_> = rows.iter().filter(|row| row.strategy == "hourly").collect();
+        assert_eq!(hourly.len(), INCREMENTALS_KEPT, "{rows:?}");
+        assert_eq!(
+            hourly
+                .iter()
+                .map(|row| (row.slot, row.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (epoch(t("2026-08-21T11:00:00Z")), SlotStatus::Missing,),
+                (epoch(t("2026-08-21T12:00:00Z")), SlotStatus::Pending,),
+            ]
+        );
+    }
+
     fn chained() -> BundlesConfig {
         let mut c = cfg();
         c.strategy[0].keep = 1;
