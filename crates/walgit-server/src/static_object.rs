@@ -8,11 +8,12 @@
 //!   `206` + `Content-Range`, `416` + `Content-Range: bytes */total`;
 //! * `HEAD` answered from metadata (no body download);
 //! * `Content-Length` on every body so clients/proxies can stream and reuse
-//!   connections; `Accept-Ranges: bytes`; `Cache-Control: public, immutable`.
+//!   connections; `Accept-Ranges: bytes`; caller-selected immutable cache policy.
 //!
 //! Objects addressed here are immutable by construction (content-addressed
-//! names, or a generation-pinned URL), so the year-long immutable policy is
-//! correct even on shared caches.
+//! names, or a generation-pinned URL). Anonymous repository responses may use
+//! shared caches; authenticated responses use private browser caches while a
+//! trusted internal edge may still cache after WalGit authorizes every request.
 
 use std::ops::Range;
 
@@ -24,6 +25,7 @@ use walgit_store::{CasToken, GetOptions, GetResult, ObjectMeta, ObjectStore, Sto
 use crate::error::ApiError;
 
 pub const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+pub const PRIVATE_IMMUTABLE: &str = "private, max-age=31536000, immutable";
 
 /// Request header an edge proxy (nginx, `deploy/nginx.conf.example`) sets to announce what it
 /// can do on our behalf; comma/space separated tokens.
@@ -183,7 +185,7 @@ fn base_headers(resp: &mut Response, meta: &ObjectMeta, opts: &ServeOptions<'_>)
     h.insert(header::ETAG, etag_of(&meta.version));
     h.insert(header::CACHE_CONTROL, cache_control(opts));
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    h.insert(header::VARY, vary_header(opts));
     if let Some(name) = opts.filename {
         if let Ok(v) = HeaderValue::from_str(&format!(
             "attachment; filename=\"{}\"",
@@ -200,12 +202,24 @@ fn cache_control(opts: &ServeOptions<'_>) -> HeaderValue {
         .unwrap_or(HeaderValue::from_static(IMMUTABLE))
 }
 
+fn vary_header(opts: &ServeOptions<'_>) -> HeaderValue {
+    if opts.cache_control.is_some_and(|value| {
+        value
+            .split(',')
+            .any(|directive| directive.trim().eq_ignore_ascii_case("private"))
+    }) {
+        HeaderValue::from_static("Accept-Encoding, Authorization, Cookie, X-Walgit-Principal")
+    } else {
+        HeaderValue::from_static("Accept-Encoding")
+    }
+}
+
 fn not_modified(meta_version: &CasToken, opts: &ServeOptions<'_>) -> Response {
     let mut resp = StatusCode::NOT_MODIFIED.into_response();
     let h = resp.headers_mut();
     h.insert(header::ETAG, etag_of(meta_version));
     h.insert(header::CACHE_CONTROL, cache_control(opts));
-    h.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    h.insert(header::VARY, vary_header(opts));
     resp
 }
 
@@ -262,10 +276,11 @@ pub async fn serve(
             if let Some(auth) = &target.authorization {
                 h.insert("x-walgit-store-authorization", hv(auth)?);
             }
-            // The edge's cache key: the object, not the (possibly presigned, changing) URL.
+            // The edge's cache key: the canonical bucket object key, not the repository-relative
+            // key or the possibly presigned, changing URL.
             h.insert(
                 "x-walgit-store-key",
-                hv(&walgit_store::util::encode_path(key))?,
+                hv(&walgit_store::util::encode_path(&target.cache_key))?,
             );
             h.insert("x-walgit-accel", HeaderValue::from_static(store.backend()));
             // nginx keeps only Content-Type/Disposition, Accept-Ranges, Cache-Control and Expires

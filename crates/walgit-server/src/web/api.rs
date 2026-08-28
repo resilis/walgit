@@ -219,7 +219,8 @@ pub const REPO_API_BASES: [&str; 2] = ["/{owner}/{repo}/api", "/{owner}/{repo}/a
 pub(crate) fn auth_err(e: AuthError) -> ApiError {
     match e {
         AuthError::Invalid | AuthError::Unauthorized => ApiError::Unauthorized,
-        AuthError::Forbidden => ApiError::Forbidden,
+        AuthError::Forbidden | AuthError::TenantForbidden => ApiError::Forbidden,
+        AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         AuthError::Unavailable => ApiError::ServiceUnavailable("auth provider unavailable".into()),
     }
 }
@@ -292,8 +293,11 @@ async fn open(
     owner: &str,
     name: &str,
 ) -> Result<Arc<RepoHandle>, ApiError> {
-    st.auth.require_read(headers).await.map_err(auth_err)?;
     let id = walgit_git::RepoId::new(owner, name).map_err(|_| not_found("repository"))?;
+    st.auth
+        .require_tenant_read(headers, id.owner())
+        .await
+        .map_err(auth_err)?;
     st.registry.open(&id).await.map_err(|e| match e {
         walgit_wal::WalError::NotFound => not_found("repository"),
         _ => internal(e),
@@ -471,9 +475,13 @@ pub(crate) async fn owners(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_read(&headers).await.map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
-    let mut out: Vec<String> = repos.into_iter().map(|r| r.owner().to_string()).collect();
+    let mut out: Vec<String> = repos
+        .into_iter()
+        .filter(|repo| principal.can_read_tenant(repo.owner()))
+        .map(|r| r.owner().to_string())
+        .collect();
     out.sort();
     out.dedup();
     Ok(json_swr(&out, None).into_response(&headers))
@@ -483,7 +491,10 @@ pub(crate) async fn owner_repos(
     headers: HeaderMap,
     Path(owner): Path<String>,
 ) -> Result<Response, ApiError> {
-    st.auth.require_read(&headers).await.map_err(auth_err)?;
+    st.auth
+        .require_tenant_read(&headers, &owner)
+        .await
+        .map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos
         .into_iter()
@@ -588,6 +599,12 @@ async fn ref_list(
         let mut resp = crate::sse::sse_response(futures::stream::iter(items));
         resp.headers_mut()
             .insert(header::CACHE_CONTROL, SWR.parse().unwrap());
+        resp.headers_mut().insert(
+            header::VARY,
+            "Accept-Encoding, Authorization, Cookie, X-Walgit-Principal"
+                .parse()
+                .unwrap(),
+        );
         return Ok(resp);
     }
     Ok(json_swr(&RefPage { refs, more }, None).into_response(&headers))

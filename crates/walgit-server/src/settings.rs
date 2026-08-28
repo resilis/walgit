@@ -25,7 +25,13 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        _ => ApiError::Forbidden,
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::Unavailable => {
+            ApiError::ServiceUnavailable("auth provider unavailable".into())
+        }
     }
 }
 
@@ -49,16 +55,24 @@ pub async fn http_get(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let body = match h.settings() {
         None => json!({"revision": 0, "toml": "", "author": "", "updated_at": null, "message": ""}),
-        Some(s) => {
-            json!({"revision": s.revision, "toml": s.toml, "author": s.author, "updated_at": ts(s.updated_at.as_ref()), "message": s.message})
-        }
+        Some(s) => json!({
+            "revision": s.revision,
+            "toml": visible_settings_document(&s.toml, principal.is_operator())?,
+            "author": s.author,
+            "updated_at": ts(s.updated_at.as_ref()),
+            "message": s.message,
+        }),
     };
     Ok((
         StatusCode::OK,
@@ -73,7 +87,11 @@ pub async fn http_effective(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -102,7 +120,11 @@ pub async fn http_history(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -117,9 +139,16 @@ pub async fn http_history(
         .filter(|e| e.kind() == walgit_proto::v1::EntryKind::Settings)
         .map(|e| {
             let s = e.settings.clone().unwrap_or_default();
-            json!({"seq": e.seq, "revision": s.revision, "author": s.author, "message": s.message, "at": ts(e.created_at.as_ref()), "toml": s.toml})
+            Ok(json!({
+                "seq": e.seq,
+                "revision": s.revision,
+                "author": s.author,
+                "message": s.message,
+                "at": ts(e.created_at.as_ref()),
+                "toml": visible_settings_document(&s.toml, principal.is_operator())?,
+            }))
         })
-        .collect();
+        .collect::<Result<_, ApiError>>()?;
     Ok((
         StatusCode::OK,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -135,21 +164,45 @@ pub async fn http_put(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_admin(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
+    h.sync_refs()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     let bytes = crate::collect_body(body).await?;
     if bytes.len() > walgit_config::SETTINGS_MAX_BYTES {
         return Err(ApiError::PayloadTooLarge);
     }
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| ApiError::BadRequest("settings must be UTF-8 TOML".into()))?;
+    let current = h.settings();
+    let expected_revision = current
+        .as_ref()
+        .map(|settings| settings.revision)
+        .unwrap_or(0);
+    let current_toml = current.map(|settings| settings.toml).unwrap_or_default();
+    let text = settings_document_for_publish(text, &current_toml, principal.is_operator())?;
+    if text.len() > walgit_config::SETTINGS_MAX_BYTES {
+        return Err(ApiError::PayloadTooLarge);
+    }
     let message = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
         .find(|(k, _)| *k == "message")
         .map(|(_, v)| percent_decode(v))
         .unwrap_or_default();
-    publish(&h, text, &principal.name, &message).await
+    publish(
+        &h,
+        &text,
+        &principal.name,
+        &message,
+        (!principal.is_operator()).then_some(expected_revision),
+    )
+    .await
 }
 
 pub async fn http_delete(
@@ -157,9 +210,30 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_admin(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
-    publish(&h, "", &principal.name, "clear").await
+    h.sync_refs()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let current = h.settings();
+    let expected_revision = current
+        .as_ref()
+        .map(|settings| settings.revision)
+        .unwrap_or(0);
+    let current_toml = current.map(|settings| settings.toml).unwrap_or_default();
+    let text = settings_document_for_publish("", &current_toml, principal.is_operator())?;
+    publish(
+        &h,
+        &text,
+        &principal.name,
+        "clear",
+        (!principal.is_operator()).then_some(expected_revision),
+    )
+    .await
 }
 
 async fn publish(
@@ -167,12 +241,23 @@ async fn publish(
     text: &str,
     author: &str,
     message: &str,
+    expected_revision: Option<u64>,
 ) -> Result<Response, ApiError> {
-    match h.publish_settings(text, author, message).await {
+    let result = match expected_revision {
+        Some(revision) => {
+            h.publish_settings_if_revision(text, author, message, revision)
+                .await
+        }
+        None => h.publish_settings(text, author, message).await,
+    };
+    match result {
         Ok(revision) => {
             Ok((StatusCode::OK, axum::Json(json!({"revision": revision}))).into_response())
         }
         Err(walgit_wal::WalError::Invalid(why)) => Err(ApiError::BadRequest(why)),
+        Err(walgit_wal::WalError::SettingsConflict { .. }) => Err(ApiError::Conflict(
+            "repository settings changed; reload and retry".into(),
+        )),
         Err(e) => Err(ApiError::Internal(e.to_string())),
     }
 }
@@ -220,6 +305,59 @@ fn toml_json(v: &toml::Value) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
 }
 
+fn authorize_settings_document(text: &str, operator: bool) -> Result<(), ApiError> {
+    if operator || text.trim().is_empty() {
+        return Ok(());
+    }
+    let document: toml::Table = text
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("settings: parsing TOML: {e}")))?;
+    if document.contains_key("upstream") {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
+
+fn visible_settings_document(text: &str, operator: bool) -> Result<String, ApiError> {
+    if operator || text.trim().is_empty() {
+        return Ok(text.to_string());
+    }
+    let mut document: toml::Table = text
+        .parse()
+        .map_err(|e| ApiError::Internal(format!("stored settings are invalid: {e}")))?;
+    document.remove("upstream");
+    toml::to_string_pretty(&document).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+fn settings_document_for_publish(
+    proposed: &str,
+    current: &str,
+    operator: bool,
+) -> Result<String, ApiError> {
+    if operator {
+        return Ok(proposed.to_string());
+    }
+    let mut proposed_document: toml::Table = proposed
+        .parse()
+        .map_err(|e| ApiError::BadRequest(format!("settings: parsing TOML: {e}")))?;
+    if proposed_document.contains_key("upstream") {
+        return Err(ApiError::Forbidden);
+    }
+    if !current.trim().is_empty() {
+        let mut current_document: toml::Table = current
+            .parse()
+            .map_err(|e| ApiError::Internal(format!("stored settings are invalid: {e}")))?;
+        if let Some(upstream) = current_document.remove("upstream") {
+            proposed_document.insert("upstream".into(), upstream);
+        }
+    }
+    if proposed_document.is_empty() {
+        Ok(String::new())
+    } else {
+        toml::to_string_pretty(&proposed_document).map_err(|e| ApiError::Internal(e.to_string()))
+    }
+}
+
 /// Everything the Settings tab needs in one answer: the strategies (with the
 /// next fire time and a human preview), placement (host-level, read-only),
 /// the effective settings projection as a flat `key → {value, source}` map,
@@ -229,7 +367,11 @@ pub async fn http_describe(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await
@@ -239,7 +381,13 @@ pub async fn http_describe(
     Ok((
         StatusCode::OK,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        axum::Json(describe_json(st, &h, &effective, settings.as_ref())?),
+        axum::Json(describe_json(
+            st,
+            &h,
+            &effective,
+            settings.as_ref(),
+            principal.is_operator(),
+        )?),
     )
         .into_response())
 }
@@ -249,6 +397,7 @@ fn describe_json(
     h: &walgit_wal::RepoHandle,
     effective: &walgit_config::Config,
     settings: Option<&walgit_proto::v1::RepoSettings>,
+    operator: bool,
 ) -> Result<serde_json::Value, ApiError> {
     let now = std::time::SystemTime::now();
     let strategies: Vec<serde_json::Value> = effective
@@ -322,7 +471,16 @@ fn describe_json(
     let m = h.manifest();
     Ok(json!({
         "repo": h.id().to_string(),
-        "settings": settings.map(|s| json!({"revision": s.revision, "author": s.author, "message": s.message, "updated_at": ts(s.updated_at.as_ref()), "toml": s.toml})).unwrap_or(json!({"revision": 0, "toml": ""})),
+        "settings": match settings {
+            Some(s) => json!({
+                "revision": s.revision,
+                "author": s.author,
+                "message": s.message,
+                "updated_at": ts(s.updated_at.as_ref()),
+                "toml": visible_settings_document(&s.toml, operator)?,
+            }),
+            None => json!({"revision": 0, "toml": ""}),
+        },
         "sections": walgit_config::SETTINGS_SECTIONS,
         "strategies": strategies,
         "bundles": {"enabled": effective.bundles.enabled, "min_commits": effective.bundles.min_commits, "main_only": effective.bundles.main_only},
@@ -398,11 +556,16 @@ pub async fn http_validate(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| ApiError::BadRequest("settings must be UTF-8 TOML".into()))?;
+    authorize_settings_document(text, principal.is_operator())?;
     let out = match st.cfg.with_settings(text) {
         Ok(eff) => {
             let preview = walgit_proto::v1::RepoSettings {
@@ -412,7 +575,7 @@ pub async fn http_validate(
                 updated_at: None,
                 message: String::new(),
             };
-            let mut d = describe_json(st, &h, &eff, Some(&preview))?;
+            let mut d = describe_json(st, &h, &eff, Some(&preview), principal.is_operator())?;
             d["ok"] = json!(true);
             d["errors"] = json!([]);
             d
@@ -434,7 +597,11 @@ pub async fn http_policy_validate(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let _ = open(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let out = match crate::policy::parse_document(&bytes) {
@@ -458,7 +625,11 @@ pub async fn http_policy_dry_run(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let h = open(st, route).await?;
     h.sync_refs()
         .await

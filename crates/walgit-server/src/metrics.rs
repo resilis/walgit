@@ -4,7 +4,8 @@
 use std::sync::{Arc, OnceLock};
 
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use metrics_exporter_prometheus::PrometheusHandle;
 
 use crate::AppState;
@@ -30,13 +31,35 @@ pub fn install() -> anyhow::Result<Arc<PrometheusHandle>> {
 }
 
 /// `GET /metrics`
-pub async fn metrics_route(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+pub async fn metrics_route(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Response, crate::error::ApiError> {
+    st.auth.require_operator(&headers).await.map_err(auth_err)?;
     let body = st.metrics_handle.render();
-    (
+    Ok((
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
         body,
     )
+        .into_response())
+}
+
+fn auth_err(error: crate::auth::AuthError) -> crate::error::ApiError {
+    match error {
+        crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
+            crate::error::ApiError::Unauthorized
+        }
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            crate::error::ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => {
+            crate::error::ApiError::NotFound("repository".into())
+        }
+        crate::auth::AuthError::Unavailable => {
+            crate::error::ApiError::ServiceUnavailable("auth provider unavailable".into())
+        }
+    }
 }

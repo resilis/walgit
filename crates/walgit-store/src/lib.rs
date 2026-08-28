@@ -87,6 +87,9 @@ pub type ObjectVersionID = ObjectVersionId;
 pub struct AccelTarget {
     /// Absolute URL the edge proxies to (the object, not a listing).
     pub url: String,
+    /// Canonical bucket key used by the trusted edge cache. This must include every configured
+    /// store and repository prefix; a repository-relative key can collide across tenants.
+    pub cache_key: String,
     /// `Authorization` header value for that request, when the URL itself is not credentialed.
     pub authorization: Option<String>,
 }
@@ -1300,5 +1303,35 @@ mod s3_evidence_tests {
             .to_string();
         assert!(error.contains("escaped the configured prefix"), "{error}");
         assert!(!error.contains("outside/key"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use super::{ObjectStore, Prefixed};
+
+    #[tokio::test]
+    async fn accel_cache_keys_include_nested_repository_prefixes() {
+        let memory = Arc::new(crate::memory::MemoryStore::new());
+        memory.fake_object_urls.store(true, Ordering::Relaxed);
+        let root = Arc::new(Prefixed::new(memory, "prod/"));
+        let acme = Prefixed::new(root.clone(), "repos/acme/app/");
+        let beta = Prefixed::new(root, "repos/beta/app/");
+        let relative = "bundles/full/2026-08-26.bundle";
+
+        let acme_target = acme.accel_target(relative).await.expect("acme target");
+        let beta_target = beta.accel_target(relative).await.expect("beta target");
+        assert_eq!(
+            acme_target.cache_key,
+            "prod/repos/acme/app/bundles/full/2026-08-26.bundle"
+        );
+        assert_eq!(
+            beta_target.cache_key,
+            "prod/repos/beta/app/bundles/full/2026-08-26.bundle"
+        );
+        assert_ne!(acme_target.cache_key, beta_target.cache_key);
     }
 }

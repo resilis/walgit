@@ -368,7 +368,12 @@ async fn accel_redirect_offloads_static_objects_to_the_edge() -> Result<()> {
             && store_url.ends_with(&oid),
         "url {store_url:?}"
     );
-    assert!(hdr(&r, "x-walgit-store-key").ends_with(&oid));
+    let store_key = hdr(&r, "x-walgit-store-key");
+    assert!(
+        store_key.starts_with("repos/o/r/lfs/objects/"),
+        "{store_key}"
+    );
+    assert!(store_key.ends_with(&oid), "{store_key}");
     let etag = hdr(&r, "etag");
     assert!(etag.starts_with('"'));
     // The edge re-emits this as the client-visible ETag (nginx drops ETag across X-Accel-Redirect

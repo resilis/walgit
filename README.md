@@ -17,6 +17,10 @@ auto_create_on_push = true
 mode = "token"
 anonymous_read = false
 tokens = [{ principal = "me", token_env = "WALGIT_TOKEN_ME", write = true }]
+[[server.auth.tenant_grants]]
+principal = "me"
+tenant = "acme"
+role = "admin"
 [store]
 backend = "s3"
 bucket = "my-walgit"
@@ -146,6 +150,19 @@ each repository one maintainer (placement globs) and you are done.
 | `none` | everyone is `anon` with write — loopback experiments | nothing |
 | `token` | static `tokens` in the config (`token_env` reads the secret from the environment) | `Authorization: Bearer <token>`, or the token as an HTTP Basic password |
 | `oidc` | any OpenID Connect issuer (`issuer`, `oauth_client_id/secret`, `allowed_domains`/`allowed_emails`): Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab… | a **walgit access token**: sign in once in the browser, create one at `/_auth/tokens`, paste it into the installer. Stateless (HMAC with `session_secret`, `access_token_ttl`); rotating the secret revokes all. ID tokens from the issuer (`audiences`) and static `tokens` work too. |
+
+For `token` and `oidc`, `tenant_grants` are required for repository access. An operator-only host
+can instead list only `platform_operators`. The repository owner is the tenant:
+`reader` can fetch and browse, `writer` can also push and upload LFS objects, and `admin` can
+also create/delete repositories and change policy, settings, and maintenance operations. A `*`
+principal matches authenticated users only; anonymous access needs an explicit `anonymous` grant.
+`platform_operators` is a separate exact-principal list for `/metrics` and event notifications and
+does not grant repository access.
+Grants are loaded at startup. Update every serving and broker instance as one rollout and remove
+the old instance generation before treating a revocation as complete. Presigned download URLs
+remain bearer credentials until their configured TTL expires. S3 client URLs override object
+metadata with a private cache policy. Authenticated GCS tenants must use proxy delivery because
+GCS signed URLs inherit public object cache metadata.
 
 Developer setup is one idempotent command — `sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"` —
 which stores the token in a file only the user can read, installs a tiny git credential helper (git ≥ 2.46: it

@@ -118,12 +118,14 @@ pub async fn require_auth(
                 return Redirect::temporary(&format!("/_auth/login?next={q}")).into_response();
             }
             let status = match e {
-                crate::auth::AuthError::Forbidden => StatusCode::FORBIDDEN,
+                crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+                    StatusCode::FORBIDDEN
+                }
                 crate::auth::AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::UNAUTHORIZED,
             };
             let why = match e {
-                crate::auth::AuthError::Forbidden => {
+                crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
                     "your account is not in an allowed domain".to_string()
                 }
                 crate::auth::AuthError::Unavailable => {

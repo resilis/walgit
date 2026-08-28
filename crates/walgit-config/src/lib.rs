@@ -145,6 +145,13 @@ pub struct AuthConfig {
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
     /// Presented as `Authorization: Bearer <token>` or as the password of HTTP Basic.
     pub tokens: Vec<StaticToken>,
+    /// Repository-owner authorization. The existing `owner` path component is the tenant key.
+    /// A principal or tenant of `*` is a wildcard; wildcard principals never match anonymous
+    /// requests. Multiple entries combine by taking the strongest matching role.
+    pub tenant_grants: Vec<TenantGrant>,
+    /// Exact authenticated principals allowed to use platform-wide endpoints such as `/metrics`
+    /// and `/_events/notify`. Operator status never grants repository access.
+    pub platform_operators: Vec<String>,
     /// OIDC issuer (`oidc` mode). Discovery at `<issuer>/.well-known/openid-configuration`
     /// supplies the JWKS, authorization and token endpoints. Any compliant provider works
     /// (Google, Microsoft Entra, Okta, Auth0, Keycloak, Dex, GitLab, ...).
@@ -197,6 +204,25 @@ pub enum AuthMode {
     /// OpenID Connect: browser sign-in through the issuer, ID tokens as bearers, plus
     /// walgit-issued access tokens for git — and `tokens` for robots.
     Oidc,
+}
+
+/// A principal's authority inside one tenant (`RepoId.owner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TenantRole {
+    Reader,
+    Writer,
+    Admin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantGrant {
+    /// Exact authenticated principal, or `*` for every authenticated principal.
+    pub principal: String,
+    /// Exact repository owner, or `*` for every owner.
+    pub tenant: String,
+    pub role: TenantRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -995,6 +1021,11 @@ impl Config {
         })?;
         cfg.validate()
             .context("settings: validating the effective config")?;
+        anyhow::ensure!(
+            cfg.bundles.signed_url_ttl <= self.bundles.signed_url_ttl,
+            "settings: bundles.signed_url_ttl may not exceed the host maximum ({:?})",
+            self.bundles.signed_url_ttl
+        );
         Ok(cfg)
     }
 
@@ -1143,6 +1174,16 @@ pub fn repo_listed(list: &[String], owner: &str, name: &str) -> bool {
     })
 }
 
+fn valid_repo_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value != ".."
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -1188,6 +1229,8 @@ impl Default for AuthConfig {
             mode: AuthMode::None,
             anonymous_read: true,
             tokens: vec![],
+            tenant_grants: vec![],
+            platform_operators: vec![],
             issuer: "https://accounts.google.com".into(),
             allowed_domains: vec![],
             allowed_emails: vec![],
@@ -1721,6 +1764,26 @@ impl Config {
         for origin in &self.server.cors_origins {
             validated_cors_origin(origin)?;
         }
+        if self.store.backend == StoreBackend::Gcs && self.server.auth.mode != AuthMode::None {
+            anyhow::ensure!(
+                self.lfs.serve_via != BundleServe::SignedUrl
+                    && self.bundles.serve_via != BundleServe::SignedUrl
+                    && self.bundles.signed_url_for.is_empty(),
+                "authenticated GCS tenants must serve LFS and bundles through the proxy because GCS signed URLs inherit public object cache metadata"
+            );
+        }
+        for o in &self.server.cors_origins {
+            let host = o
+                .strip_prefix("https://")
+                .or_else(|| o.strip_prefix("http://localhost").map(|_| "localhost"))
+                .filter(|h| !h.is_empty() && !h.contains('/'));
+            anyhow::ensure!(
+                host.is_some()
+                    && o.matches('*').count() <= 1
+                    && (!o.contains('*') || o.contains("://*.")),
+                "server.cors_origins entries must be https origins (or http://localhost[:port]) with at most one leading `*.` wildcard, got {o:?}"
+            );
+        }
         // Security contract: identity modes fail closed.
         let a = &self.server.auth;
         let issuer = if a.issuer.is_empty() {
@@ -1736,8 +1799,8 @@ impl Config {
         }
         for (index, t) in a.tokens.iter().enumerate() {
             anyhow::ensure!(
-                !t.principal.is_empty(),
-                "server.auth.tokens[{index}].principal must not be empty"
+                !t.principal.is_empty() && !t.principal.eq_ignore_ascii_case("anonymous"),
+                "server.auth.tokens[{index}].principal must be non-empty and may not be the reserved anonymous identity"
             );
             if let Some(name) = &t.token_env {
                 anyhow::ensure!(
@@ -1752,6 +1815,30 @@ impl Config {
             anyhow::ensure!(
                 !t.token.is_empty() || t.token_env.is_some(),
                 "server.auth.tokens[{index}] needs `token` or `token_env`"
+            );
+        }
+        for grant in &a.tenant_grants {
+            anyhow::ensure!(
+                !grant.principal.trim().is_empty(),
+                "server.auth.tenant_grants[].principal must not be empty"
+            );
+            anyhow::ensure!(
+                grant.tenant == "*" || valid_repo_part(&grant.tenant),
+                "server.auth.tenant_grants[] tenant {:?} must be `*` or an owner name using ASCII [A-Za-z0-9._-] without a leading dot",
+                grant.tenant
+            );
+            anyhow::ensure!(
+                !grant.principal.eq_ignore_ascii_case("anonymous")
+                    || grant.role == TenantRole::Reader,
+                "server.auth.tenant_grants[] for anonymous must use the reader role"
+            );
+        }
+        for principal in &a.platform_operators {
+            anyhow::ensure!(
+                !principal.trim().is_empty()
+                    && principal != "*"
+                    && !principal.eq_ignore_ascii_case("anonymous"),
+                "server.auth.platform_operators entries must be exact non-anonymous principals"
             );
         }
         if let Some(secret) = a.session_secret.as_deref().filter(|s| !s.is_empty()) {
@@ -1790,6 +1877,20 @@ impl Config {
             anyhow::ensure!(
                 !oauth_id || a.session_secret.as_deref().is_some_and(|s| !s.is_empty()),
                 "server.auth.session_secret is required with oauth_client_id (it signs sessions and access tokens)"
+            );
+        }
+        if a.mode != AuthMode::None {
+            anyhow::ensure!(
+                !a.tenant_grants.is_empty() || !a.platform_operators.is_empty(),
+                "server.auth.tenant_grants or server.auth.platform_operators must list at least one authorization in token or oidc mode"
+            );
+        }
+        if a.mode == AuthMode::Token && a.anonymous_read {
+            anyhow::ensure!(
+                a.tenant_grants
+                    .iter()
+                    .any(|grant| grant.principal.eq_ignore_ascii_case("anonymous")),
+                "server.auth.anonymous_read requires an explicit anonymous tenant reader grant"
             );
         }
         anyhow::ensure!(
@@ -2580,6 +2681,23 @@ listen = \"0.0.0.0:1\"\n",
             .unwrap_err()
             .to_string();
         assert!(e.contains("settings"), "{e}");
+        let e = base
+            .with_settings("[bundles]\nsigned_url_ttl = \"2h\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("host maximum"), "{e}");
+        for upstream in [
+            "https://user:secret@example.com/repo.git",
+            "https://example.com/repo.git?token=secret",
+        ] {
+            let e = base
+                .with_settings(&format!("[upstream]\ngit = {upstream:?}\n"))
+                .unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("upstream.git"), "{e}");
+            assert!(!e.contains(upstream), "{e}");
+            assert!(!e.contains("secret"), "{e}");
+        }
         assert_eq!(
             base.with_settings("  ").unwrap().bundles.min_commits,
             base.bundles.min_commits
@@ -2761,17 +2879,63 @@ audiences = ["walgit-cli", "https://git.example.com"]
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\n")
             .unwrap_err();
         assert!(err.to_string().contains("tokens"), "{err}");
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server.auth]\nmode = \"token\"\ntokens = [{ principal = \"ci\", token = \"secret\" }]\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant_grants"), "{err}");
         // oidc: anonymous_read off, an allowlist, and a way in.
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\n").unwrap_err();
         assert!(err.to_string().contains("way in"), "{err}");
         let err = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\n").unwrap_err();
         assert!(err.to_string().contains("session_secret"), "{err}");
-        let ok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n").unwrap();
+        let ok = Config::parse("[store]\nbucket = \"b\"\n[server.auth]\nmode = \"oidc\"\nissuer = \"https://login.example.com\"\nanonymous_read = false\nallowed_domains = [\"example.com\"]\noauth_client_id = \"x\"\noauth_client_secret = \"y\"\nsession_secret = \"0123456789abcdef0123456789abcdef\"\n[[server.auth.tenant_grants]]\nprincipal = \"*\"\ntenant = \"acme\"\nrole = \"reader\"\n").unwrap();
         assert_eq!(ok.server.auth.issuer, "https://login.example.com");
+        assert_eq!(ok.server.auth.tenant_grants[0].tenant, "acme");
         assert_eq!(
             ok.server.auth.access_token_ttl,
             Duration::from_secs(90 * 86400)
         );
+        let mut token = ok.clone();
+        token.server.auth.mode = AuthMode::Token;
+        token.server.auth.tokens = vec![StaticToken {
+            principal: "ci".into(),
+            token: "secret".into(),
+            token_env: None,
+            write: true,
+        }];
+        for (mode, authenticated) in [("token", token), ("oidc", ok.clone())] {
+            for (control, configure) in [
+                (
+                    "lfs.serve_via",
+                    (|cfg: &mut Config| cfg.lfs.serve_via = BundleServe::SignedUrl)
+                        as fn(&mut Config),
+                ),
+                ("bundles.serve_via", |cfg: &mut Config| {
+                    cfg.bundles.serve_via = BundleServe::SignedUrl
+                }),
+                ("bundles.signed_url_for", |cfg: &mut Config| {
+                    cfg.bundles.signed_url_for = vec!["acme/*".into()]
+                }),
+            ] {
+                let mut unsafe_gcs = authenticated.clone();
+                unsafe_gcs.store.backend = StoreBackend::Gcs;
+                configure(&mut unsafe_gcs);
+                let err = unsafe_gcs.validate().unwrap_err();
+                assert!(
+                    err.to_string().contains("authenticated GCS tenants"),
+                    "{mode} {control}: {err}"
+                );
+            }
+        }
+
+        let mut unauthenticated_gcs = ok;
+        unauthenticated_gcs.server.auth.mode = AuthMode::None;
+        unauthenticated_gcs.store.backend = StoreBackend::Gcs;
+        unauthenticated_gcs.lfs.serve_via = BundleServe::SignedUrl;
+        unauthenticated_gcs.bundles.serve_via = BundleServe::SignedUrl;
+        unauthenticated_gcs.bundles.signed_url_for = vec!["acme/*".into()];
+        unauthenticated_gcs.validate().unwrap();
     }
 
     #[test]
@@ -2842,12 +3006,18 @@ audiences = ["walgit-cli", "https://git.example.com"]
         let mut cfg = Config::default();
         cfg.store.bucket = "b".into();
         cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
         cfg.server.auth.issuer.clear();
         cfg.server.auth.tokens = vec![StaticToken {
             principal: "robot".into(),
             token: "literal-fallback".into(),
             token_env: Some("ROBOT_TOKEN".into()),
             write: true,
+        }];
+        cfg.server.auth.tenant_grants = vec![TenantGrant {
+            principal: "robot".into(),
+            tenant: "*".into(),
+            role: TenantRole::Writer,
         }];
         cfg.validate().expect("named env with literal fallback");
         cfg.server.auth.tokens[0].token_env = None;

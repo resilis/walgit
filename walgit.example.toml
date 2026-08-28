@@ -61,6 +61,14 @@ anonymous_read = true             # must be false in oidc mode
 # audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
 #                                          #       the configured web client is always accepted
 # trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
+# platform_operators = ["platform-observer"] # exact principals for /metrics and /_events/notify; no repo access implied
+#
+# `owner` is the tenant. Required for repository access in token/oidc mode; an operator-only host
+# may instead configure only `platform_operators`. Repeat entries for different tenant roles.
+# [[server.auth.tenant_grants]]
+# principal = "alice"                     # exact principal, or "*" for authenticated principals only
+# tenant = "acme"                         # exact repository owner, or "*"
+# role = "admin"                          # "reader" | "writer" | "admin"
 
 [store]
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
@@ -94,7 +102,8 @@ bulk_concurrency = 32             # 1..=256 bulk operations per process; control
 endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
 # Bucket versioning is mandatory and GCS soft-delete retention must be disabled. WalGit verifies both at startup.
 direct_connectivity = true
-# signing_service_account = "sa@project.iam.gserviceaccount.com"   # for bundles/lfs serve_via = "signed_url"
+# signing_service_account = "sa@project.iam.gserviceaccount.com"   # signed URLs are allowed only with auth mode "none";
+#                                                                  # authenticated GCS tenants must use proxy delivery
 bulk_clients = 4                  # separate data channels for pack/idx/side-file/bundle/LFS bytes + ranged reads
 bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
 
@@ -244,7 +253,7 @@ min_commits = 25                  # don't cut an incremental slot with fewer com
 min_bytes = "0B"                  # optional second guard on the incremental's pack size (0 = off)
 main_only = true                  # default bundle refs: HEAD + refs/heads/main (false: heads/* + tags/* + HEAD)
 extra_refs = []                   # e.g. ["refs/tags/v*"] added to every bundle's default ref set
-serve_via = "proxy"               # "proxy" (bytes through walgit or the edge) | "signed_url" (presigned bucket URLs in the list)
+serve_via = "proxy"               # "proxy" (bytes through walgit or the edge) | "signed_url" (S3, or unauthenticated GCS)
 signed_url_ttl = "1h"
 advertise = true                  # advertise bundle-uri in v2 capabilities
 advertise_filtered = false        # filtered families in the PLAIN list/advertisement too (filter = lines) — only for
@@ -252,12 +261,12 @@ advertise_filtered = false        # filtered families in the PLAIN list/advertis
                                   # swallow blobless bundles into a full clone (design §6b)
 require = []                      # repos ("owner/name" | "owner/*") whose unbounded zero-have clones must use
                                   # bundle-uri; shallow/filtered zero-have requests and fetches with haves proceed
-signed_url_for = []               # repos whose bundle URIs are presigned store URLs (clone bytes bypass the hosts); on any
+signed_url_for = []               # S3 or unauthenticated-GCS repos whose bundle URIs are presigned store URLs; on any
                                   # signing error the listing falls back to proxy URIs and warns once per repo
 
 [lfs]
 enabled = true
-serve_via = "proxy"               # "proxy" | "signed_url"
+serve_via = "proxy"               # "proxy" | "signed_url" (S3, or unauthenticated GCS)
 signed_url_ttl = "1h"
 max_object_bytes = "16GiB"
 

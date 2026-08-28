@@ -75,21 +75,31 @@ pub async fn batch(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
-    body_bytes: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
-    let body: BatchRequest = serde_json::from_slice(&body_bytes)
-        .map_err(|e| ApiError::BadRequest(format!("invalid lfs batch: {e}")))?;
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    // Authenticate the tenant before accepting a potentially large JSON body. The operation
+    // inside the body then decides whether Reader or Writer is required.
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
+    let body_bytes = crate::collect_body(body).await?;
+    let body: BatchRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ApiError::BadRequest(format!("invalid lfs batch: {e}")))?;
+    let is_upload = body.operation == "upload";
+    if is_upload && !principal.can_write_tenant(route.id.owner()) {
+        return Err(ApiError::Forbidden);
+    }
     not_served_here(st, &route.id)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let base = base_url(st, route, headers);
     let cfg = handle.effective_config();
 
-    let is_upload = body.operation == "upload";
     // Local presence first; then one bounded upstream batch for the misses.
     let mut local = Vec::with_capacity(body.objects.len());
     let mut missing = Vec::new();
@@ -218,7 +228,11 @@ pub async fn get_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     let handle = open_repo(st, &route.id, false).await?;
@@ -241,6 +255,8 @@ pub async fn get_object(
         method,
         headers,
         crate::static_object::ServeOptions {
+            cache_control: (!principal.public_cache_allowed())
+                .then_some(crate::static_object::PRIVATE_IMMUTABLE),
             accel: st.cfg.server.accel_redirect,
             ..Default::default()
         },
@@ -287,6 +303,11 @@ async fn read_through(
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_LENGTH, obj.size)
             .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+            .header(axum::http::header::CACHE_CONTROL, "no-store")
+            .header(
+                axum::http::header::VARY,
+                "Authorization, Cookie, X-Walgit-Principal",
+            )
             .body(Body::empty())
             .unwrap());
     }
@@ -370,6 +391,10 @@ async fn read_through(
         .header(axum::http::header::CONTENT_LENGTH, len)
         .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .header(
+            axum::http::header::VARY,
+            "Authorization, Cookie, X-Walgit-Principal",
+        )
         .body(Body::from_stream(stream))
         .unwrap())
 }
@@ -384,7 +409,11 @@ pub async fn put_object(
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st
+        .auth
+        .require_tenant_write(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
     let handle = open_repo(st, &route.id, false).await?;
@@ -417,14 +446,19 @@ pub async fn verify(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
-    body_bytes: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
     }
+    let _ = st
+        .auth
+        .require_tenant_write(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
+    let body_bytes = crate::collect_body(body).await?;
     let body: BatchObject = serde_json::from_slice(&body_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(&body.oid);
@@ -477,7 +511,10 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

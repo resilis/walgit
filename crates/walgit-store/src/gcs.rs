@@ -1225,6 +1225,7 @@ impl ObjectStore for GcsStore {
                 self.bucket,
                 crate::util::encode_path(key)
             ),
+            cache_key: key.to_string(),
             authorization,
         })
     }

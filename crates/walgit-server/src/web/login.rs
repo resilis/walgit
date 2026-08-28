@@ -287,7 +287,7 @@ async fn callback(
     };
     let principal = match st.auth.verify_login_id_token(&id_token).await {
         Ok(p) => p,
-        Err(crate::auth::AuthError::Forbidden) => {
+        Err(crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden) => {
             return (
                 StatusCode::FORBIDDEN,
                 "your account is not in an allowed domain",
@@ -400,7 +400,9 @@ async fn check(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response 
             );
             r
         }
-        Err(crate::auth::AuthError::Forbidden) => crate::error::ApiError::Forbidden.into_response(),
+        Err(crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden) => {
+            crate::error::ApiError::Forbidden.into_response()
+        }
         Err(crate::auth::AuthError::Unavailable) => {
             crate::error::ApiError::ServiceUnavailable("auth provider unavailable".into())
                 .into_response()

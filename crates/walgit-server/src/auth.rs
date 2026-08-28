@@ -34,7 +34,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use tokio::sync::Mutex;
-use walgit_config::{ACCESS_TOKEN_PREFIX, AuthMode, StaticToken};
+use walgit_config::{ACCESS_TOKEN_PREFIX, AuthMode, StaticToken, TenantGrant, TenantRole};
 
 /// Client `Authorization` as copied by an edge before it replaces that header with its own
 /// hop credential. Read only when the edge announces `client-authorization`.
@@ -61,16 +61,55 @@ pub struct Principal {
     pub name: String,
     pub write: bool,
     pub anonymous: bool,
+    tenant_access: Vec<TenantAccess>,
+    operator: bool,
+    public_read: bool,
 }
 
 impl Principal {
-    pub fn anonymous() -> Self {
-        Self {
-            name: "anonymous".to_string(),
-            write: false,
-            anonymous: true,
-        }
+    fn tenant_role(&self, tenant: &str) -> Option<TenantRole> {
+        self.tenant_access
+            .iter()
+            .filter(|access| access.tenant == "*" || access.tenant == tenant)
+            .map(|access| access.role)
+            .max()
     }
+
+    pub fn can_read_tenant(&self, tenant: &str) -> bool {
+        self.tenant_role(tenant).is_some()
+    }
+
+    pub fn can_admin_tenant(&self, tenant: &str) -> bool {
+        self.write && self.tenant_role(tenant) == Some(TenantRole::Admin)
+    }
+
+    pub fn can_write_tenant(&self, tenant: &str) -> bool {
+        self.write
+            && self
+                .tenant_role(tenant)
+                .is_some_and(|role| role >= TenantRole::Writer)
+    }
+
+    pub fn is_operator(&self) -> bool {
+        self.operator
+    }
+
+    pub fn public_cache_allowed(&self) -> bool {
+        self.public_read
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TenantAccess {
+    tenant: String,
+    role: TenantRole,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TenantAction {
+    Read,
+    Write,
+    Admin,
 }
 
 /// A JWKS public key: RSA or EC P-256.
@@ -383,6 +422,8 @@ pub struct Authenticator {
     anonymous_read: bool,
     /// Resolved once at construction. Plaintext static tokens are never retained.
     tokens: Vec<HashedStaticToken>,
+    tenant_grants: Vec<TenantGrant>,
+    platform_operators: Vec<String>,
     issuer: String,
     allowed_domains: Vec<String>,
     allowed_emails: Vec<String>,
@@ -482,6 +523,12 @@ impl Authenticator {
             mode: auth.mode,
             anonymous_read: auth.anonymous_read,
             tokens: resolve_tokens(&auth.tokens, resolve_env)?,
+            tenant_grants: auth.tenant_grants.clone(),
+            platform_operators: auth
+                .platform_operators
+                .iter()
+                .map(|v| v.to_ascii_lowercase())
+                .collect(),
             issuer: auth.issuer.trim_end_matches('/').to_string(),
             allowed_domains: auth
                 .allowed_domains
@@ -551,6 +598,55 @@ impl Authenticator {
     }
     pub fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    fn principal(
+        &self,
+        name: String,
+        write: bool,
+        anonymous: bool,
+        allow_operator: bool,
+    ) -> Principal {
+        let tenant_access = self
+            .tenant_grants
+            .iter()
+            .filter(|grant| {
+                grant.principal.eq_ignore_ascii_case(&name)
+                    || (!anonymous && grant.principal == "*")
+            })
+            .map(|grant| TenantAccess {
+                tenant: grant.tenant.clone(),
+                role: grant.role,
+            })
+            .collect();
+        let operator = allow_operator
+            && !anonymous
+            && self
+                .platform_operators
+                .iter()
+                .any(|principal| principal.eq_ignore_ascii_case(&name));
+        Principal {
+            name,
+            write,
+            anonymous,
+            tenant_access,
+            operator,
+            public_read: anonymous,
+        }
+    }
+
+    fn development_principal(name: String) -> Principal {
+        Principal {
+            name,
+            write: true,
+            anonymous: false,
+            tenant_access: vec![TenantAccess {
+                tenant: "*".into(),
+                role: TenantRole::Admin,
+            }],
+            operator: true,
+            public_read: true,
+        }
     }
 
     /// The issuer's discovery document (authorization/token endpoints for the browser flow).
@@ -689,18 +785,21 @@ impl Authenticator {
         else {
             return Ok(caller);
         };
-        if self.mode == AuthMode::None
-            || (caller.write
-                && self
-                    .trusted_forwarders
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(&caller.name)))
+        if forwarded.eq_ignore_ascii_case("anonymous") {
+            return Err(AuthError::Invalid);
+        }
+        if self.mode == AuthMode::None {
+            return Ok(Self::development_principal(forwarded.to_string()));
+        }
+        if caller.write
+            && self
+                .trusted_forwarders
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(&caller.name))
         {
-            return Ok(Principal {
-                name: forwarded.to_string(),
-                write: caller.write,
-                anonymous: false,
-            });
+            // The forwarding hop authenticates the assertion, but it does not lend its
+            // tenant wildcard or operator authority to the end user.
+            return Ok(self.principal(forwarded.to_string(), caller.write, false, false));
         }
         Ok(caller)
     }
@@ -743,20 +842,12 @@ impl Authenticator {
             return None;
         }
         let configured = &self.tokens[matched_index as usize];
-        Some(Principal {
-            name: configured.principal.clone(),
-            write: configured.write,
-            anonymous: false,
-        })
+        Some(self.principal(configured.principal.clone(), configured.write, false, true))
     }
 
     async fn authenticate_inner(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
         match self.mode {
-            AuthMode::None => Ok(Principal {
-                name: "anon".to_string(),
-                write: true,
-                anonymous: false,
-            }),
+            AuthMode::None => Ok(Self::development_principal("anon".to_string())),
             AuthMode::Token => {
                 let presented =
                     bearer_token(headers).or_else(|| basic_credentials(headers).map(|(_, p)| p));
@@ -764,7 +855,7 @@ impl Authenticator {
                     Some(tok) => self
                         .opaque_token_principal(&tok)
                         .unwrap_or(Err(AuthError::Invalid)),
-                    None => Ok(Principal::anonymous()),
+                    None => Ok(self.principal("anonymous".to_string(), false, true, false)),
                 }
             }
             AuthMode::Oidc => {
@@ -803,6 +894,70 @@ impl Authenticator {
             Ok(p)
         } else {
             Err(AuthError::Unauthorized)
+        }
+    }
+
+    async fn require_tenant(
+        &self,
+        headers: &HeaderMap,
+        tenant: &str,
+        action: TenantAction,
+    ) -> Result<Principal, AuthError> {
+        let principal = self.require_read(headers).await?;
+        let Some(role) = principal.tenant_role(tenant) else {
+            return Err(if principal.anonymous {
+                AuthError::Unauthorized
+            } else {
+                AuthError::TenantNotFound
+            });
+        };
+        let allowed = match action {
+            TenantAction::Read => true,
+            TenantAction::Write => principal.write && role >= TenantRole::Writer,
+            TenantAction::Admin => principal.write && role >= TenantRole::Admin,
+        };
+        if allowed {
+            Ok(principal)
+        } else {
+            Err(AuthError::TenantForbidden)
+        }
+    }
+
+    pub async fn require_tenant_read(
+        &self,
+        headers: &HeaderMap,
+        tenant: &str,
+    ) -> Result<Principal, AuthError> {
+        self.require_tenant(headers, tenant, TenantAction::Read)
+            .await
+    }
+
+    pub async fn require_tenant_write(
+        &self,
+        headers: &HeaderMap,
+        tenant: &str,
+    ) -> Result<Principal, AuthError> {
+        self.require_tenant(headers, tenant, TenantAction::Write)
+            .await
+    }
+
+    pub async fn require_tenant_admin(
+        &self,
+        headers: &HeaderMap,
+        tenant: &str,
+    ) -> Result<Principal, AuthError> {
+        self.require_tenant(headers, tenant, TenantAction::Admin)
+            .await
+    }
+
+    pub async fn require_operator(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        let principal = self.authenticate(headers).await?;
+        if principal.anonymous {
+            Err(AuthError::Unauthorized)
+        } else if principal.operator {
+            Ok(principal)
+        } else {
+            Err(AuthError::Forbidden)
         }
     }
 
@@ -870,11 +1025,7 @@ impl Authenticator {
             None => allowed,
             Some(domains) => domains.iter().any(|d| d == &domain_lower),
         };
-        Ok(Principal {
-            name: email,
-            write,
-            anonymous: false,
-        })
+        Ok(self.principal(email, write, false, true))
     }
 }
 
@@ -903,6 +1054,8 @@ pub enum AuthError {
     Invalid,
     Unauthorized,
     Forbidden,
+    TenantForbidden,
+    TenantNotFound,
     Unavailable,
 }
 
@@ -910,7 +1063,8 @@ impl AuthError {
     pub fn status(&self) -> StatusCode {
         match self {
             AuthError::Invalid | AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
-            AuthError::Forbidden => StatusCode::FORBIDDEN,
+            AuthError::Forbidden | AuthError::TenantForbidden => StatusCode::FORBIDDEN,
+            AuthError::TenantNotFound => StatusCode::NOT_FOUND,
             AuthError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -1328,6 +1482,13 @@ mod tests {
         );
     }
 
+    fn tenant_grant(principal: &str, tenant: &str, role: TenantRole) -> walgit_config::TenantGrant {
+        walgit_config::TenantGrant {
+            principal: principal.into(),
+            tenant: tenant.into(),
+            role,
+        }
+    }
     #[tokio::test]
     async fn token_mode_accepts_bearer_and_basic_and_rejects_the_rest() {
         let mut cfg = walgit_config::Config::default();
@@ -1376,6 +1537,71 @@ mod tests {
         cfg.server.auth.trusted_forwarders.clear();
         let auth = Authenticator::new(&cfg).unwrap();
         assert_eq!(auth.authenticate(&headers).await.unwrap().name, "front");
+    }
+
+    #[tokio::test]
+    async fn tenant_roles_are_scoped_and_fail_closed() {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.anonymous_read = true;
+        cfg.server.auth.tokens = vec![static_token("alice", "secret", true)];
+        cfg.server.auth.tenant_grants = vec![
+            tenant_grant("alice", "acme", TenantRole::Admin),
+            tenant_grant("alice", "beta", TenantRole::Reader),
+            tenant_grant("*", "shared", TenantRole::Reader),
+        ];
+        let auth = Authenticator::new(&cfg).unwrap();
+        let headers = bearer("secret");
+        assert!(auth.require_tenant_admin(&headers, "acme").await.is_ok());
+        assert!(auth.require_tenant_read(&headers, "beta").await.is_ok());
+        assert!(matches!(
+            auth.require_tenant_write(&headers, "beta").await,
+            Err(AuthError::TenantForbidden)
+        ));
+        assert!(matches!(
+            auth.require_tenant_read(&headers, "missing").await,
+            Err(AuthError::TenantNotFound)
+        ));
+        assert!(matches!(
+            auth.require_tenant_read(&HeaderMap::new(), "shared").await,
+            Err(AuthError::Unauthorized)
+        ));
+
+        cfg.server
+            .auth
+            .tenant_grants
+            .push(tenant_grant("anonymous", "public", TenantRole::Reader));
+        let auth = Authenticator::new(&cfg).unwrap();
+        assert!(
+            auth.require_tenant_read(&HeaderMap::new(), "public")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_forwarder_resolves_end_user_tenant_grants() {
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auth.tokens = vec![static_token("front", "secret", true)];
+        cfg.server.auth.trusted_forwarders = vec!["front".into()];
+        cfg.server.auth.platform_operators = vec!["front".into()];
+        cfg.server.auth.tenant_grants = vec![
+            tenant_grant("front", "*", TenantRole::Admin),
+            tenant_grant("user@example.com", "acme", TenantRole::Writer),
+        ];
+        let auth = Authenticator::new(&cfg).unwrap();
+        let mut headers = bearer("secret");
+        headers.insert("x-walgit-principal", "user@example.com".parse().unwrap());
+
+        let principal = auth.require_tenant_write(&headers, "acme").await.unwrap();
+        assert_eq!(principal.name, "user@example.com");
+        assert!(!principal.is_operator());
+        assert!(matches!(
+            auth.require_tenant_read(&headers, "beta").await,
+            Err(AuthError::TenantNotFound)
+        ));
     }
 
     #[tokio::test]

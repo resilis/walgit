@@ -29,7 +29,11 @@ pub async fn list(
     if !st.cfg.bundles.advertise {
         return Err(ApiError::NotFound("bundles disabled".into()));
     }
-    let principal = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     // This principal tried bundle-uri (see `smart::bundle_fallback_allowed`).
     st.caches.bundle_attempts.insert(
         format!("{}\0{}", route.id, principal.name),
@@ -114,7 +118,11 @@ pub async fn object(
     method: &Method,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
+    let principal = st
+        .auth
+        .require_tenant_read(headers, route.id.owner())
+        .await
+        .map_err(auth_err)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
 
@@ -136,6 +144,8 @@ pub async fn object(
         headers,
         static_object::ServeOptions {
             content_type: "application/x-git-bundle",
+            cache_control: (!principal.public_cache_allowed())
+                .then_some(static_object::PRIVATE_IMMUTABLE),
             accel: st.cfg.server.accel_redirect,
             ..Default::default()
         },
@@ -148,7 +158,10 @@ fn auth_err(e: crate::auth::AuthError) -> ApiError {
         crate::auth::AuthError::Invalid | crate::auth::AuthError::Unauthorized => {
             ApiError::Unauthorized
         }
-        crate::auth::AuthError::Forbidden => ApiError::Forbidden,
+        crate::auth::AuthError::Forbidden | crate::auth::AuthError::TenantForbidden => {
+            ApiError::Forbidden
+        }
+        crate::auth::AuthError::TenantNotFound => ApiError::NotFound("repository".into()),
         crate::auth::AuthError::Unavailable => {
             ApiError::ServiceUnavailable("auth provider unavailable".into())
         }

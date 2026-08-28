@@ -2223,6 +2223,20 @@ async fn test_repo_settings_publish_and_effective_config() {
         2
     );
     assert_eq!(handle.effective_config().bundles.min_commits, 9);
+    let stale = handle
+        .publish_settings_if_revision("[bundles]\nmin_commits = 4\n", "bob", "stale edit", 1)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            stale,
+            walgit_wal::WalError::SettingsConflict {
+                expected: 1,
+                actual: 2
+            }
+        ),
+        "{stale}"
+    );
     assert_eq!(
         handle.publish_settings("", "alice", "clear").await.unwrap(),
         3
