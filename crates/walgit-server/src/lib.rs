@@ -15,6 +15,7 @@ pub mod instance;
 pub mod lfs;
 pub mod lfs_upstream;
 pub mod maintain;
+mod managed_capability;
 pub mod metrics;
 pub mod middleware;
 pub mod ops;

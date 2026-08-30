@@ -31,7 +31,7 @@ pub async fn list(
     }
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     // This principal tried bundle-uri (see `smart::bundle_fallback_allowed`).
@@ -120,7 +120,7 @@ pub async fn object(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let handle = open_repo(st, &route.id, false).await?;

@@ -34,7 +34,12 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use tokio::sync::Mutex;
-use walgit_config::{ACCESS_TOKEN_PREFIX, AuthMode, StaticToken, TenantGrant, TenantRole};
+use walgit_config::{
+    ACCESS_TOKEN_PREFIX, AuthMode, MANAGED_CAPABILITY_PREFIX, StaticToken, TenantGrant, TenantRole,
+};
+use walgit_git::RepoId;
+
+use crate::managed_capability::{ManagedCapabilityVerifier, VerifiedCapability};
 
 /// Client `Authorization` as copied by an edge before it replaces that header with its own
 /// hop credential. Read only when the edge announces `client-authorization`.
@@ -62,6 +67,7 @@ pub struct Principal {
     pub write: bool,
     pub anonymous: bool,
     tenant_access: Vec<TenantAccess>,
+    repository_scope: Option<RepoId>,
     operator: bool,
     public_read: bool,
 }
@@ -79,8 +85,18 @@ impl Principal {
         self.tenant_role(tenant).is_some()
     }
 
+    pub fn can_read_repo(&self, repository: &RepoId) -> bool {
+        self.repository_scope_matches(repository) && self.tenant_role(repository.owner()).is_some()
+    }
+
     pub fn can_admin_tenant(&self, tenant: &str) -> bool {
         self.write && self.tenant_role(tenant) == Some(TenantRole::Admin)
+    }
+
+    pub fn can_admin_repo(&self, repository: &RepoId) -> bool {
+        self.repository_scope_matches(repository)
+            && self.write
+            && self.tenant_role(repository.owner()) == Some(TenantRole::Admin)
     }
 
     pub fn can_write_tenant(&self, tenant: &str) -> bool {
@@ -90,12 +106,32 @@ impl Principal {
                 .is_some_and(|role| role >= TenantRole::Writer)
     }
 
+    pub fn can_write_repo(&self, repository: &RepoId) -> bool {
+        self.repository_scope_matches(repository)
+            && self.write
+            && self
+                .tenant_role(repository.owner())
+                .is_some_and(|role| role >= TenantRole::Writer)
+    }
+
+    fn repository_scope_matches(&self, repository: &RepoId) -> bool {
+        self.repository_scope
+            .as_ref()
+            .is_none_or(|scope| scope == repository)
+    }
+
     pub fn is_operator(&self) -> bool {
         self.operator
     }
 
     pub fn public_cache_allowed(&self) -> bool {
         self.public_read
+    }
+
+    /// Repository-scoped managed authority cannot be represented by the push broker's
+    /// forwarded-principal header and must stay on the verifying host.
+    pub fn is_repository_scoped(&self) -> bool {
+        self.repository_scope.is_some()
     }
 }
 
@@ -422,6 +458,7 @@ pub struct Authenticator {
     anonymous_read: bool,
     /// Resolved once at construction. Plaintext static tokens are never retained.
     tokens: Vec<HashedStaticToken>,
+    managed_tokens: Option<ManagedCapabilityVerifier>,
     tenant_grants: Vec<TenantGrant>,
     platform_operators: Vec<String>,
     issuer: String,
@@ -523,6 +560,11 @@ impl Authenticator {
             mode: auth.mode,
             anonymous_read: auth.anonymous_read,
             tokens: resolve_tokens(&auth.tokens, resolve_env)?,
+            managed_tokens: auth
+                .managed_tokens
+                .as_ref()
+                .map(ManagedCapabilityVerifier::new)
+                .transpose()?,
             tenant_grants: auth.tenant_grants.clone(),
             platform_operators: auth
                 .platform_operators
@@ -630,6 +672,7 @@ impl Authenticator {
             write,
             anonymous,
             tenant_access,
+            repository_scope: None,
             operator,
             public_read: anonymous,
         }
@@ -644,6 +687,7 @@ impl Authenticator {
                 tenant: "*".into(),
                 role: TenantRole::Admin,
             }],
+            repository_scope: None,
             operator: true,
             public_read: true,
         }
@@ -743,6 +787,16 @@ impl Authenticator {
         self.principal_for_email(email).ok()
     }
 
+    /// Require the browser session cookie specifically. Bearer and Basic credentials cannot use
+    /// this seam to mint a longer-lived, unscoped WalGit access token.
+    pub fn require_browser_session(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        if self.mode != AuthMode::Oidc {
+            return Err(AuthError::Unauthorized);
+        }
+        self.authenticate_cookie(headers)
+            .ok_or(AuthError::Unauthorized)
+    }
+
     /// Sliding sessions: a fresh cookie value when the request carries a valid
     /// session older than a quarter of `session_ttl` whose principal still
     /// passes policy — `None` otherwise.
@@ -792,6 +846,7 @@ impl Authenticator {
             return Ok(Self::development_principal(forwarded.to_string()));
         }
         if caller.write
+            && !caller.is_repository_scoped()
             && self
                 .trusted_forwarders
                 .iter()
@@ -806,6 +861,14 @@ impl Authenticator {
 
     /// A static token or an issued access token, from a bearer or a Basic password.
     fn opaque_token_principal(&self, tok: &str) -> Option<Result<Principal, AuthError>> {
+        if let Some(jwt) = tok.strip_prefix(MANAGED_CAPABILITY_PREFIX) {
+            return Some(
+                unix_now()
+                    .and_then(|now| self.managed_tokens.as_ref()?.verify(jwt, now))
+                    .map(Self::managed_principal)
+                    .ok_or(AuthError::Invalid),
+            );
+        }
         if let Some(principal) = self.static_token_principal(tok) {
             return Some(Ok(principal));
         }
@@ -816,6 +879,23 @@ impl Authenticator {
             });
         }
         None
+    }
+
+    fn managed_principal(capability: VerifiedCapability) -> Principal {
+        let write = capability.role >= TenantRole::Writer;
+        let tenant = capability.repository.owner().to_string();
+        Principal {
+            name: capability.subject,
+            write,
+            anonymous: false,
+            tenant_access: vec![TenantAccess {
+                tenant,
+                role: capability.role,
+            }],
+            repository_scope: Some(capability.repository),
+            operator: false,
+            public_read: false,
+        }
     }
 
     fn static_token_principal(&self, token: &str) -> Option<Principal> {
@@ -923,6 +1003,35 @@ impl Authenticator {
         }
     }
 
+    async fn require_repo(
+        &self,
+        headers: &HeaderMap,
+        repository: &RepoId,
+        action: TenantAction,
+    ) -> Result<Principal, AuthError> {
+        let principal = self.require_read(headers).await?;
+        if !principal.repository_scope_matches(repository) {
+            return Err(AuthError::TenantNotFound);
+        }
+        let Some(role) = principal.tenant_role(repository.owner()) else {
+            return Err(if principal.anonymous {
+                AuthError::Unauthorized
+            } else {
+                AuthError::TenantNotFound
+            });
+        };
+        let allowed = match action {
+            TenantAction::Read => true,
+            TenantAction::Write => principal.write && role >= TenantRole::Writer,
+            TenantAction::Admin => principal.write && role >= TenantRole::Admin,
+        };
+        if allowed {
+            Ok(principal)
+        } else {
+            Err(AuthError::TenantForbidden)
+        }
+    }
+
     pub async fn require_tenant_read(
         &self,
         headers: &HeaderMap,
@@ -947,6 +1056,33 @@ impl Authenticator {
         tenant: &str,
     ) -> Result<Principal, AuthError> {
         self.require_tenant(headers, tenant, TenantAction::Admin)
+            .await
+    }
+
+    pub async fn require_repo_read(
+        &self,
+        headers: &HeaderMap,
+        repository: &RepoId,
+    ) -> Result<Principal, AuthError> {
+        self.require_repo(headers, repository, TenantAction::Read)
+            .await
+    }
+
+    pub async fn require_repo_write(
+        &self,
+        headers: &HeaderMap,
+        repository: &RepoId,
+    ) -> Result<Principal, AuthError> {
+        self.require_repo(headers, repository, TenantAction::Write)
+            .await
+    }
+
+    pub async fn require_repo_admin(
+        &self,
+        headers: &HeaderMap,
+        repository: &RepoId,
+    ) -> Result<Principal, AuthError> {
+        self.require_repo(headers, repository, TenantAction::Admin)
             .await
     }
 
@@ -1195,6 +1331,10 @@ fn resolve_tokens(
             !plaintext.is_empty(),
             "server.auth.tokens[{index}] resolves to an empty token"
         );
+        anyhow::ensure!(
+            !plaintext.starts_with(MANAGED_CAPABILITY_PREFIX),
+            "server.auth.tokens[{index}] uses the reserved managed capability prefix"
+        );
         let digest = static_token_digest(&plaintext);
         anyhow::ensure!(
             seen.insert(digest),
@@ -1219,6 +1359,7 @@ mod tests {
     };
     use axum::http::header::AUTHORIZATION;
     use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
     use std::sync::LazyLock;
@@ -1462,6 +1603,18 @@ mod tests {
             "resolved token leaked in error: {err}"
         );
 
+        cfg.server.auth.tokens = vec![static_token(
+            "reserved",
+            "wgc_not-a-managed-capability",
+            true,
+        )];
+        let err = Authenticator::with_key_source_and_env(&cfg, source(), |_| Ok(None))
+            .err()
+            .expect("managed prefix must not be shadowed by a static token")
+            .to_string();
+        assert!(err.contains("reserved managed capability prefix"), "{err}");
+        assert!(!err.contains("wgc_not-a-managed-capability"), "{err}");
+
         cfg.server.auth.tokens = vec![StaticToken {
             principal: "broken-environment".into(),
             token: "resolver-error-fallback-must-not-be-used".into(),
@@ -1488,6 +1641,123 @@ mod tests {
             tenant: tenant.into(),
             role,
         }
+    }
+
+    fn managed_token(role: TenantRole) -> (walgit_config::ManagedTokensConfig, String) {
+        let signing = SigningKey::from_bytes(&[17; 32]);
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signing.verifying_key().to_bytes());
+        let now = unix_now().unwrap();
+        let header = serde_json::json!({
+            "alg": "EdDSA",
+            "typ": "walgit-capability+jwt",
+            "kid": "active"
+        });
+        let claims = serde_json::json!({
+            "v": 1,
+            "iss": "cloud-core",
+            "aud": "walgit-production",
+            "sub": "cloud-core-agent",
+            "tenant": "acme",
+            "repository": "widgets",
+            "role": match role {
+                TenantRole::Reader => "reader",
+                TenantRole::Writer => "writer",
+                TenantRole::Admin => "admin",
+            },
+            "iat": now,
+            "nbf": now,
+            "exp": now + 300
+        });
+        let input = format!("{}.{}", encode_segment(&header), encode_segment(&claims));
+        let signature = signing.sign(input.as_bytes());
+        let token = format!(
+            "{MANAGED_CAPABILITY_PREFIX}{input}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
+        (
+            walgit_config::ManagedTokensConfig {
+                issuer: "cloud-core".into(),
+                audience: "walgit-production".into(),
+                keys: vec![walgit_config::ManagedTokenPublicKey {
+                    kid: "active".into(),
+                    x,
+                }],
+                max_ttl: Duration::from_secs(900),
+            },
+            token,
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_capabilities_use_basic_or_bearer_and_keep_exact_repo_scope() {
+        let (managed, reader_token) = managed_token(TenantRole::Reader);
+        let mut cfg = walgit_config::Config::default();
+        cfg.server.auth.mode = AuthMode::Token;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auth.managed_tokens = Some(managed);
+        cfg.server.auth.tokens = vec![static_token("bootstrap", "static-secret", true)];
+        cfg.server.auth.tenant_grants = vec![
+            tenant_grant("cloud-core-agent", "*", TenantRole::Admin),
+            tenant_grant("bootstrap", "*", TenantRole::Admin),
+        ];
+        cfg.server.auth.platform_operators = vec!["cloud-core-agent".into(), "bootstrap".into()];
+        cfg.server.auth.trusted_forwarders = vec!["cloud-core-agent".into()];
+        let auth = Authenticator::new(&cfg).unwrap();
+        let exact = RepoId::new("acme", "widgets").unwrap();
+        let sibling = RepoId::new("acme", "other").unwrap();
+
+        let bearer_headers = bearer(&reader_token);
+        let principal = auth
+            .require_repo_read(&bearer_headers, &exact)
+            .await
+            .unwrap();
+        assert_eq!(principal.name, "cloud-core-agent");
+        assert!(principal.is_repository_scoped());
+        assert!(!principal.is_operator());
+        assert!(matches!(
+            auth.require_repo_write(&bearer_headers, &exact).await,
+            Err(AuthError::TenantForbidden)
+        ));
+        assert!(matches!(
+            auth.require_repo_read(&bearer_headers, &sibling).await,
+            Err(AuthError::TenantNotFound)
+        ));
+        assert!(matches!(
+            auth.require_repo_admin(&bearer_headers, &exact).await,
+            Err(AuthError::TenantForbidden)
+        ));
+        assert!(matches!(
+            auth.require_operator(&bearer_headers).await,
+            Err(AuthError::Forbidden)
+        ));
+
+        let mut forwarded = bearer_headers.clone();
+        forwarded.insert("x-walgit-principal", "bootstrap".parse().unwrap());
+        assert_eq!(
+            auth.authenticate(&forwarded).await.unwrap().name,
+            "cloud-core-agent"
+        );
+        assert!(
+            auth.require_repo_read(&basic("git", &reader_token), &exact)
+                .await
+                .is_ok()
+        );
+
+        let static_headers = bearer("static-secret");
+        assert!(
+            auth.require_repo_admin(&static_headers, &sibling)
+                .await
+                .is_ok()
+        );
+        assert!(auth.require_operator(&static_headers).await.is_ok());
+        assert!(matches!(
+            auth.authenticate(&bearer(
+                reader_token.trim_start_matches(MANAGED_CAPABILITY_PREFIX)
+            ))
+            .await,
+            Err(AuthError::Invalid)
+        ));
     }
     #[tokio::test]
     async fn token_mode_accepts_bearer_and_basic_and_rejects_the_rest() {

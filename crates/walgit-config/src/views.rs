@@ -211,6 +211,7 @@ pub struct SafeAuthView {
     pub mode: AuthMode,
     pub anonymous_read: bool,
     pub tokens: Vec<SafeStaticTokenView>,
+    pub managed_tokens: Option<SafeManagedTokensView>,
     pub issuer: Option<String>,
     pub allowed_domains: Vec<String>,
     pub allowed_emails: Vec<String>,
@@ -224,6 +225,15 @@ pub struct SafeAuthView {
     pub access_token_ttl: Duration,
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SafeManagedTokensView {
+    pub issuer: String,
+    pub audience: String,
+    pub key_ids: Vec<String>,
+    #[serde(with = "humantime_serde")]
+    pub max_ttl: Duration,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +461,14 @@ impl SafeConfigView {
                             write: token.write,
                         })
                         .collect(),
+                    managed_tokens: auth.managed_tokens.as_ref().map(|managed| {
+                        SafeManagedTokensView {
+                            issuer: managed.issuer.clone(),
+                            audience: managed.audience.clone(),
+                            key_ids: managed.keys.iter().map(|key| key.kid.clone()).collect(),
+                            max_ttl: managed.max_ttl,
+                        }
+                    }),
                     issuer: diagnostic_url(&auth.issuer),
                     allowed_domains: auth.allowed_domains.clone(),
                     allowed_emails: auth.allowed_emails.clone(),

@@ -5737,6 +5737,7 @@ name = "walgit-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytesize",
  "cron",
  "humantime-serde",
@@ -5840,6 +5841,7 @@ dependencies = [
  "bytesize",
  "chrono",
  "dashmap",
+ "ed25519-dalek",
  "futures",
  "gix-actor",
  "gix-date",

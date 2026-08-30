@@ -165,11 +165,7 @@ async fn repo_index_route(State(state): State<Arc<AppState>>, req: Request<Body>
     let Some(route) = crate::repo::parse_repo_route(req.uri().path()) else {
         return ApiError::NotFound("repository".into()).into_response();
     };
-    match state
-        .auth
-        .require_tenant_read(req.headers(), route.id.owner())
-        .await
-    {
+    match state.auth.require_repo_read(req.headers(), &route.id).await {
         Ok(_) => index(req.method(), req.headers()),
         Err(error) => auth_err(error).into_response(),
     }
@@ -605,7 +601,7 @@ async fn overview(
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     state
         .auth
-        .require_tenant_read(&headers, id.owner())
+        .require_repo_read(&headers, &id)
         .await
         .map_err(auth_err)?;
     let handle = state.registry.open(&id).await.map_err(wal_err)?;
@@ -1079,7 +1075,7 @@ async fn ops_list(
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     state
         .auth
-        .require_tenant_read(&headers, id.owner())
+        .require_repo_read(&headers, &id)
         .await
         .map_err(auth_err)?;
     let body = OpsInfo {
@@ -1118,7 +1114,7 @@ async fn ops_start(
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     let principal = state
         .auth
-        .require_tenant_admin(&headers, id.owner())
+        .require_repo_admin(&headers, &id)
         .await
         .map_err(auth_err)?;
     // Make sure the repo exists before spawning anything.
@@ -1146,7 +1142,7 @@ async fn tasks_list(
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     state
         .auth
-        .require_tenant_read(&headers, id.owner())
+        .require_repo_read(&headers, &id)
         .await
         .map_err(auth_err)?;
     let tasks = state.registry.tasks();
@@ -1177,7 +1173,7 @@ async fn task_stream(
         walgit_git::RepoId::new(&owner, &repo).map_err(|e| ApiError::NotFound(e.to_string()))?;
     state
         .auth
-        .require_tenant_read(&headers, id.owner())
+        .require_repo_read(&headers, &id)
         .await
         .map_err(auth_err)?;
     let task = state

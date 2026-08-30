@@ -84,14 +84,14 @@ pub async fn batch(
     // inside the body then decides whether Reader or Writer is required.
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let body_bytes = crate::collect_body(body).await?;
     let body: BatchRequest = serde_json::from_slice(&body_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid lfs batch: {e}")))?;
     let is_upload = body.operation == "upload";
-    if is_upload && !principal.can_write_tenant(route.id.owner()) {
+    if is_upload && !principal.can_write_repo(&route.id) {
         return Err(ApiError::Forbidden);
     }
     not_served_here(st, &route.id)?;
@@ -230,7 +230,7 @@ pub async fn get_object(
     }
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
@@ -411,7 +411,7 @@ pub async fn put_object(
     }
     let _ = st
         .auth
-        .require_tenant_write(headers, route.id.owner())
+        .require_repo_write(headers, &route.id)
         .await
         .map_err(auth_err)?;
     not_served_here(st, &route.id)?;
@@ -453,7 +453,7 @@ pub async fn verify(
     }
     let _ = st
         .auth
-        .require_tenant_write(headers, route.id.owner())
+        .require_repo_write(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let body_bytes = crate::collect_body(body).await?;

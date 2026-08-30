@@ -151,7 +151,13 @@ each repository one maintainer (placement globs) and you are done.
 | `token` | static `tokens` in the config (`token_env` reads the secret from the environment) | `Authorization: Bearer <token>`, or the token as an HTTP Basic password |
 | `oidc` | any OpenID Connect issuer (`issuer`, `oauth_client_id/secret`, `allowed_domains`/`allowed_emails`): Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab… | a **walgit access token**: sign in once in the browser, create one at `/_auth/tokens`, paste it into the installer. Stateless (HMAC with `session_secret`, `access_token_ttl`); rotating the secret revokes all. ID tokens from the issuer (`audiences`) and static `tokens` work too. |
 
-For `token` and `oidc`, `tenant_grants` are required for repository access. An operator-only host
+`token` and `oidc` can also enable `server.auth.managed_tokens`. Cloud Core then issues `wgc_` EdDSA JWTs
+that expire within 15 minutes and bind one exact owner, repository, and `reader`, `writer`, or `admin` role.
+WalGit stores at most four public Ed25519 keys and no managed signing secret. Git can send the capability as a
+Bearer token or an HTTP Basic password. Managed capabilities cannot become platform operators, inherit static
+tenant grants, mint `wgt_` tokens, or access sibling repositories.
+
+For `token` and `oidc`, `tenant_grants` are required for non-managed repository access. An operator-only host
 can instead list only `platform_operators`. The repository owner is the tenant:
 `reader` can fetch and browse, `writer` can also push and upload LFS objects, and `admin` can
 also create/delete repositories and change policy, settings, and maintenance operations. A `*`

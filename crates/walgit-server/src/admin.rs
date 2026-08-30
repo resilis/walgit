@@ -18,7 +18,7 @@ pub async fn create(
 ) -> Result<Response, ApiError> {
     let _principal = st
         .auth
-        .require_tenant_admin(headers, route.id.owner())
+        .require_repo_admin(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let format = match query
@@ -51,7 +51,7 @@ pub async fn delete(
 ) -> Result<Response, ApiError> {
     let _principal = st
         .auth
-        .require_tenant_admin(headers, route.id.owner())
+        .require_repo_admin(headers, &route.id)
         .await
         .map_err(auth_err)?;
     st.registry.delete(&route.id).await.map_err(wal_err)?;
@@ -64,7 +64,7 @@ pub async fn list_repos(st: &AppState, headers: &HeaderMap) -> Result<Response, 
     let repos = st.registry.list().await.map_err(wal_err)?;
     let body = repos
         .into_iter()
-        .filter(|repo| principal.can_read_tenant(repo.owner()))
+        .filter(|repo| principal.can_read_repo(repo))
         .map(|r| r.to_string())
         .collect::<Vec<_>>()
         .join("\n");

@@ -145,6 +145,9 @@ pub struct AuthConfig {
     /// Static tokens (`token` mode, and accepted in `oidc` mode too — for robots): token → principal.
     /// Presented as `Authorization: Bearer <token>` or as the password of HTTP Basic.
     pub tokens: Vec<StaticToken>,
+    /// Optional verifier for short-lived repository capabilities issued by the managed control
+    /// plane. This channel is available in `token` and `oidc` modes and contains public keys only.
+    pub managed_tokens: Option<ManagedTokensConfig>,
     /// Repository-owner authorization. The existing `owner` path component is the tenant key.
     /// A principal or tenant of `*` is a wildcard; wildcard principals never match anonymous
     /// requests. Multiple entries combine by taking the strongest matching role.
@@ -192,6 +195,8 @@ pub struct AuthConfig {
 /// Prefix of access tokens walgit mints itself (`/_auth/tokens`): recognisable in logs and
 /// secret scanners, never confused with an ID token.
 pub const ACCESS_TOKEN_PREFIX: &str = "wgt_";
+/// Prefix of managed repository capabilities. The remainder is a strict EdDSA JWT.
+pub const MANAGED_CAPABILITY_PREFIX: &str = "wgc_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -223,6 +228,31 @@ pub struct TenantGrant {
     /// Exact repository owner, or `*` for every owner.
     pub tenant: String,
     pub role: TenantRole,
+}
+
+/// Public verification configuration for managed repository capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTokensConfig {
+    /// Exact issuer claim. Cloud Core is the sole producer in the managed deployment.
+    pub issuer: String,
+    /// Exact audience claim for this WalGit deployment.
+    pub audience: String,
+    /// At most four Ed25519 public keys permit bounded key rotation.
+    pub keys: Vec<ManagedTokenPublicKey>,
+    /// Maximum accepted `exp - iat`. Schema v1 has a hard 15-minute ceiling.
+    #[serde(with = "humantime_serde")]
+    pub max_ttl: Duration,
+}
+
+/// One Ed25519 public JWK reduced to the fields the capability verifier accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTokenPublicKey {
+    /// Exact JWT `kid`, 1..=64 characters from ASCII `[A-Za-z0-9._-]`.
+    pub kid: String,
+    /// Base64url without padding of the exact 32-byte Ed25519 public key.
+    pub x: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1184,6 +1214,14 @@ fn valid_repo_part(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+fn valid_managed_claim_string(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -1229,6 +1267,7 @@ impl Default for AuthConfig {
             mode: AuthMode::None,
             anonymous_read: true,
             tokens: vec![],
+            managed_tokens: None,
             tenant_grants: vec![],
             platform_operators: vec![],
             issuer: "https://accounts.google.com".into(),
@@ -1772,6 +1811,14 @@ impl Config {
                 "authenticated GCS tenants must serve LFS and bundles through the proxy because GCS signed URLs inherit public object cache metadata"
             );
         }
+        if self.server.auth.managed_tokens.is_some() {
+            anyhow::ensure!(
+                self.lfs.serve_via == BundleServe::Proxy
+                    && self.bundles.serve_via == BundleServe::Proxy
+                    && self.bundles.signed_url_for.is_empty(),
+                "server.auth.managed_tokens requires proxy-only LFS and bundle serving so a signed URL cannot outlive a repository capability"
+            );
+        }
         for o in &self.server.cors_origins {
             let host = o
                 .strip_prefix("https://")
@@ -1793,8 +1840,8 @@ impl Config {
         };
         if a.mode == AuthMode::Token {
             anyhow::ensure!(
-                !a.tokens.is_empty(),
-                "server.auth.tokens must list at least one token in token mode"
+                !a.tokens.is_empty() || a.managed_tokens.is_some(),
+                "server.auth.tokens or server.auth.managed_tokens must configure at least one credential in token mode"
             );
         }
         for (index, t) in a.tokens.iter().enumerate() {
@@ -1816,6 +1863,55 @@ impl Config {
                 !t.token.is_empty() || t.token_env.is_some(),
                 "server.auth.tokens[{index}] needs `token` or `token_env`"
             );
+        }
+        if let Some(managed) = &a.managed_tokens {
+            use base64::Engine;
+
+            anyhow::ensure!(
+                a.mode != AuthMode::None,
+                "server.auth.managed_tokens requires token or oidc mode"
+            );
+            anyhow::ensure!(
+                valid_managed_claim_string(&managed.issuer),
+                "server.auth.managed_tokens.issuer must be 1..=256 printable ASCII characters"
+            );
+            anyhow::ensure!(
+                valid_managed_claim_string(&managed.audience),
+                "server.auth.managed_tokens.audience must be 1..=256 printable ASCII characters"
+            );
+            anyhow::ensure!(
+                (1..=4).contains(&managed.keys.len()),
+                "server.auth.managed_tokens.keys must contain 1..=4 public keys"
+            );
+            anyhow::ensure!(
+                (1..=900).contains(&managed.max_ttl.as_secs()),
+                "server.auth.managed_tokens.max_ttl must be between 1s and 15m"
+            );
+            let mut kids = std::collections::HashSet::with_capacity(managed.keys.len());
+            for (index, key) in managed.keys.iter().enumerate() {
+                anyhow::ensure!(
+                    !key.kid.is_empty()
+                        && key.kid.len() <= 64
+                        && key.kid.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                        }),
+                    "server.auth.managed_tokens.keys[{index}].kid must use 1..=64 ASCII [A-Za-z0-9._-] characters"
+                );
+                anyhow::ensure!(
+                    kids.insert(key.kid.as_str()),
+                    "server.auth.managed_tokens.keys contains a duplicate kid"
+                );
+                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&key.x)
+                    .ok();
+                anyhow::ensure!(
+                    decoded.as_deref().is_some_and(|bytes| bytes.len() == 32)
+                        && decoded.as_ref().is_some_and(|bytes| {
+                            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes) == key.x
+                        }),
+                    "server.auth.managed_tokens.keys[{index}].x must be canonical unpadded base64url for exactly 32 bytes"
+                );
+            }
         }
         for grant in &a.tenant_grants {
             anyhow::ensure!(
@@ -1881,8 +1977,10 @@ impl Config {
         }
         if a.mode != AuthMode::None {
             anyhow::ensure!(
-                !a.tenant_grants.is_empty() || !a.platform_operators.is_empty(),
-                "server.auth.tenant_grants or server.auth.platform_operators must list at least one authorization in token or oidc mode"
+                !a.tenant_grants.is_empty()
+                    || !a.platform_operators.is_empty()
+                    || a.managed_tokens.is_some(),
+                "server.auth must configure tenant_grants, platform_operators, or managed_tokens in token or oidc mode"
             );
         }
         if a.mode == AuthMode::Token && a.anonymous_read {
@@ -2939,6 +3037,103 @@ audiences = ["walgit-cli", "https://git.example.com"]
     }
 
     #[test]
+    fn managed_token_verifier_is_bounded_and_needs_no_static_tenant_grant() {
+        const KEY_X: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let valid = format!(
+            r#"
+[store]
+bucket = "b"
+[server.auth]
+mode = "token"
+anonymous_read = false
+[server.auth.managed_tokens]
+issuer = "cloud-core"
+audience = "walgit-production"
+max_ttl = "15m"
+keys = [{{ kid = "2026-08", x = "{KEY_X}" }}]
+"#,
+        );
+        let parsed = Config::parse(&valid).expect("managed verifier configuration");
+        let managed = parsed
+            .server
+            .auth
+            .managed_tokens
+            .as_ref()
+            .expect("managed verifier");
+        assert_eq!(managed.keys.len(), 1);
+        assert!(parsed.server.auth.tokens.is_empty());
+        assert!(parsed.server.auth.tenant_grants.is_empty());
+
+        for (name, configure) in [
+            (
+                "LFS signed URL",
+                (|cfg: &mut Config| cfg.lfs.serve_via = BundleServe::SignedUrl) as fn(&mut Config),
+            ),
+            ("bundle signed URL", |cfg: &mut Config| {
+                cfg.bundles.serve_via = BundleServe::SignedUrl
+            }),
+            ("per-repo signed bundle URL", |cfg: &mut Config| {
+                cfg.bundles.signed_url_for = vec!["acme/widgets".into()]
+            }),
+        ] {
+            let mut unsafe_config = parsed.clone();
+            unsafe_config.store.backend = StoreBackend::Memory;
+            configure(&mut unsafe_config);
+            let err = unsafe_config.validate().unwrap_err().to_string();
+            assert!(err.contains("proxy-only"), "{name}: {err}");
+        }
+
+        for (name, input, expected) in [
+            (
+                "none mode",
+                valid.replace("mode = \"token\"", "mode = \"none\""),
+                "requires token or oidc mode",
+            ),
+            (
+                "zero ttl",
+                valid.replace("max_ttl = \"15m\"", "max_ttl = \"0s\""),
+                "between 1s and 15m",
+            ),
+            (
+                "overlong ttl",
+                valid.replace("max_ttl = \"15m\"", "max_ttl = \"901s\""),
+                "between 1s and 15m",
+            ),
+            (
+                "bad key bytes",
+                valid.replace(KEY_X, "AA"),
+                "exactly 32 bytes",
+            ),
+            (
+                "padded key",
+                valid.replace(KEY_X, &format!("{KEY_X}=")),
+                "canonical unpadded base64url",
+            ),
+            (
+                "bad kid",
+                valid.replace("kid = \"2026-08\"", "kid = \"bad/kid\""),
+                "keys[0].kid",
+            ),
+            (
+                "duplicate kid",
+                valid.replace(
+                    &format!("keys = [{{ kid = \"2026-08\", x = \"{KEY_X}\" }}]"),
+                    &format!(
+                        "keys = [{{ kid = \"same\", x = \"{KEY_X}\" }}, {{ kid = \"same\", x = \"{KEY_X}\" }}]"
+                    ),
+                ),
+                "duplicate kid",
+            ),
+        ] {
+            let err = Config::parse(&input)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{name}: {err}");
+            assert!(!err.contains(KEY_X), "{name} leaked public key material: {err}");
+        }
+    }
+
+    #[test]
     fn upstream_urls_reject_credential_and_suffix_channels() {
         let mut cfg = Config::default();
         cfg.store.bucket = "b".into();
@@ -3207,6 +3402,15 @@ audiences = ["walgit-cli", "https://git.example.com"]
         }];
         cfg.server.auth.session_secret = Some("safe-view-session-secret-sentinel".repeat(2));
         cfg.server.auth.oauth_client_secret = Some("safe-view-oauth-secret-sentinel".into());
+        cfg.server.auth.managed_tokens = Some(ManagedTokensConfig {
+            issuer: "cloud-core".into(),
+            audience: "walgit-production".into(),
+            keys: vec![ManagedTokenPublicKey {
+                kid: "managed-key-id".into(),
+                x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            }],
+            max_ttl: Duration::from_secs(900),
+        });
         cfg.wal.push_broker_token = Some("safe-view-broker-token-sentinel".into());
         cfg.events.webhook_secret = Some("safe-view-webhook-secret-sentinel".into());
         cfg.server.public_url = Some(
@@ -3242,6 +3446,7 @@ audiences = ["walgit-cli", "https://git.example.com"]
         assert!(text.contains("diagnostic-bucket"), "{text}");
         assert!(text.contains("deploy-bot"), "{text}");
         assert!(text.contains("DEPLOY_BOT_TOKEN"), "{text}");
+        assert!(text.contains("managed-key-id"), "{text}");
         assert!(text.contains("session_secret_configured = true"), "{text}");
         assert!(
             text.contains("push_broker_token_configured = true"),
@@ -3270,6 +3475,7 @@ audiences = ["walgit-cli", "https://git.example.com"]
             "safe-view-static-token-sentinel",
             "safe-view-session-secret-sentinel",
             "safe-view-oauth-secret-sentinel",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "safe-view-broker-token-sentinel",
             "safe-view-webhook-secret-sentinel",
             "public-user",

@@ -67,6 +67,7 @@ rcgen.workspace = true
 tokio-rustls.workspace = true
 [dev-dependencies]
 aws-lc-rs.workspace = true
+ed25519-dalek.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
