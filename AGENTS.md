@@ -75,7 +75,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write — loopback only),
+- Three base auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write — loopback only),
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
@@ -83,7 +83,12 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   token** (`wgt_…`, HMAC-signed with `session_secret`, minted at `/_auth/tokens` by a signed-in browser, stateless,
   `access_token_ttl`; rotating the secret revokes all), and the HMAC **session cookie** set by `/_auth/login` →
   issuer → `/_auth/callback`. Static `tokens` work in `oidc` mode too (robots). Every path ends in the same
-  allowlist and `write_domains`.
+  allowlist and `write_domains`. In `token` or `oidc` mode, optional
+  `server.auth.managed_tokens` also verifies `wgc_` EdDSA JWT capabilities issued only by the managed control
+  plane. Each capability is valid for at most 15 minutes and binds one exact owner/repository plus one
+  `TenantRole`. WalGit stores only a bounded set of public Ed25519 JWK components. It never mints a managed
+  capability. Managed capabilities work as bearer tokens or HTTP Basic passwords, never become operators,
+  never inherit configured grants, never use push-broker identity forwarding, and cannot mint `wgt_` tokens.
 - Open at the application (no credential): `/healthz`, `/readyz`, `/repos.js`, `/repos.mjs`, `/_auth/*` (the
   sign-in flow itself) and **`/services/public/*`** (data-free; today `install.sh` + `ca.pem`; everything else
   under it 404; never reads repo data or takes a bearer — test `public_lane_serves_only_the_installer_without_auth`).
@@ -291,7 +296,8 @@ decision in §4 — or the PR is; never "fix later".
 - **D12** Auth is `none` | `token` | `oidc` (§1.3). `oidc` is generic OpenID Connect through discovery; the
   walgit-issued access token (`wgt_…`, HMAC, stateless, `/_auth/tokens`) is the credential git uses, so no client
   needs a vendor CLI to mint tokens. An edge that wants to do auth itself uses `auth_request /_auth/check`
-  (`deploy/nginx.conf.example`).
+  (`deploy/nginx.conf.example`). The optional `managed_tokens` verifier is a credential channel inside `token`
+  and `oidc`; it is not a fourth mode.
 - **D13** Long work is a task and is narrated (§2.7); no endpoint may block silently.
 - **D14** Web toolchain: pnpm + Vite only. The build fails unless the optimized SPA artefacts are present.
 - **D15** Repo-scoped API lives at `/{o}/{r}/api/…` (refs, resolve, tree, blob, commits, commit, overview, ops,
@@ -397,6 +403,14 @@ decision in §4 — or the PR is; never "fix later".
   + chain) is for clones, **`bundles/catchup`** (no fulls) is what recipes record in `fetch.bundleURI`. Measured: a
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
+- **D42** **Managed deployment capabilities are short-lived and exact-repository scoped.** Cloud Core is the
+  sole issuer. WalGit verifies `wgc_` EdDSA JWTs against at most four configured public keys. A closed v1 claim
+  binds issuer, audience, subject, owner, repository, `TenantRole`, issued-at, not-before, and expiry. The
+  lifetime is at most 15 minutes with 30 seconds of clock skew. Every repository authorization compares the
+  canonical `RepoId` before applying the existing Reader/Writer/Admin threshold. Owner and global lists filter
+  every result by that exact scope. Managed principals cannot gain ambient grants or operator authority, mint
+  `wgt_` tokens, or pass through principal-only broker forwarding. Managed deployments proxy bundle and LFS
+  bytes so a signed URL cannot outlive the capability.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
@@ -425,7 +439,7 @@ Decision identifiers are stable; gaps in the numbering are intentional.
   suite (`just test-s3` against rustfs, `just test-gcs <bucket>`); "GCS only" is a bug.
 - **Use the rig before prod** (`just dev-store` → `walgit-server --config walgit.standalone.toml`). Per-repo
   settings (D24) with minute-scale slots compress a week of bundle behaviour into 30 minutes.
-- No new auth paths (§1.3). No LIST on hot paths. No unbounded buffering of packs in memory. No full
+- No auth paths outside §1.3. No LIST on hot paths. No unbounded buffering of packs in memory. No full
   materialization above `cache.max_bytes` in budget mode. No silent long operations (make it a task, narrate it).
 - Every immutable response: `immutable` + strong ETag + Range; every ref-dependent response: SWR + ETag.
 - Before changing the wire/store formats: proto is append-only; manifests/log entries must stay replayable by

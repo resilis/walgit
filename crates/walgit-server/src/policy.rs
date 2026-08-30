@@ -659,7 +659,7 @@ pub async fn http_get(
 ) -> Result<Response, ApiError> {
     let _ = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     ensure_repo(st, route).await?;
@@ -685,7 +685,7 @@ pub async fn http_put(
 ) -> Result<Response, ApiError> {
     let _ = st
         .auth
-        .require_tenant_admin(headers, route.id.owner())
+        .require_repo_admin(headers, &route.id)
         .await
         .map_err(auth_err)?;
     ensure_repo(st, route).await?;
@@ -704,7 +704,7 @@ pub async fn http_delete(
 ) -> Result<Response, ApiError> {
     let _ = st
         .auth
-        .require_tenant_admin(headers, route.id.owner())
+        .require_repo_admin(headers, &route.id)
         .await
         .map_err(auth_err)?;
     ensure_repo(st, route).await?;

@@ -57,7 +57,7 @@ pub async fn http_get(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -89,7 +89,7 @@ pub async fn http_effective(
 ) -> Result<Response, ApiError> {
     let _ = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -122,7 +122,7 @@ pub async fn http_history(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -166,7 +166,7 @@ pub async fn http_put(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_admin(headers, route.id.owner())
+        .require_repo_admin(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -212,7 +212,7 @@ pub async fn http_delete(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_admin(headers, route.id.owner())
+        .require_repo_admin(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -369,7 +369,7 @@ pub async fn http_describe(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -558,7 +558,7 @@ pub async fn http_validate(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;
@@ -599,7 +599,7 @@ pub async fn http_policy_validate(
 ) -> Result<Response, ApiError> {
     let _ = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let _ = open(st, route).await?;
@@ -627,7 +627,7 @@ pub async fn http_policy_dry_run(
 ) -> Result<Response, ApiError> {
     let _ = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
     let h = open(st, route).await?;

@@ -40,11 +40,9 @@ pub async fn info_refs(
     // Auth: read for upload-pack, write for receive-pack advertisement.
     let is_receive = service_param == "git-receive-pack";
     let auth_result = if is_receive {
-        st.auth
-            .require_tenant_write(headers, route.id.owner())
-            .await
+        st.auth.require_repo_write(headers, &route.id).await
     } else {
-        st.auth.require_tenant_read(headers, route.id.owner()).await
+        st.auth.require_repo_read(headers, &route.id).await
     };
     let principal = match auth_result {
         Ok(principal) => principal,
@@ -84,7 +82,7 @@ pub async fn info_refs(
         other => return Err(ApiError::BadRequest(format!("unknown service: {other}"))),
     };
 
-    let create_if_missing = is_receive && principal.can_admin_tenant(route.id.owner());
+    let create_if_missing = is_receive && principal.can_admin_repo(&route.id);
     let handle = open_repo(st, &route.id, create_if_missing).await?;
     // Advertisements need refs only: never wait for (or require) the pack set.
     let _guard = handle.sync_refs().await.map_err(wal_err)?;
@@ -186,7 +184,7 @@ pub async fn upload_pack(
     body: Body,
 ) -> Result<Response, ApiError> {
     st.auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .map_err(auth_err)?;
 
@@ -647,7 +645,7 @@ async fn narrated_fetch(
     let repo = route.id.to_string();
     let who = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .ok()
         .map(|p| p.name)
@@ -918,7 +916,7 @@ pub async fn receive_pack(
 ) -> Result<Response, ApiError> {
     let principal = st
         .auth
-        .require_tenant_write(headers, route.id.owner())
+        .require_repo_write(headers, &route.id)
         .await
         .map_err(auth_err)?;
     if let Some(msg) = push_url_must_be_git(st, route, headers) {
@@ -996,6 +994,7 @@ pub async fn receive_pack(
         .as_deref()
         .filter(|url| !url.trim().is_empty())
         && !already_forwarded
+        && !principal.is_repository_scoped()
     {
         let content_len = headers
             .get(axum::http::header::CONTENT_LENGTH)
@@ -1048,7 +1047,7 @@ pub async fn receive_pack(
         }
     }
 
-    let handle = open_repo(st, &route.id, principal.can_admin_tenant(route.id.owner())).await?;
+    let handle = open_repo(st, &route.id, principal.can_admin_repo(&route.id)).await?;
 
     let enc = headers
         .get(axum::http::header::CONTENT_ENCODING)
@@ -1666,7 +1665,7 @@ async fn bundle_fallback_allowed(
 ) -> Option<String> {
     let who = st
         .auth
-        .require_tenant_read(headers, route.id.owner())
+        .require_repo_read(headers, &route.id)
         .await
         .ok()?
         .name;

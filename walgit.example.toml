@@ -69,6 +69,16 @@ anonymous_read = true             # must be false in oidc mode
 # principal = "alice"                     # exact principal, or "*" for authenticated principals only
 # tenant = "acme"                         # exact repository owner, or "*"
 # role = "admin"                          # "reader" | "writer" | "admin"
+#
+# Optional managed credential channel inside token/oidc mode. Cloud Core keeps the private key and issues
+# `wgc_` EdDSA JWTs for one exact owner/repository and role, valid for at most 15 minutes. WalGit stores only
+# public Ed25519 JWK `x` values. Configure 1..=4 unique key IDs for bounded rotation. Managed credentials work
+# as Bearer tokens or HTTP Basic passwords. They never inherit tenant_grants or platform_operators.
+# [server.auth.managed_tokens]
+# issuer = "cloud-core"
+# audience = "walgit-production"
+# max_ttl = "15m"
+# keys = [{ kid = "2026-08", x = "<unpadded-base64url-of-32-byte-ed25519-public-key>" }]
 
 [store]
 backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)

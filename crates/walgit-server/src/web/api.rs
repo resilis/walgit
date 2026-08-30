@@ -295,7 +295,7 @@ async fn open(
 ) -> Result<Arc<RepoHandle>, ApiError> {
     let id = walgit_git::RepoId::new(owner, name).map_err(|_| not_found("repository"))?;
     st.auth
-        .require_tenant_read(headers, id.owner())
+        .require_repo_read(headers, &id)
         .await
         .map_err(auth_err)?;
     st.registry.open(&id).await.map_err(|e| match e {
@@ -479,7 +479,7 @@ pub(crate) async fn owners(
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos
         .into_iter()
-        .filter(|repo| principal.can_read_tenant(repo.owner()))
+        .filter(|repo| principal.can_read_repo(repo))
         .map(|r| r.owner().to_string())
         .collect();
     out.sort();
@@ -491,14 +491,11 @@ pub(crate) async fn owner_repos(
     headers: HeaderMap,
     Path(owner): Path<String>,
 ) -> Result<Response, ApiError> {
-    st.auth
-        .require_tenant_read(&headers, &owner)
-        .await
-        .map_err(auth_err)?;
+    let principal = st.auth.require_read(&headers).await.map_err(auth_err)?;
     let repos = st.registry.list().await.map_err(internal)?;
     let mut out: Vec<String> = repos
         .into_iter()
-        .filter(|r| r.owner() == owner)
+        .filter(|r| r.owner() == owner && principal.can_read_repo(r))
         .map(|r| r.name().to_string())
         .collect();
     out.sort();

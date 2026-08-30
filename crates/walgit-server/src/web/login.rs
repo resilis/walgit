@@ -479,8 +479,8 @@ async fn mint_token(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     {
         return crate::error::ApiError::Forbidden.into_response();
     }
-    let principal = match st.auth.authenticate(&headers).await {
-        Ok(p) if !p.anonymous => p,
+    let principal = match st.auth.require_browser_session(&headers) {
+        Ok(p) => p,
         _ => return crate::error::ApiError::Unauthorized.into_response(),
     };
     let Some(token) = st.auth.access_token(&principal.name) else {
@@ -506,7 +506,7 @@ async fn mint_token(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 /// `GET /_auth/tokens` — a small page: one button that POSTs and shows the token with the
 /// git one-liner that stores it. Unauthenticated browsers are sent to sign in first.
 async fn tokens_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let signed_in = matches!(st.auth.authenticate(&headers).await, Ok(p) if !p.anonymous);
+    let signed_in = st.auth.require_browser_session(&headers).is_ok();
     if !signed_in {
         let mut r = Redirect::to("/_auth/login?next=%2F_auth%2Ftokens").into_response();
         r.headers_mut()

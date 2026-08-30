@@ -218,7 +218,7 @@ async fn discovery(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         sdk: format!("{base_url}/repos.js"),
         docs: "https://git.example.com/api",
         auth: DiscoveryAuth {
-            bearer: "Authorization: Bearer <token>  (an access token from /_auth/tokens, a static token, or an ID token)".to_string(),
+            bearer: "Authorization: Bearer <token>  (an access token from /_auth/tokens, a static token, an ID token, or a managed repository capability)".to_string(),
             setup: format!("{base_url}/services/setup.json"),
             browser: "fetch(`/{owner}/{repo}/api-browser/…`, {credentials: \"include\"}); on 401 open `authenticate` in a popup and retry",
             authenticate: format!("{base_url}{API_BROWSER}/v1/authenticate"),

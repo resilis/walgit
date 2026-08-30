@@ -630,6 +630,222 @@ async fn tenant_grants_isolate_same_named_repositories_and_admin_actions() -> Te
     Ok(())
 }
 
+fn managed_test_tokens() -> (
+    walgit_config::ManagedTokensConfig,
+    impl Fn(walgit_config::TenantRole, &str, &str) -> String,
+) {
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    let signing = SigningKey::from_bytes(&[29; 32]);
+    let x =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+    let config = walgit_config::ManagedTokensConfig {
+        issuer: "cloud-core".into(),
+        audience: "walgit-test".into(),
+        keys: vec![walgit_config::ManagedTokenPublicKey {
+            kid: "active".into(),
+            x,
+        }],
+        max_ttl: std::time::Duration::from_secs(900),
+    };
+    let issue = move |role: walgit_config::TenantRole, tenant: &str, repository: &str| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let header = serde_json::json!({
+            "alg": "EdDSA",
+            "typ": "walgit-capability+jwt",
+            "kid": "active"
+        });
+        let claims = serde_json::json!({
+            "v": 1,
+            "iss": "cloud-core",
+            "aud": "walgit-test",
+            "sub": "cloud-core-agent",
+            "tenant": tenant,
+            "repository": repository,
+            "role": match role {
+                walgit_config::TenantRole::Reader => "reader",
+                walgit_config::TenantRole::Writer => "writer",
+                walgit_config::TenantRole::Admin => "admin",
+            },
+            "iat": now,
+            "nbf": now,
+            "exp": now + 300
+        });
+        let encode = |value: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(value).unwrap())
+        };
+        let input = format!("{}.{}", encode(&header), encode(&claims));
+        let signature = signing.sign(input.as_bytes());
+        format!(
+            "wgc_{input}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    };
+    (config, issue)
+}
+
+fn git_with_managed_token(cwd: &std::path::Path, args: &[&str], token: &str) -> TestResult {
+    use base64::Engine as _;
+
+    let credential = base64::engine::general_purpose::STANDARD.encode(format!("git:{token}"));
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .envs([
+            ("GIT_AUTHOR_NAME", "walgit test"),
+            ("GIT_AUTHOR_EMAIL", "test@walgit"),
+            ("GIT_COMMITTER_NAME", "walgit test"),
+            ("GIT_COMMITTER_EMAIL", "test@walgit"),
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+        ])
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!("Authorization: Basic {credential}"),
+        )
+        .args(args)
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "authenticated git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_capabilities_scope_clone_fetch_push_and_admin_to_one_repo() -> TestResult {
+    use walgit_config::{AuthMode, StaticToken, TenantGrant, TenantRole};
+
+    let (managed, issue) = managed_test_tokens();
+    let reader = issue(TenantRole::Reader, "acme", "app");
+    let writer = issue(TenantRole::Writer, "acme", "app");
+    let admin = issue(TenantRole::Admin, "acme", "app");
+    let server = Server::start_with_tweak(move |cfg| {
+        cfg.server.auth.mode = AuthMode::Oidc;
+        cfg.server.auth.anonymous_read = false;
+        cfg.server.auth.allowed_domains = vec!["example.com".into()];
+        cfg.server.auth.audiences = vec!["browser-client".into()];
+        cfg.server.auth.session_secret =
+            Some("0123456789abcdef0123456789abcdef-managed-test".into());
+        cfg.server.auth.managed_tokens = Some(managed);
+        cfg.server.auth.tokens = vec![StaticToken {
+            principal: "bootstrap".into(),
+            token: "bootstrap-test-token".into(),
+            token_env: None,
+            write: true,
+        }];
+        cfg.server.auth.tenant_grants = vec![TenantGrant {
+            principal: "bootstrap".into(),
+            tenant: "*".into(),
+            role: TenantRole::Admin,
+        }];
+    })
+    .await?;
+    let client = reqwest::Client::new();
+
+    let sibling = client
+        .put(format!("{}/acme/private", server.base_url))
+        .bearer_auth("bootstrap-test-token")
+        .send()
+        .await?;
+    assert_eq!(sibling.status(), 201);
+    let create = client
+        .put(format!("{}/acme/app", server.base_url))
+        .bearer_auth(&admin)
+        .send()
+        .await?;
+    assert_eq!(create.status(), 201);
+    let wrong_create = client
+        .put(format!("{}/acme/other", server.base_url))
+        .bearer_auth(&admin)
+        .send()
+        .await?;
+    assert_eq!(wrong_create.status(), 404);
+
+    let list = client
+        .get(format!("{}/?format=text", server.base_url))
+        .bearer_auth(&admin)
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert_eq!(list.trim(), "acme/app");
+    let owner_repos: serde_json::Value = client
+        .get(format!("{}/api/v1/owners/acme/repos", server.base_url))
+        .bearer_auth(&admin)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(owner_repos, serde_json::json!(["app"]));
+
+    let mint = client
+        .post(format!("{}/_auth/tokens", server.base_url))
+        .bearer_auth(&admin)
+        .send()
+        .await?;
+    assert_eq!(
+        mint.status(),
+        401,
+        "managed bearer must not mint wgt_ tokens"
+    );
+
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "first"])?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    let repo_url = server.repo_url("acme", "app");
+    git_with_managed_token(&src, &["push", &repo_url, "main"], &writer)?;
+
+    let clone_dir = tempfile::tempdir()?;
+    git_with_managed_token(
+        clone_dir.path(),
+        &["-c", "protocol.version=0", "clone", &repo_url, "checkout"],
+        &reader,
+    )?;
+    git_in(&src, &["commit", "--allow-empty", "-m", "second"])?;
+    git_with_managed_token(&src, &["push", &repo_url, "main"], &writer)?;
+    git_with_managed_token(
+        clone_dir.path().join("checkout").as_path(),
+        &["fetch", "origin"],
+        &reader,
+    )?;
+
+    let wrong_read = client
+        .get(format!(
+            "{}/acme/private.git/info/refs?service=git-upload-pack",
+            server.base_url
+        ))
+        .basic_auth("git", Some(&reader))
+        .send()
+        .await?;
+    assert_eq!(wrong_read.status(), 404);
+    let reader_delete = client
+        .delete(format!("{}/acme/app", server.base_url))
+        .bearer_auth(&reader)
+        .send()
+        .await?;
+    assert_eq!(reader_delete.status(), 403);
+    let delete = client
+        .delete(format!("{}/acme/app", server.base_url))
+        .bearer_auth(&admin)
+        .send()
+        .await?;
+    assert_eq!(delete.status(), 204);
+    assert!(
+        ObjectStore::head(&*server.store, "repos/acme/private/manifest.pb")
+            .await?
+            .is_some(),
+        "exact-scope delete touched a sibling repository"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_clones_and_pushes_with_telemetry() -> TestResult {
     // Regression: tracing spans entered across .await under a multi-threaded

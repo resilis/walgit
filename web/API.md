@@ -17,7 +17,8 @@ https://git.example.com/api/v1                         non-repo      discovery, 
 https://git.example.com/repos.js                       the SDK       window.repos — permanent URL on every host
 ```
 Lanes differ by **credential handling** and CORS (D27): the bearer is a walgit access token (`/_auth/tokens`), a
-static token, or an ID token from the OIDC issuer (`GET /services/setup.json` returns the setup commands). Browser
+static token, an ID token from the OIDC issuer, or an exact-repository managed capability (`GET
+/services/setup.json` returns the setup commands). Browser
 calls carry the session cookie (`walgit_session`, minted by `/_auth/login` → the issuer → `/_auth/callback`) with
 `credentials: "include"`. No lane-first forms, no aliases.
 
